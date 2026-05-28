@@ -35,6 +35,7 @@ public class BasisVideoMaterialOutputInspector : Editor
         BindByName("PlaceholderField", "PlaceholderTexture");
         BindByName("RestoreOnEndedField", "RestorePlaceholderOnEnded");
         BindByName("FlipVerticallyField", "FlipVertically");
+        BindByName("FlipHorizontallyField", "FlipHorizontally");
         BindByName("ProjectionModeField", "ProjectionMode");
         BindByName("StereoEyeField", "StereoEye");
         BindByName("AspectModeField", "AspectMode");

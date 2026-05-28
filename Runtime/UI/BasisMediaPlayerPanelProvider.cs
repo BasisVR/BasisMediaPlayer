@@ -403,12 +403,12 @@ namespace Basis.BasisUI.MediaPlayer
             _adminGroup = PanelElementDescriptor.CreateNew(PanelElementDescriptor.ElementStyles.Group, parent);
             _adminGroup.SetTitle("Admin");
             _adminGroup.SetDescription("Network-synced policy. Visible only to clients with the basis.mediaplayer.control or * permission.");
-            _adminGroup.gameObject.SetActive(false);
             RectTransform content = _adminGroup.ContentParent;
 
             _adminOnlyToggle = PanelToggle.CreateNewEntry(content);
             _adminOnlyToggle.Descriptor.SetTitle("Admin Only");
             _adminOnlyToggle.Descriptor.SetDescription("Only clients with the control permission can take ownership.");
+            _adminOnlyToggle.SetValueWithoutNotify(false);
             _adminOnlyToggle.OnValueChanged = v =>
             {
                 if (_activeNetworking == null)
@@ -422,6 +422,7 @@ namespace Basis.BasisUI.MediaPlayer
             _allowAnyoneToggle = PanelToggle.CreateNewEntry(content);
             _allowAnyoneToggle.Descriptor.SetTitle("Allow Anyone To Take Control");
             _allowAnyoneToggle.Descriptor.SetDescription("When Admin Only is off, allows non-owners to take ownership.");
+            _allowAnyoneToggle.SetValueWithoutNotify(true);
             _allowAnyoneToggle.OnValueChanged = v =>
             {
                 if (_activeNetworking == null)
@@ -434,6 +435,7 @@ namespace Basis.BasisUI.MediaPlayer
 
             _driftSlider = PanelSlider.CreateNew(content);
             _driftSlider.SetSliderSettings(PanelSlider.SliderSettings.Advanced("Drift Seek Threshold (s)", 0f, 10f, false, 2, ValueDisplayMode.Raw));
+            _driftSlider.SetValueWithoutNotify(2f);
             _driftSlider.OnValueChanged = v =>
             {
                 if (_activeNetworking == null)
@@ -443,6 +445,12 @@ namespace Basis.BasisUI.MediaPlayer
 
                 _ = _activeNetworking.SetDriftSeekThresholdSeconds(v);
             };
+
+            // Deactivate AFTER children are built. PanelElementDescriptor.Awake calls
+            // SetTitle(DefaultTitle)/SetDescription(DefaultDescription); if a child is
+            // instantiated under an inactive parent its Awake fires later and would
+            // overwrite the labels set above.
+            _adminGroup.gameObject.SetActive(false);
         }
 
         private void BuildDebugGroup(RectTransform parent)
@@ -450,11 +458,11 @@ namespace Basis.BasisUI.MediaPlayer
             _debugGroup = PanelElementDescriptor.CreateNew(PanelElementDescriptor.ElementStyles.Group, parent);
             _debugGroup.SetTitle("Debug");
             _debugGroup.SetDescription("Toggle to surface live pipeline counters.");
-            _debugGroup.gameObject.SetActive(false);
             RectTransform content = _debugGroup.ContentParent;
 
             _debugToggle = PanelToggle.CreateNewEntry(content);
             _debugToggle.Descriptor.SetTitle("Debug Mode");
+            _debugToggle.SetValueWithoutNotify(false);
             _debugToggle.OnValueChanged = v =>
             {
                 SetDebugTickSubscription(v);
@@ -462,6 +470,10 @@ namespace Basis.BasisUI.MediaPlayer
                 if (v) RefreshDebugInfo();
                 else _debugGroup?.SetDescription("Toggle to surface live pipeline counters.");
             };
+
+            // See BuildAdminGroup: deactivate after children so their Awake doesn't
+            // clobber the title above.
+            _debugGroup.gameObject.SetActive(false);
         }
 
         private void ApplyAdvancedVisibility(bool visible)

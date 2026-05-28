@@ -38,13 +38,12 @@ public static class BasisVideoScreenMeshGenerator
             new Vector3( hw,  hh, 0f),
             new Vector3(-hw,  hh, 0f),
         };
-        // U is mirrored vs world +X so the texture reads non-mirrored from the +Z audience side.
         mesh.uv = new[]
         {
-            new Vector2(1f, 0f),
             new Vector2(0f, 0f),
-            new Vector2(0f, 1f),
+            new Vector2(1f, 0f),
             new Vector2(1f, 1f),
+            new Vector2(0f, 1f),
         };
         mesh.normals = new[]
         {

@@ -41,6 +41,9 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
     [Tooltip("Flip the video vertically. Native GPU textures (D3D11/D3D12) are top-left origin and come in upside-down for Unity sampling, so this defaults ON. Toggle if your content/platform is already the right way up.")]
     public bool FlipVertically = true;
 
+    [Tooltip("Flip the video horizontally. Use when the screen mesh's UV winding presents the video mirrored to the viewer.")]
+    public bool FlipHorizontally = false;
+
     [Header("Projection")]
     [Tooltip("How the source frame is laid out. Mono/SBS/OU select the correct UV half via UV transform; Equirect360/VR180/Fisheye set a shader keyword (BASIS_PROJ_*) for compatible shaders.")]
     public BasisVideoProjectionMode ProjectionMode = BasisVideoProjectionMode.Mono;
@@ -195,7 +198,9 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
         offset.x = originalOffset.x + originalScale.x * offset.x;
         offset.y = originalOffset.y + originalScale.y * offset.y;
 
-        if (FlipVertically) BasisVideoOutputMath.ApplyVerticalFlip(ref scale, ref offset);
+        if (FlipVertically && FlipHorizontally) BasisVideoOutputMath.ApplyBothFlip(ref scale, ref offset);
+        else if (FlipVertically) BasisVideoOutputMath.ApplyVerticalFlip(ref scale, ref offset);
+        else if (FlipHorizontally) BasisVideoOutputMath.ApplyHorizontalFlip(ref scale, ref offset);
 
         material.SetTextureScale(propertyId, scale);
         material.SetTextureOffset(propertyId, offset);

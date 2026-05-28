@@ -123,6 +123,20 @@ public static class BasisVideoOutputMath
         scale.y = -scale.y;
         offset.y = offset.y - scale.y;
     }
+
+    public static void ApplyHorizontalFlip(ref Vector2 scale, ref Vector2 offset)
+    {
+        scale.x = -scale.x;
+        offset.x = offset.x - scale.x;
+    }
+
+    public static void ApplyBothFlip(ref Vector2 scale, ref Vector2 offset)
+    {
+        scale.x = -scale.x;
+        scale.y = -scale.y;
+        offset.x = offset.x - scale.x;
+        offset.y = offset.y - scale.y;
+    }
 }
 
 public struct BasisVideoPicture

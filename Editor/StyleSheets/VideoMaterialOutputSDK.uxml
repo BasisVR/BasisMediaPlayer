@@ -17,6 +17,7 @@
             <editor:ObjectField label="Placeholder Texture" name="PlaceholderField" type="UnityEngine.Texture, UnityEngine.CoreModule" allow-scene-objects="true"/>
             <engine:Toggle label="Restore Placeholder On Ended" name="RestoreOnEndedField"/>
             <engine:Toggle label="Flip Vertically" name="FlipVerticallyField" tooltip="Native GPU textures (D3D11/D3D12) come in top-left origin; ON by default."/>
+            <engine:Toggle label="Flip Horizontally" name="FlipHorizontallyField" tooltip="Mirror the video left-right. Use when the screen mesh winding presents the video reversed."/>
         </engine:Foldout>
 
         <engine:Foldout text="Projection" name="ProjectionFoldout" value="false" class="bvp-foldout">
