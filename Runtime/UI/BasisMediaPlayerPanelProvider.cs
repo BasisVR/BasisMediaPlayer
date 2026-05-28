@@ -154,20 +154,37 @@ namespace Basis.BasisUI.MediaPlayer
             {
                 if (_activePlayer == null || _urlField == null) return;
                 string u = _urlField.Value;
-                if (!string.IsNullOrEmpty(u)) _activePlayer.LoadUrl(u);
+                if (string.IsNullOrEmpty(u)) return;
+                if (_activeNetworking != null) _ = _activeNetworking.SetUrl(u);
+                else _activePlayer.LoadUrl(u);
             };
 
             PanelButton playBtn = PanelButton.CreateNew(actions);
             playBtn.Descriptor.SetTitle("Play");
-            playBtn.OnClicked += () => _activePlayer?.Play();
+            playBtn.OnClicked += () =>
+            {
+                if (_activePlayer == null) return;
+                if (_activeNetworking != null) _ = _activeNetworking.Play();
+                else _activePlayer.Play();
+            };
 
             PanelButton pauseBtn = PanelButton.CreateNew(actions);
             pauseBtn.Descriptor.SetTitle("Pause");
-            pauseBtn.OnClicked += () => _activePlayer?.Pause();
+            pauseBtn.OnClicked += () =>
+            {
+                if (_activePlayer == null) return;
+                if (_activeNetworking != null) _ = _activeNetworking.Pause();
+                else _activePlayer.Pause();
+            };
 
             PanelButton stopBtn = PanelButton.CreateNew(actions);
             stopBtn.Descriptor.SetTitle("Stop");
-            stopBtn.OnClicked += () => _activePlayer?.Stop();
+            stopBtn.OnClicked += () =>
+            {
+                if (_activePlayer == null) return;
+                if (_activeNetworking != null) _ = _activeNetworking.Stop();
+                else _activePlayer.Stop();
+            };
 
             _bitrateDropdown = PanelDropdown.CreateNewEntry(content);
             _bitrateDropdown.Descriptor.SetTitle("Bitrate");
