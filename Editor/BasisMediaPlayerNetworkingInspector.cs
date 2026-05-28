@@ -28,6 +28,7 @@ public class BasisMediaPlayerNetworkingInspector : Editor
         tree.CloneTree(_root);
         if (sheet != null) _root.styleSheets.Add(sheet);
 
+        BindByName("AdminOnlyField", "AdminOnly");
         BindByName("AllowAnyoneField", "AllowAnyoneToTakeControl");
         BindByName("DriftThresholdField", "DriftSeekThresholdSeconds");
         BindByName("VerboseLoggingField", "VerboseLogging");
@@ -38,11 +39,26 @@ public class BasisMediaPlayerNetworkingInspector : Editor
         _editHint = _root.Q<Label>("StatusEditModeHint");
 
         var playBtn = _root.Q<Button>("ActPlayButton");
-        if (playBtn != null) playBtn.clicked += () => { if (PlayModeOnly()) _target.Play(); };
+        if (playBtn != null) playBtn.clicked += () => { if (PlayModeOnly()) _ = _target.Play(); };
         var pauseBtn = _root.Q<Button>("ActPauseButton");
-        if (pauseBtn != null) pauseBtn.clicked += () => { if (PlayModeOnly()) _target.Pause(); };
+        if (pauseBtn != null) pauseBtn.clicked += () => { if (PlayModeOnly()) _ = _target.Pause(); };
+        var resumeBtn = _root.Q<Button>("ActResumeButton");
+        if (resumeBtn != null) resumeBtn.clicked += () => { if (PlayModeOnly()) _ = _target.Resume(); };
         var stopBtn = _root.Q<Button>("ActStopButton");
-        if (stopBtn != null) stopBtn.clicked += () => { if (PlayModeOnly()) _target.Stop(); };
+        if (stopBtn != null) stopBtn.clicked += () => { if (PlayModeOnly()) _ = _target.Stop(); };
+
+        var urlField = _root.Q<TextField>("UrlField");
+        var loadBtn = _root.Q<Button>("ActLoadUrlButton");
+        if (loadBtn != null)
+        {
+            loadBtn.clicked += () =>
+            {
+                if (!PlayModeOnly()) return;
+                string url = urlField != null ? urlField.value : null;
+                if (string.IsNullOrWhiteSpace(url)) return;
+                _ = _target.SetUrl(url.Trim());
+            };
+        }
 
         _root.schedule.Execute(RefreshStatus).Every(250);
         return _root;
