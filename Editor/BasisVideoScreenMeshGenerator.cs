@@ -31,12 +31,14 @@ public static class BasisVideoScreenMeshGenerator
         mesh.name = "VideoScreen16x9";
         mesh.Clear();
 
+        // 180 deg Y rotation baked in: X negated, normal flipped to -Z. Triangle winding
+        // stays the same because rotating vertex positions already flips geometric winding.
         mesh.vertices = new[]
         {
-            new Vector3(-hw, -hh, 0f),
             new Vector3( hw, -hh, 0f),
-            new Vector3( hw,  hh, 0f),
+            new Vector3(-hw, -hh, 0f),
             new Vector3(-hw,  hh, 0f),
+            new Vector3( hw,  hh, 0f),
         };
         mesh.uv = new[]
         {
@@ -47,10 +49,10 @@ public static class BasisVideoScreenMeshGenerator
         };
         mesh.normals = new[]
         {
-            Vector3.forward,
-            Vector3.forward,
-            Vector3.forward,
-            Vector3.forward,
+            Vector3.back,
+            Vector3.back,
+            Vector3.back,
+            Vector3.back,
         };
         mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
         mesh.RecalculateTangents();
