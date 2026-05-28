@@ -208,7 +208,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     }
 
     // Main-thread tick: drive the render-thread texture update and surface events.
-    public void Pump()
+    public void Pump(bool verboseLogging = false)
     {
         if (handle == IntPtr.Zero || disposed) return;
 
@@ -280,6 +280,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
         // log shows whether frames keep flowing (frames climbing), the stream
         // ended (state=Ended), or the texture froze (frames stuck but no error).
         pumpCount++;
+        if (!verboseLogging) return;
         BasisMediaEngineState hb = State;
         if (hb != lastLoggedState || (pumpCount % 120) == 0)
         {

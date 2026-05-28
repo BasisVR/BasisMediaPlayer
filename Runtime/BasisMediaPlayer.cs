@@ -829,7 +829,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         // ready/size/EOS/error events, then mirror status. No CPU frame queue.
         if (nativeEngine != null)
         {
-            nativeEngine.Pump();
+            nativeEngine.Pump(VerboseLogging);
             DrainPendingEvents();
             PollNativeEngineStatus();
             HandleRestartTimer();
