@@ -11,7 +11,7 @@ GameObject:
   - component: {fileID: 2265814159907839490}
   - component: {fileID: 136030129054553920}
   - component: {fileID: 4300968560286109803}
-  m_Layer: 0
+  m_Layer: 8
   m_Name: Audio Source
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -236,7 +236,8 @@ GameObject:
   - component: {fileID: 3404733239259574964}
   - component: {fileID: 2558915426334022879}
   - component: {fileID: 7733138127675236971}
-  m_Layer: 0
+  - component: {fileID: 6300711699957440172}
+  m_Layer: 8
   m_Name: MediaPlayerStreaming
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -645,3 +646,24 @@ Rigidbody:
   m_Interpolate: 0
   m_Constraints: 0
   m_CollisionDetection: 0
+--- !u!65 &6300711699957440172
+BoxCollider:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 8238937759899344198}
+  m_Material: {fileID: 0}
+  m_IncludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ExcludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_LayerOverridePriority: 0
+  m_IsTrigger: 0
+  m_ProvidesContacts: 0
+  m_Enabled: 1
+  serializedVersion: 3
+  m_Size: {x: 14.463681, y: 8.13582, z: 0}
+  m_Center: {x: 0, y: 0, z: 0}
