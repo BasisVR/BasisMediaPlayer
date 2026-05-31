@@ -516,10 +516,10 @@ MonoBehaviour:
   DesktopZoopMinDistance: 0.2
   DesktopZoopMaxDistance: 2
   GenerateColliderMesh: 1
-  minLinearVelocity: 0.5
-  interactEndLinearVelocityMultiplier: 1
-  minAngularVelocity: 0.5
-  interactEndAngularVelocityMultiplier: 1
+  minLinearVelocity: 0
+  interactEndLinearVelocityMultiplier: 0
+  minAngularVelocity: 0
+  interactEndAngularVelocityMultiplier: 0
   RigidRef: {fileID: 7733138127675236971}
   InputConstraint:
     rid: 8257204327381467259
@@ -628,8 +628,8 @@ Rigidbody:
   m_GameObject: {fileID: 8238937759899344198}
   serializedVersion: 5
   m_Mass: 100
-  m_LinearDamping: 1
-  m_AngularDamping: 1
+  m_LinearDamping: 1000
+  m_AngularDamping: 1000
   m_CenterOfMass: {x: 0, y: 0, z: 0}
   m_InertiaTensor: {x: 1, y: 1, z: 1}
   m_InertiaRotation: {x: 0, y: 0, z: 0, w: 1}
@@ -665,5 +665,5 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 14.463681, y: 8.13582, z: 0}
+  m_Size: {x: 14.463681, y: 8.13582, z: 0.1}
   m_Center: {x: 0, y: 0, z: 0}
