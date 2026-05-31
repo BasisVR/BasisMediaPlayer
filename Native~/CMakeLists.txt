@@ -67,6 +67,7 @@ set(CORE_SOURCES
     protocol/basis_rtmp.c
     protocol/basis_ts.c
     protocol/basis_mp4.c
+    protocol/basis_hls.c
 )
 
 # ---------------------------------------------------------------------------
