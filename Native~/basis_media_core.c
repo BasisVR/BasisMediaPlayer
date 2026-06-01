@@ -21,6 +21,7 @@
 #include "protocol/basis_ts.h"
 #include "protocol/basis_mp4.h"
 #include "protocol/basis_http.h"
+#include "protocol/basis_hls.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -192,11 +193,44 @@ static int ends_with_ci(const char* s, const char* suffix) {
     return 1;
 }
 
+/* HLS / LL-HLS: the URL is a playlist, not a continuous byte stream. The HLS
+ * source fetches+parses the M3U8, stitches segments (and LL-HLS parts) into one
+ * byte stream, and the existing TS/fMP4 demuxers consume it. Windows fetches via
+ * WinHTTP; Android/Quest support is planned. */
+static void run_hls(basis_media_engine_t* e) {
+#if defined(_WIN32)
+    basis_http_provider_t provider = {
+        basis_win_http_open, basis_win_http_read, basis_win_http_close
+    };
+    int is_fmp4 = 0;
+    void* hls = basis_hls_open(e->url, &provider, e->sink.is_running, e->sink.user, &is_fmp4);
+    if (!hls) {
+        basis_engine_set_error(e, "failed to open HLS playlist");
+        return;
+    }
+    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
+    if (is_fmp4)
+        basis_mp4_run(&e->sink, basis_hls_read, hls);
+    else
+        basis_ts_run(&e->sink, basis_hls_read, hls);
+    basis_hls_close(hls);
+#else
+    basis_engine_set_error(e, "HLS playback currently requires the Windows backend.");
+#endif
+}
+
 static void run_http_like(basis_media_engine_t* e) {
     /* Android: the OS extractor can demux the URL itself (TLS included). */
     if (basis_decoder_try_open_url(e->decoder, e->url)) {
         basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
         while (e->running) sleep_ms(20);
+        return;
+    }
+
+    /* HLS playlists are not a single continuous stream — hand off to the HLS
+     * source before the plain TS/fMP4 byte-source path. (.m3u8 may carry a query.) */
+    if (strstr(e->parts.path, ".m3u8")) {
+        run_hls(e);
         return;
     }
 

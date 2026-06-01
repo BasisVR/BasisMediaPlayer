@@ -18,9 +18,24 @@ presented **zero-copy** into a Unity texture. No transcode server, no VP9, no
 | `rtmp://`  | RTMP pull | `rtmp://stream.vrcdn.live/live/vrcdn` |
 | `https://…​.mp4` | fragmented MP4 over HTTPS | `https://stream.vrcdn.live/live/vrcdn.live.mp4` |
 | `https://…​.ts`  | MPEG-TS over HTTPS (Quest) | `https://stream.vrcdn.live/live/vrcdn.live.ts` |
+| `https://…​.m3u8` | HLS / Low-Latency HLS (Windows) | `https://stream.example/live/index.m3u8` |
 
 The protocol/demux core (RTSP/RTP, RTMP/FLV, MPEG-TS, fMP4) is portable C; the OS
 backends only decode + present.
+
+### HLS / Low-Latency HLS
+
+`.m3u8` URLs are handled by `protocol/basis_hls.c`, which is **not** a demuxer: it
+parses the playlist, selects one rendition, starts at the live edge, and stitches
+the segments — and, for LL-HLS, the partial segments (`EXT-X-PART`) — into one byte
+stream that the existing MPEG-TS / fMP4 demuxers consume. When the origin advertises
+`EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD` with parts, the client uses blocking
+`_HLS_msn`/`_HLS_part` playlist reloads and rides parts to target roughly
+`PART-HOLD-BACK` latency (~5 s). **The ~5 s target needs an LL-HLS origin** — against
+a plain HLS origin you get its segment-bound latency, not 5 s.
+
+Runs on **Windows** (WinHTTP fetch), **clear streams**, **single rendition**.
+Android/Quest support is planned.
 
 ## Usage
 
