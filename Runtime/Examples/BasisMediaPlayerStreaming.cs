@@ -60,11 +60,11 @@ public sealed class BasisMediaPlayerStreaming : MonoBehaviour
 
     public string ResolveUrl()
     {
-        if (!AutoSelectPerPlatform) return StreamUrl;
+        if (!AutoSelectPerPlatform) return StreamUrl?.Trim();
 #if UNITY_ANDROID && !UNITY_EDITOR
-        return QuestUrl;
+        return QuestUrl?.Trim();
 #else
-        return PcUrl;
+        return PcUrl?.Trim();
 #endif
     }
 }
