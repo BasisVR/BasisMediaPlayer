@@ -74,7 +74,7 @@ namespace Basis.BasisUI.MediaPlayer
         {
             if (BasisMainMenu.ActiveMenuTitle == Title)
             {
-                BasisMainMenu.Instance.ActiveMenu.ReleaseInstance();
+                BasisMainMenu.CloseActivePanel();
                 return;
             }
 
