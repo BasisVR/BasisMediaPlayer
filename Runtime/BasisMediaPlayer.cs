@@ -354,7 +354,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             if (!BasisMediaPlayerSecurity.IsUrlAllowed(media.Uri, out string blockReason))
                 throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load '{media.Uri}': {blockReason}");
 
-            SetNativeEngine(new BasisNativeVideoSource(media.Uri));
+            SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media)));
         }
         catch (Exception ex)
         {
@@ -362,6 +362,23 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
 
         ApplyMediaSourceSettings(media);
+    }
+
+    // RIST exposes a receive-buffer depth that librist parses straight from the URL
+    // query. Framework devs set it via Options["buffer"] (milliseconds); fold it in
+    // here so the native side sees rist://host:port?...&buffer=<ms>. Non-RIST schemes
+    // ignore Options["buffer"], so the URI is returned untouched for them.
+    private static string ResolveNativeUri(BasisMediaSource media)
+    {
+        string uri = media.Uri;
+        if (media.Options != null &&
+            uri.StartsWith("rist://", StringComparison.OrdinalIgnoreCase) &&
+            media.Options.TryGetValue("buffer", out object buffer) && buffer != null)
+        {
+            char sep = uri.IndexOf('?') >= 0 ? '&' : '?';
+            uri += $"{sep}buffer={buffer}";
+        }
+        return uri;
     }
 
     private void HandleProtonDeclined(BasisMediaSource media)
