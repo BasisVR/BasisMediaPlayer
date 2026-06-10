@@ -55,8 +55,11 @@ available by assigning `player.Source` directly — useful for tests without a f
 
 ## Building the native plugin
 
-Source is under `Native~/`. It links **only OS frameworks** (no third-party libs).
-You also need Unity's PluginAPI headers — see `Native~/unity/README.md`.
+Source is under `Native~/`. By default it links **only OS frameworks** (no
+third-party libs). The optional RIST transport (`-DBASIS_WITH_RIST=ON`) statically
+links prebuilt librist + mbedTLS from `Native~/third_party/` — see
+`Native~/third_party/README.md`. You also need Unity's PluginAPI headers — see
+`Native~/unity/README.md`.
 
 **Windows → `Plugins/Windows/x86_64/basis_media_native.dll`**
 ```
