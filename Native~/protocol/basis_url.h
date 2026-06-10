@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 typedef struct basis_url {
-    char scheme[16];   /* lowercased: rtsp, rtspt, rtmp, rtmps, http, https */
+    char scheme[16];   /* lowercased: rtsp, rtspt, rtmp, rtmps, http, https, rist */
     char host[256];
     int  port;         /* defaulted per scheme when absent */
     char path[1024];   /* everything after the host, including leading '/' and query */
@@ -24,6 +24,7 @@ int basis_url_parse(const char* url, basis_url_t* out);
 /* 1 if the scheme uses our custom TCP control protocols (rtsp/rtmp family). */
 int basis_url_is_rtsp(const basis_url_t* u);
 int basis_url_is_rtmp(const basis_url_t* u);
+int basis_url_is_rist(const basis_url_t* u);
 
 #ifdef __cplusplus
 }

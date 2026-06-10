@@ -17,6 +17,14 @@ Native~/build-*/
 Native~/CMakeUserPresets.json
 Native~/CMakeCache.txt
 
+# librist statics + headers are built from source (build-librist.{ps1,sh}) into
+# third_party/, never committed. Keep the .gitkeep placeholders only.
+Native~/third_party/win-x64/*
+!Native~/third_party/win-x64/.gitkeep
+Native~/third_party/android-arm64/*
+!Native~/third_party/android-arm64/.gitkeep
+Native~/third_party/include/librist/
+
 # Unity PluginAPI headers copied locally for the native build (see unity/README.md).
 Native~/unity/IUnityInterface.h
 Native~/unity/IUnityGraphics.h
