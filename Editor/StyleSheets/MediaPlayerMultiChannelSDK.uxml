@@ -1,0 +1,28 @@
+<engine:UXML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:engine="UnityEngine.UIElements" xmlns:editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <engine:VisualElement class="bvp-root">
+        <engine:VisualElement name="HeaderCard" class="bvp-card bvp-header-card">
+            <engine:Label text="Basis Media Multichannel Audio" name="HeaderTitle" selectable="false" class="bvp-header-title"/>
+            <engine:Label text="Surround stream &#8594; one AudioSource per channel" name="HeaderSubtitle" selectable="false" class="bvp-header-subtitle"/>
+        </engine:VisualElement>
+
+        <engine:Foldout text="Output" name="OutputFoldout" value="true" class="bvp-foldout">
+            <editor:PropertyField name="OutputsField" label="Outputs" tooltip="AudioSources that play content audio. Each needs a BasisMediaAudioChannel component selecting its channel(s)."/>
+        </engine:Foldout>
+
+        <engine:Foldout text="Format" name="FormatFoldout" value="false" class="bvp-foldout">
+            <engine:IntegerField label="Sample Rate" name="SampleRateField" tooltip="Auto-updated from the decoder."/>
+            <engine:SliderInt label="Channel Count" name="ChannelCountField" low-value="1" high-value="8" show-input-field="true" tooltip="Auto-updated from the decoder."/>
+        </engine:Foldout>
+
+        <engine:Foldout text="Buffering" name="BufferingFoldout" value="false" class="bvp-foldout">
+            <engine:FloatField label="Clip Length (s)" name="ClipLengthField" tooltip="Length of each streaming AudioClip and the depth of the broadcast window. Larger = steadier but adds latency."/>
+        </engine:Foldout>
+
+        <engine:Foldout text="Playback" name="PlaybackFoldout" value="true" class="bvp-foldout">
+            <engine:Toggle label="Auto Play On Enable" name="AutoPlayField"/>
+            <engine:Toggle label="Stop On Disable" name="StopOnDisableField"/>
+            <engine:Slider label="Volume Gain" name="VolumeGainField" low-value="0" high-value="2" show-input-field="true" tooltip="Sample-domain multiplier applied after decode (hard-capped at 2.0 at runtime)."/>
+            <engine:Toggle label="Mute" name="MuteField"/>
+        </engine:Foldout>
+    </engine:VisualElement>
+</engine:UXML>

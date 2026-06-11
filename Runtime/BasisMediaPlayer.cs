@@ -193,6 +193,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public long FormatErrorCount => runtimeFormatErrors;
     public long DroppedFrameCount => runtimeOverflowDrops + runtimeLateSkips + runtimeFormatErrors;
     public BasisMediaPlayerAudio AudioComponent => audioComponent;
+    public BasisMediaPlayerMultiChannelAudio MultiChannelAudioComponent => multiChannelComponent;
     public BasisMediaSource ActiveMediaSource => activeMediaSource;
 
     public System.Collections.Generic.IReadOnlyList<BasisBitrateTrack> BitrateTracks =>
@@ -249,6 +250,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private const int RestartMaxRechecks = 5;
     private const float RestartRecheckIntervalSeconds = 1f;
     private BasisMediaPlayerAudio audioComponent;
+    private BasisMediaPlayerMultiChannelAudio multiChannelComponent;
     private long lastEnqueuedPtsUs;
     private BasisMediaSource activeMediaSource;
     private float sleepTimerRemainingSeconds;
@@ -281,11 +283,10 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         // the master media clock so video frames are scheduled against audio
         // playback instead of wall time. Falls back to wall-clock pacing
         // automatically when no audio component is present (e.g. video-only).
-        if (TryGetComponent(out audioComponent))
-        {
-            Clock.ExternalSource = audioComponent;
-            ApplyAudioRoutingToComponent();
-        }
+        TryGetComponent(out audioComponent);
+        TryGetComponent(out multiChannelComponent);
+        if (audioComponent != null) Clock.ExternalSource = audioComponent;
+        ApplyAudioRoutingToComponent();
         BasisMediaPlayerRegistry.Add(this);
     }
 
@@ -297,7 +298,9 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
             return;
         }
-        LoadSource(BasisMediaSource.FromUrl(url));
+        var media = BasisMediaSource.FromUrl(url);
+        media.AudioRouting = AudioRouting;
+        LoadSource(media);
     }
 
     // Convenience wrapper: builds a BasisMediaSource from an absolute or
@@ -309,7 +312,9 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayer.LoadLocalPath called with empty path.", BasisDebug.LogTag.Video);
             return;
         }
-        LoadSource(BasisMediaSource.FromLocalPath(path));
+        var media = BasisMediaSource.FromLocalPath(path);
+        media.AudioRouting = AudioRouting;
+        LoadSource(media);
     }
 
     // Resolves the descriptor to the OS-codec engine and starts it. All network
@@ -668,7 +673,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             nativeEngine.OnBitrateTrackChanged += HandleBitrateTrackChanged;
             nativeEngine.OnAudioTrackChanged += HandleAudioTrackChanged;
         }
-        if (audioComponent != null) audioComponent.NativePcmSource = nativeEngine;
+        RouteNativePcmSource(nativeEngine);
         if (nativeEngine != null) nativeEngine.SetBuffer(BufferMode, ResolvedBufferMilliseconds());
 
         // Push the (currently null) external texture so consumers rebind once a
@@ -689,6 +694,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         nativeEngine.OnAudioTrackChanged -= HandleAudioTrackChanged;
         if (audioComponent != null && ReferenceEquals(audioComponent.NativePcmSource, nativeEngine))
             audioComponent.NativePcmSource = null;
+        if (multiChannelComponent != null && ReferenceEquals(multiChannelComponent.NativePcmSource, nativeEngine))
+            multiChannelComponent.NativePcmSource = null;
         try { nativeEngine.Dispose(); }
         catch (Exception ex) { BasisDebug.LogError($"BasisMediaPlayer native engine dispose failed: {ex.Message}", BasisDebug.LogTag.Video); }
         nativeEngine = null;
@@ -732,9 +739,20 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
     private void ApplyAudioRoutingToComponent()
     {
-        if (audioComponent == null) return;
-        audioComponent.VolumeGain = Volume;
-        audioComponent.Mute = Mute;
+        if (audioComponent != null) { audioComponent.VolumeGain = Volume; audioComponent.Mute = Mute; }
+        if (multiChannelComponent != null) { multiChannelComponent.VolumeGain = Volume; multiChannelComponent.Mute = Mute; }
+    }
+
+    // Multichannel routing feeds the native PCM ring to the per-channel sink;
+    // every other routing feeds the stereo sink. Only one drains the ring.
+    private bool UseMultiChannelAudio =>
+        AudioRouting == BasisAudioRouting.UnityMultiChannelSources && multiChannelComponent != null;
+
+    private void RouteNativePcmSource(IBasisPcmSource pcm)
+    {
+        bool multi = UseMultiChannelAudio;
+        if (audioComponent != null) audioComponent.NativePcmSource = multi ? null : pcm;
+        if (multiChannelComponent != null) multiChannelComponent.NativePcmSource = multi ? pcm : null;
     }
 
     private void HandleVideoFrame(BasisVideoFrame frame)
@@ -945,9 +963,10 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
         runtimeCurrentMediaTimeUs = Math.Max(0, nativeEngine.PositionUs);
 
-        if (audioComponent != null && nativeEngine.TryGetPcmFormat(out int sr, out int ch) && sr > 0 && ch > 0)
+        if (nativeEngine.TryGetPcmFormat(out int sr, out int ch) && sr > 0 && ch > 0)
         {
-            audioComponent.SetExpectedFormat(sr, ch);
+            if (UseMultiChannelAudio) multiChannelComponent.SetExpectedFormat(sr, ch);
+            else audioComponent?.SetExpectedFormat(sr, ch);
         }
 
         Texture tex = nativeEngine.OutputTexture;

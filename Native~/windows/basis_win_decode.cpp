@@ -490,16 +490,30 @@ static bool configure_audio_mft(basis_decoder* d, const uint8_t* asc, int asc_le
     in->Release();
     if (FAILED(hr)) { SAFE_RELEASE(d->adec); return false; }
 
-    /* Use a type the decoder actually offers (Float preferred, else PCM16). */
-    IMFMediaType* chosen = nullptr; int bits = 0;
+    /* Pick the output type the decoder offers. Prefer IEEE float, then a channel
+     * count matching the input, then more channels. For >2-channel AAC the
+     * decoder also offers a stereo fold-down, so matching the input channel
+     * count is what keeps the discrete surround channels (e.g. 5.1). */
+    IMFMediaType* chosen = nullptr; int bits = 0; int chosenRank = -1;
+    int target = d->ach ? d->ach : 2;
     for (DWORD i = 0; ; ++i) {
         IMFMediaType* t = nullptr;
         if (FAILED(d->adec->GetOutputAvailableType(0, i, &t))) break;
         GUID sub; t->GetGUID(MF_MT_SUBTYPE, &sub);
-        UINT32 b = 0; t->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &b);
-        if (sub == MFAudioFormat_Float) { if (chosen) chosen->Release(); chosen = t; bits = 32; break; }
-        if (sub == MFAudioFormat_PCM && !chosen) { chosen = t; bits = (int)(b ? b : 16); }
-        else t->Release();
+        UINT32 b = 0, tch = 0;
+        t->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &b);
+        t->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &tch);
+        bool isFloat = (sub == MFAudioFormat_Float);
+        bool isPcm = (sub == MFAudioFormat_PCM);
+        if (!isFloat && !isPcm) { t->Release(); continue; }
+        int rank = (isFloat ? 1000 : 0) + ((int)tch == target ? 500 : 0) + (int)tch;
+        if (rank > chosenRank) {
+            if (chosen) chosen->Release();
+            chosen = t; chosenRank = rank;
+            bits = isFloat ? 32 : (int)(b ? b : 16);
+        } else {
+            t->Release();
+        }
     }
     if (!chosen) { SAFE_RELEASE(d->adec); return false; }
 

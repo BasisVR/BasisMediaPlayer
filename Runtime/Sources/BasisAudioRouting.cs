@@ -5,8 +5,11 @@ public enum BasisAudioRouting
     // streaming AudioClip on a Unity AudioSource. Spatialization, mixer routing,
     // and per-instance volume all flow through Unity's audio graph.
     //
-    // Only routing currently supported. The enum exists as a stable property
-    // type so additional routings (e.g. direct OS-audio output from a native
-    // backend) can be added without touching call sites.
     UnityAudioSource = 0,
+
+    // Decoded audio is de-interleaved into one mono Unity AudioSource per
+    // channel via a BasisMediaPlayerMultiChannelAudio component, letting a
+    // surround stream (e.g. 5.1) be positioned channel-by-channel in the world.
+    // Each channel spatializes independently through Unity's audio graph.
+    UnityMultiChannelSources = 1,
 }

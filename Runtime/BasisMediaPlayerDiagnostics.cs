@@ -28,6 +28,7 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
 
     private BasisMediaPlayer player;
     private BasisMediaPlayerAudio audioComponent;
+    private BasisMediaPlayerMultiChannelAudio multiChannelComponent;
     private StreamWriter writer;
     private StringBuilder lineBuilder;
     private float nextSnapshotTime;
@@ -39,6 +40,7 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
     {
         player = GetComponent<BasisMediaPlayer>();
         TryGetComponent(out audioComponent);
+        TryGetComponent(out multiChannelComponent);
         lineBuilder = new StringBuilder(512);
         ResolvedLogPath = ResolvePath();
     }
@@ -183,6 +185,7 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
             "eng_audio_cfg",
             "eng_aout_count",
             "eng_audio_sr",
+            "eng_audio_ch",
             "eng_bitrate_idx",
             "eng_audio_track_idx",
             "audio_expected_sr",
@@ -200,7 +203,7 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
         var clock = player.Clock;
         var eng = player.NativeEngine;
         var src = player.Source;
-        var aud = audioComponent != null ? audioComponent : player.AudioComponent;
+        var snap = ResolveAudio();
 
         float wallDtMs = lastSnapshotTime >= 0f ? (unityTime - lastSnapshotTime) * 1000f : 0f;
         lastSnapshotTime = unityTime;
@@ -229,18 +232,17 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
         AppendL(player.CatchUpSkipCount);
         AppendL(player.LateSkipCount);
         AppendL(player.FormatErrorCount);
-        AppendB(aud != null);
-        AppendB(aud != null && aud.ActiveAudioSource != null && aud.ActiveAudioSource.isPlaying);
-        AppendL(aud != null ? aud.ConsumedSampleCount : 0);
-        AppendI(aud != null ? aud.QueuedFrameCount : 0);
-        AppendL(aud != null ? aud.DroppedFrameCount : 0);
-        AppendB(aud != null && aud.Mute);
-        AppendF(aud != null ? aud.VolumeGain : 0f);
-        var src2 = aud != null ? aud.ActiveAudioSource : null;
-        AppendF(src2 != null ? src2.volume : 0f);
-        AppendF(src2 != null ? src2.spatialBlend : 0f);
-        AppendF(aud != null ? aud.LastPcmPeak : 0f);
-        AppendF(aud != null ? aud.LastPcmRms : 0f);
+        AppendB(snap.Present);
+        AppendB(snap.Playing);
+        AppendL(snap.Consumed);
+        AppendI(snap.Queue);
+        AppendL(snap.Dropped);
+        AppendB(snap.Mute);
+        AppendF(snap.Gain);
+        AppendF(snap.Volume);
+        AppendF(snap.Spatial);
+        AppendF(snap.Peak);
+        AppendF(snap.Rms);
         AppendB(AudioListener.pause);
 
         AppendF(wallDtMs);
@@ -257,14 +259,15 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
         AppendI(engineDebug.AudioCfg);
         AppendL(engineDebug.AOutCount);
         AppendI(engineDebug.AudioSr);
+        AppendI(eng != null && eng.TryGetPcmFormat(out _, out int engCh) ? engCh : -1);
         AppendI(eng != null ? eng.SelectedBitrateIndex : -1);
         AppendI(eng != null ? eng.SelectedAudioTrackIndex : -1);
 
-        AppendI(aud != null ? aud.SampleRate : 0);
-        AppendI(aud != null ? aud.ChannelCount : 0);
-        AppendL(aud != null ? aud.AudioOutputLatencyUs : 0);
-        AppendB(aud != null && aud.HasMediaTime);
-        AppendL(aud != null ? aud.CurrentMediaTimeUs : 0, last: true);
+        AppendI(snap.SampleRate);
+        AppendI(snap.Channels);
+        AppendL(snap.LatencyUs);
+        AppendB(snap.HasMedia);
+        AppendL(snap.MediaUs, last: true);
 
         try
         {
@@ -283,6 +286,61 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
     private void AppendL(long v, bool last = false) { lineBuilder.Append(v); if (!last) lineBuilder.Append(','); }
     private void AppendB(bool v, bool last = false) { lineBuilder.Append(v ? "1" : "0"); if (!last) lineBuilder.Append(','); }
     private void AppendStr(string v, bool last = false) { if (v != null) lineBuilder.Append(v); if (!last) lineBuilder.Append(','); }
+
+    private struct AudioSnapshot
+    {
+        public bool Present, Playing, Mute, HasMedia;
+        public long Consumed, Dropped, LatencyUs, MediaUs;
+        public int Queue, SampleRate, Channels;
+        public float Gain, Volume, Spatial, Peak, Rms;
+    }
+
+    // Picks the active audio sink's metrics so the audio columns populate for
+    // either routing: the multichannel sink when present and routed, otherwise
+    // the stereo BasisMediaPlayerAudio.
+    private AudioSnapshot ResolveAudio()
+    {
+        var s = new AudioSnapshot();
+        var mc = multiChannelComponent;
+        if (mc != null && (audioComponent == null || player.AudioRouting == BasisAudioRouting.UnityMultiChannelSources))
+        {
+            s.Present = true;
+            s.Playing = mc.IsAnyOutputPlaying;
+            s.Consumed = mc.ConsumedSampleCount;
+            s.Mute = mc.Mute;
+            s.Gain = mc.VolumeGain;
+            s.Volume = mc.RepresentativeVolume;
+            s.Spatial = mc.RepresentativeSpatialBlend;
+            s.Peak = mc.LastPcmPeak;
+            s.Rms = mc.LastPcmRms;
+            s.SampleRate = mc.SampleRate;
+            s.Channels = mc.ChannelCount;
+            return s;
+        }
+
+        var aud = audioComponent != null ? audioComponent : (player != null ? player.AudioComponent : null);
+        if (aud != null)
+        {
+            var asrc = aud.ActiveAudioSource;
+            s.Present = true;
+            s.Playing = asrc != null && asrc.isPlaying;
+            s.Consumed = aud.ConsumedSampleCount;
+            s.Queue = aud.QueuedFrameCount;
+            s.Dropped = aud.DroppedFrameCount;
+            s.Mute = aud.Mute;
+            s.Gain = aud.VolumeGain;
+            s.Volume = asrc != null ? asrc.volume : 0f;
+            s.Spatial = asrc != null ? asrc.spatialBlend : 0f;
+            s.Peak = aud.LastPcmPeak;
+            s.Rms = aud.LastPcmRms;
+            s.SampleRate = aud.SampleRate;
+            s.Channels = aud.ChannelCount;
+            s.LatencyUs = aud.AudioOutputLatencyUs;
+            s.HasMedia = aud.HasMediaTime;
+            s.MediaUs = aud.CurrentMediaTimeUs;
+        }
+        return s;
+    }
 
     private sealed class NativeEngineDebug
     {
