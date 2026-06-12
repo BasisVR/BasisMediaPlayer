@@ -236,11 +236,12 @@ struct basis_decoder {
     PcmRing pcm;
     int64_t aPtsFallback = 0;       /* next chunk PTS when MF gives no sample time */
 
-    /* Presentation-clock snapshot for the audio gate, published by
-     * render_update each frame and extrapolated on the audio thread via QPC.
-     * Zero QPC = clock not started (audio reads ungated). */
-    volatile LONGLONG audClockMediaUs = 0;
-    volatile LONGLONG audClockQpc = 0;
+    /* Audio-gate clock: media-time offset from QPC, low-passed (~2s) so the
+     * segment-cadence wobble of the live-edge lock (bursty transports advance
+     * `newest` in jumps) averages out before the audio anchor reads it. The
+     * audio thread reconstructs `now` as qpc_us + offset. INT64_MIN = clock
+     * not started (audio reads ungated). */
+    volatile LONGLONG audClockOffsetUs = INT64_MIN;
 };
 
 /* ---- D3D / MF helpers --------------------------------------------------- */
@@ -867,10 +868,19 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
     int64_t nowMedia = liveClock - effBuf;
     d->dbg_lagms = (LONG)((newest - nowMedia) / 1000);
 
-    /* Snapshot the clock for the audio gate; the audio thread extrapolates
-     * from this anchor via QPC between renders. */
-    InterlockedExchange64(&d->audClockMediaUs, nowMedia);
-    InterlockedExchange64(&d->audClockQpc, nowq.QuadPart);
+    /* Publish the audio-gate clock as a low-passed offset from QPC (~2s EMA);
+     * large jumps (startup, hard resync, discontinuity) snap instead of
+     * filtering so the gate follows resyncs immediately. */
+    {
+        int64_t qpcUs = (nowq.QuadPart - d->createQpc.QuadPart) * 1000000LL / freq;
+        int64_t off = nowMedia - qpcUs;
+        LONGLONG prev = InterlockedCompareExchange64(&d->audClockOffsetUs, 0, 0);
+        if (prev == INT64_MIN || off - prev > 700000 || off - prev < -700000) {
+            InterlockedExchange64(&d->audClockOffsetUs, off);
+        } else {
+            InterlockedExchange64(&d->audClockOffsetUs, prev + (off - prev) * dtUs / 2000000);
+        }
+    }
 
     /* recover from non-monotonic/bogus PTS (lastPresentedPts stuck above the ring) */
     if (d->lastPresentedPts != INT64_MIN && d->lastPresentedPts > newest) d->lastPresentedPts = INT64_MIN;
@@ -942,16 +952,15 @@ extern "C" int basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c
 extern "C" int basis_decoder_read_audio(basis_decoder_t* d, float* out, int max_floats) {
     if (!d) return 0;
     if (basis_engine_is_paused(d->engine)) return 0;
-    /* Extrapolate the presentation clock from the last published anchor so
-     * audio release is paced to the timeline video presents on. No anchor yet
-     * (no video frame presented, or an audio-only stream) reads ungated. */
+    /* Reconstruct the presentation clock from the published offset so audio
+     * release is paced to the timeline video presents on. No offset yet (no
+     * video frame presented, or an audio-only stream) reads ungated. */
     int64_t now = INT64_MIN;
-    LONGLONG aq = InterlockedCompareExchange64(&d->audClockQpc, 0, 0);
-    if (aq != 0) {
-        LONGLONG am = InterlockedCompareExchange64(&d->audClockMediaUs, 0, 0);
+    LONGLONG off = InterlockedCompareExchange64(&d->audClockOffsetUs, 0, 0);
+    if (off != INT64_MIN) {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         int64_t freq = d->qpcFreq.QuadPart ? d->qpcFreq.QuadPart : 1;
-        now = am + (q.QuadPart - aq) * 1000000LL / freq;
+        now = (q.QuadPart - d->createQpc.QuadPart) * 1000000LL / freq + off;
     }
     int n = d->pcm.read(out, max_floats, now);
     if (n > 0 && d->ach > 0) InterlockedAdd64(&d->audioSamplesRead, (LONGLONG)(n / d->ach));
