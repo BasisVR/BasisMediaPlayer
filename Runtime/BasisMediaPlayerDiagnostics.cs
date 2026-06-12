@@ -304,6 +304,9 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
         var mc = multiChannelComponent;
         if (mc != null && (audioComponent == null || player.AudioRouting == BasisAudioRouting.UnityMultiChannelSources))
         {
+            // Queue/Dropped/LatencyUs/HasMedia/MediaUs stay defaulted here: the
+            // multichannel sink reads the native ring directly (no frame queue)
+            // and the engine owns the media clock.
             s.Present = true;
             s.Playing = mc.IsAnyOutputPlaying;
             s.Consumed = mc.ConsumedSampleCount;

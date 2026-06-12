@@ -251,6 +251,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private const float RestartRecheckIntervalSeconds = 1f;
     private BasisMediaPlayerAudio audioComponent;
     private BasisMediaPlayerMultiChannelAudio multiChannelComponent;
+    private bool warnedMultiChannelFallback;
     private long lastEnqueuedPtsUs;
     private BasisMediaSource activeMediaSource;
     private float sleepTimerRemainingSeconds;
@@ -741,6 +742,9 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     {
         if (audioComponent != null) { audioComponent.VolumeGain = Volume; audioComponent.Mute = Mute; }
         if (multiChannelComponent != null) { multiChannelComponent.VolumeGain = Volume; multiChannelComponent.Mute = Mute; }
+        // AudioRouting may have changed (LoadSource, inspector) since the engine
+        // was routed; re-route so the ring follows the current routing.
+        if (nativeEngine != null) RouteNativePcmSource(nativeEngine);
     }
 
     // Multichannel routing feeds the native PCM ring to the per-channel sink;
@@ -751,6 +755,23 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private void RouteNativePcmSource(IBasisPcmSource pcm)
     {
         bool multi = UseMultiChannelAudio;
+        if (pcm != null && !multi && AudioRouting == BasisAudioRouting.UnityMultiChannelSources)
+        {
+            // Warn once per misconfiguration episode; this is re-entered from
+            // OnValidate, so an unconditional log would repeat on every
+            // inspector change.
+            if (!warnedMultiChannelFallback)
+            {
+                warnedMultiChannelFallback = true;
+                BasisDebug.LogWarning(
+                    "BasisMediaPlayer: AudioRouting is UnityMultiChannelSources but no BasisMediaPlayerMultiChannelAudio is on this GameObject; falling back to stereo output.",
+                    BasisDebug.LogTag.Video);
+            }
+        }
+        else
+        {
+            warnedMultiChannelFallback = false;
+        }
         if (audioComponent != null) audioComponent.NativePcmSource = multi ? null : pcm;
         if (multiChannelComponent != null) multiChannelComponent.NativePcmSource = multi ? pcm : null;
     }

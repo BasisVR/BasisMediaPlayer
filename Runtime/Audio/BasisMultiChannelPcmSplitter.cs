@@ -105,7 +105,7 @@ public sealed class BasisMultiChannelPcmSplitter
                     for (int t = 0; t < tapCount; t++)
                     {
                         Tap tap = taps[t];
-                        if (tap.Source < 0 || tap.Source >= channelCount) continue;
+                        if (tap.Source < 0 || tap.Source >= channelCount || tap.Out < 0 || tap.Out >= outChannels) continue;
                         dst[outBase + tap.Out] += window[tap.Source][ringIdx] * tap.Coeff;
                     }
                     if (gain != 1f)
