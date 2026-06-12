@@ -229,9 +229,16 @@ struct basis_decoder {
 
     /* audio */
     IMFTransform* adec = nullptr;
+    basis_codec_t acodec = BASIS_CODEC_NONE;
     int asr = 0, ach = 0, aobj = 2;
     int aBits = 32;                 /* output sample bits: 32=float, 16=PCM int */
     bool aconfigured = false;
+
+    /* LPCM bypass (no decoder): convert/reorder straight into the PCM ring. */
+    int aLpcmAssign = 0;            /* Blu-ray channel_assignment */
+    int aLpcmBits = 16;
+    float* aLpcmBuf = nullptr;      /* reusable convert buffer */
+    int aLpcmBufCap = 0;            /* in floats */
     volatile LONG dbg_aout = 0;     /* AAC PCM outputs produced */
     PcmRing pcm;
     int64_t aPtsFallback = 0;       /* next chunk PTS when MF gives no sample time */
@@ -704,6 +711,7 @@ extern "C" void basis_decoder_destroy(basis_decoder_t* d) {
     /* shared textures + handles already freed by basis_decoder_render_release above */
     DeleteCriticalSection(&d->presentLock);
     d->pcm.destroy();
+    free(d->aLpcmBuf);
     delete d;
 }
 
@@ -721,9 +729,30 @@ extern "C" int basis_decoder_set_video_format(basis_decoder_t* d, basis_codec_t 
 
 extern "C" int basis_decoder_set_audio_format(basis_decoder_t* d, basis_codec_t codec,
                                               int sample_rate, int channels, const uint8_t* asc, int asc_len) {
-    if (!d || d->aconfigured || codec != BASIS_CODEC_AAC) return 0;
+    if (!d || d->aconfigured) return 0;
+
+    if (codec == BASIS_CODEC_LPCM) {
+        /* No decoder involved — submit_audio converts straight into the ring.
+         * 48 kHz only (the streaming-clip consumer plays at the clip rate, so
+         * 96/192 kHz needs the resampler this player doesn't have yet); the
+         * config blob carries the Blu-ray channel_assignment + bits code. */
+        if (sample_rate != 48000 || channels < 1 || channels > 8 || asc_len < 2) return 0;
+        int bits = asc[1] == 1 ? 16 : asc[1] == 3 ? 24 : 0;
+        if (!bits) return 0; /* 20-bit unsupported */
+        d->acodec = BASIS_CODEC_LPCM;
+        d->asr = sample_rate; d->ach = channels;
+        d->aLpcmAssign = asc[0];
+        d->aLpcmBits = bits;
+        d->aconfigured = true;
+        d->pcm.frame = channels;
+        d->pcm.sr = sample_rate;
+        return 0;
+    }
+
+    if (codec != BASIS_CODEC_AAC) return 0;
     d->asr = sample_rate; d->ach = channels;
     if (configure_audio_mft(d, asc, asc_len)) {
+        d->acodec = BASIS_CODEC_AAC;
         d->aconfigured = true;
         d->pcm.frame = d->ach > 0 ? d->ach : 1;
         d->pcm.sr = d->asr > 0 ? d->asr : 48000;
@@ -770,8 +799,55 @@ extern "C" int basis_decoder_submit_video(basis_decoder_t* d, const uint8_t* ann
     return 0;
 }
 
+/* Source-order -> WAVE-order channel map for the Blu-ray assignments whose
+ * orders differ (5.1, 7.0, 7.1: Blu-ray puts the LFE last and the side pair
+ * before the rears). NULL = identity. */
+static const int* lpcm_remap(int assign) {
+    static const int k51[6] = { 0, 1, 2, 4, 5, 3 };
+    static const int k70[7] = { 0, 1, 2, 5, 3, 4, 6 };
+    static const int k71[8] = { 0, 1, 2, 6, 4, 5, 7, 3 };
+    if (assign == 9) return k51;
+    if (assign == 10) return k70;
+    if (assign == 11) return k71;
+    return nullptr;
+}
+
+static void submit_lpcm(basis_decoder* d, const uint8_t* p, int len, int64_t pts_us) {
+    int ch = d->ach;
+    int bytes = d->aLpcmBits / 8;
+    int frame_bytes = ch * bytes;
+    int frames = len / frame_bytes;
+    if (frames <= 0) return;
+    int floats = frames * ch;
+    if (floats > d->aLpcmBufCap) {
+        float* nb = (float*)realloc(d->aLpcmBuf, sizeof(float) * floats);
+        if (!nb) return;
+        d->aLpcmBuf = nb; d->aLpcmBufCap = floats;
+    }
+    const int* map = lpcm_remap(d->aLpcmAssign);
+    for (int f = 0; f < frames; ++f) {
+        const uint8_t* s = p + f * frame_bytes;
+        float* o = d->aLpcmBuf + f * ch;
+        for (int c = 0; c < ch; ++c) {
+            int oc = map ? map[c] : c;
+            if (bytes == 2) {
+                int v = (int16_t)((s[c * 2] << 8) | s[c * 2 + 1]);
+                o[oc] = v / 32768.0f;
+            } else {
+                int v = (s[c * 3] << 16) | (s[c * 3 + 1] << 8) | s[c * 3 + 2];
+                if (v & 0x800000) v -= 0x1000000;
+                o[oc] = v / 8388608.0f;
+            }
+        }
+    }
+    d->pcm.write(d->aLpcmBuf, floats, pts_us);
+    InterlockedIncrement(&d->dbg_aout);
+}
+
 extern "C" int basis_decoder_submit_audio(basis_decoder_t* d, const uint8_t* data, int len, int64_t pts_us) {
-    if (!d || !d->adec || !data || len <= 0) return -1;
+    if (!d || !data || len <= 0) return -1;
+    if (d->acodec == BASIS_CODEC_LPCM) { submit_lpcm(d, data, len, pts_us); return 0; }
+    if (!d->adec) return -1;
     IMFSample* s = make_input_sample(data, len, pts_us);
     HRESULT hr = d->adec->ProcessInput(0, s, 0);
     s->Release();

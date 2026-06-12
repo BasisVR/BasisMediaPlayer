@@ -1,9 +1,12 @@
 /*
- * basis_ts.c — MPEG-TS demuxer (PAT/PMT/PES) -> H.264/H.265 + AAC.
+ * basis_ts.c — MPEG-TS demuxer (PAT/PMT/PES) -> H.264/H.265 + AAC/LPCM.
  *
- * Live TS over HTTP is Annex-B video + ADTS audio in 188-byte packets. We resync
- * on 0x47, follow PAT->PMT to find the elementary PIDs, reassemble PES per PID,
- * and push access units / AAC frames into the sink. PCR/PTS are 90 kHz.
+ * Live TS over HTTP is Annex-B video + ADTS audio in 188-byte packets; m2ts
+ * streams (192-byte packets, a 4-byte TP_extra_header before each sync byte)
+ * carry the same tables plus Blu-ray HDMV LPCM audio (stream_type 0x80). We
+ * resync on 0x47 (detecting the packet stride), follow PAT->PMT to find the
+ * elementary PIDs, reassemble PES per PID, and push access units / audio
+ * frames into the sink. PCR/PTS are 90 kHz.
  */
 
 #include "basis_ts.h"
@@ -40,6 +43,7 @@ typedef struct {
     int audio_announced;
     int audio_sr, audio_ch, audio_profile;
     int video_announced;
+    int pkt_size;   /* 0 until detected; 188, or 192 for m2ts */
 } ts_t;
 
 static int accum_reserve(es_accum_t* e, int extra) {
@@ -103,6 +107,32 @@ static void flush_video(ts_t* t) {
     e->started = 0;
 }
 
+/* Blu-ray channel_assignment -> channel count (0 = reserved/unsupported). */
+static const int kLpcmChannels[16] = { 0, 1, 0, 2, 3, 3, 4, 4, 5, 6, 7, 8, 0, 0, 0, 0 };
+
+/* HDMV LPCM PES payload: a 4-byte header (16-bit data length; channel
+ * assignment + sample-rate code; bits-per-sample code) followed by big-endian
+ * PCM in Blu-ray channel order. The decode layer converts and reorders; the
+ * raw assignment + bits codes travel in the format announce's config blob. */
+static void flush_audio_lpcm(ts_t* t, const uint8_t* p, int remain, int64_t pts_us) {
+    if (remain <= 4) return;
+    if (!t->audio_announced) {
+        int assign = (p[2] >> 4) & 0xF;
+        int rate_code = p[2] & 0xF;
+        int sr = rate_code == 1 ? 48000 : rate_code == 4 ? 96000 : rate_code == 5 ? 192000 : 0;
+        int ch = kLpcmChannels[assign];
+        if (sr <= 0 || ch <= 0) return;
+        uint8_t cfg[2] = { (uint8_t)assign, (uint8_t)((p[3] >> 6) & 0x3) };
+        t->audio_sr = sr; t->audio_ch = ch; t->audio_profile = 0;
+        t->sink->on_audio_format(t->sink->user, BASIS_CODEC_LPCM, sr, ch, cfg, 2);
+        t->audio_announced = 1;
+    }
+    int dlen = (p[0] << 8) | p[1];
+    int alen = remain - 4;
+    if (dlen > 0 && dlen < alen) alen = dlen;
+    t->sink->on_audio_frame(t->sink->user, p + 4, alen, pts_us);
+}
+
 static void flush_audio(ts_t* t) {
     es_accum_t* e = &t->a;
     if (!e->started || e->len <= 0) { e->len = 0; e->started = 0; return; }
@@ -115,6 +145,13 @@ static void flush_audio(ts_t* t) {
     int remain = e->len - off;
     int64_t base_us = pts >= 0 ? pts_to_us(pts) : e->pts_us;
     int frame_idx = 0;
+
+    if (t->audio_codec == BASIS_CODEC_LPCM) {
+        flush_audio_lpcm(t, p, remain, base_us);
+        e->len = 0;
+        e->started = 0;
+        return;
+    }
 
     while (remain >= 7) {
         basis_adts_t ad;
@@ -187,6 +224,7 @@ static void parse_pmt(ts_t* t, const uint8_t* p, int plen) {
         if ((stype == 0x1B) && t->video_pid < 0) { t->video_pid = pid; t->video_codec = BASIS_CODEC_H264; t->v.pid = pid; }
         else if ((stype == 0x24) && t->video_pid < 0) { t->video_pid = pid; t->video_codec = BASIS_CODEC_H265; t->v.pid = pid; }
         else if ((stype == 0x0F || stype == 0x11) && t->audio_pid < 0) { t->audio_pid = pid; t->audio_codec = BASIS_CODEC_AAC; t->a.pid = pid; }
+        else if (stype == 0x80 && t->audio_pid < 0) { t->audio_pid = pid; t->audio_codec = BASIS_CODEC_LPCM; t->a.pid = pid; }
         es += 5 + eslen;
     }
 }
@@ -228,11 +266,19 @@ int basis_ts_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
         rb_len += n;
 
         int i = 0;
-        while (rb_len - i >= TS_PKT) {
+        for (;;) {
+            /* Stride detection needs two packets of lookahead beyond the sync
+             * byte; once locked, one packet at a time. */
+            int need = t.pkt_size ? t.pkt_size : 2 * 192 + 1;
+            if (rb_len - i < need) break;
             if (rb[i] != 0x47) { i++; continue; }            /* resync */
-            if (rb_len - i < TS_PKT) break;
+            if (!t.pkt_size) {
+                if (rb[i + 188] == 0x47 && rb[i + 376] == 0x47) t.pkt_size = 188;
+                else if (rb[i + 192] == 0x47 && rb[i + 384] == 0x47) t.pkt_size = 192; /* m2ts */
+                else { i++; continue; }
+            }
             handle_packet(&t, rb + i);
-            i += TS_PKT;
+            i += t.pkt_size;
         }
         /* keep the tail */
         if (i > 0) { memmove(rb, rb + i, (size_t)(rb_len - i)); rb_len -= i; }
