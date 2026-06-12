@@ -2,27 +2,33 @@ using UnityEngine;
 
 // Declares which decoded channel(s) one AudioSource plays inside a
 // BasisMediaPlayerMultiChannelAudio output set. Sits on the same GameObject as
-// the AudioSource. Mono selections take a single channel; Stereo plays a
-// stereo downmix of the whole stream as a 2-channel clip.
+// the AudioSource. Channel selections take a single decoded channel; Stereo
+// plays a stereo downmix of the whole stream as a 2-channel clip.
 //
-// Channel numbers follow the decoded WAVE order:
-//   1 Front Left  2 Front Right  3 Front Centre  4 LFE  5 Back Left  6 Back Right
+// What each channel carries depends on the stream's layout — e.g. a 5.1 stream
+// decodes in WAVE order (1 Front Left, 2 Front Right, 3 Front Centre, 4 LFE,
+// 5 Back Left, 6 Back Right), while a custom mix can use them as arbitrary
+// content lanes.
 [RequireComponent(typeof(AudioSource))]
 public sealed class BasisMediaAudioChannel : MonoBehaviour
 {
     public enum Selection
     {
-        [InspectorName("Mono 1 (Front Left)")] Mono1 = 0,
-        [InspectorName("Mono 2 (Front Right)")] Mono2 = 1,
-        [InspectorName("Mono 3 (Front Centre)")] Mono3 = 2,
-        [InspectorName("Mono 4 (LFE)")] Mono4 = 3,
-        [InspectorName("Mono 5 (Back Left)")] Mono5 = 4,
-        [InspectorName("Mono 6 (Back Right)")] Mono6 = 5,
+        [InspectorName("Channel 1")] Channel1 = 0,
+        [InspectorName("Channel 2")] Channel2 = 1,
+        [InspectorName("Channel 3")] Channel3 = 2,
+        [InspectorName("Channel 4")] Channel4 = 3,
+        [InspectorName("Channel 5")] Channel5 = 4,
+        [InspectorName("Channel 6")] Channel6 = 5,
+        [InspectorName("Channel 7")] Channel7 = 6,
+        [InspectorName("Channel 8")] Channel8 = 7,
+        // Values 0-63 are direct decoded channel indices; 100+ are reserved for
+        // mixed/virtual output modes so future channels don't collide.
         [InspectorName("Stereo (downmix)")] Stereo = 100,
     }
 
-    [Tooltip("Which decoded channel(s) this AudioSource plays. Mono picks one channel; Stereo plays a stereo downmix of the whole stream.")]
-    public Selection Channel = Selection.Mono1;
+    [Tooltip("Which decoded channel(s) this AudioSource plays. Channel N picks one decoded channel; Stereo plays a stereo downmix of the whole stream.")]
+    public Selection Channel = Selection.Channel1;
 
     public bool IsStereo => Channel == Selection.Stereo;
 

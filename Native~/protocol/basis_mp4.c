@@ -148,7 +148,7 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
                                 int sri = ((t->asc[0] & 7) << 1) | (t->asc[1] >> 7);
                                 t->obj = aot;
                                 if (!t->sr) t->sr = basis_aac_sample_rate_from_index(sri);
-                                if (!t->ch) t->ch = (t->asc[1] >> 3) & 0xF;
+                                if (!t->ch) t->ch = basis_aac_channels_from_config((t->asc[1] >> 3) & 0xF);
                             }
                             break;
                         }

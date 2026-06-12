@@ -124,8 +124,9 @@ static void flush_audio(ts_t* t) {
         if (!t->audio_announced) {
             uint8_t asc[2];
             basis_aac_build_asc(ad.profile + 1, ad.sample_rate, ad.channels, asc);
-            t->audio_sr = ad.sample_rate; t->audio_ch = ad.channels; t->audio_profile = ad.profile;
-            t->sink->on_audio_format(t->sink->user, BASIS_CODEC_AAC, ad.sample_rate, ad.channels, asc, 2);
+            int ach = basis_aac_channels_from_config(ad.channels);
+            t->audio_sr = ad.sample_rate; t->audio_ch = ach; t->audio_profile = ad.profile;
+            t->sink->on_audio_format(t->sink->user, BASIS_CODEC_AAC, ad.sample_rate, ach, asc, 2);
             t->audio_announced = 1;
         }
 

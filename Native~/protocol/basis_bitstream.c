@@ -170,6 +170,10 @@ int basis_adts_parse(const uint8_t* p, int len, basis_adts_t* out) {
     return 0;
 }
 
+int basis_aac_channels_from_config(int config) {
+    return config == 7 ? 8 : config;
+}
+
 int basis_aac_build_asc(int object_type, int sample_rate, int channels, uint8_t out[2]) {
     int sri = basis_aac_sample_rate_index(sample_rate);
     /* 5 bits AOT, 4 bits sample-rate index, 4 bits channel config */

@@ -42,7 +42,7 @@ int basis_avcc_extradata_to_annexb(const uint8_t* cfg, int cfg_len, int hevc,
 
 typedef struct basis_adts {
     int sample_rate;
-    int channels;
+    int channels;     /* raw channel_configuration (use basis_aac_channels_from_config for a count) */
     int profile;      /* MPEG-4 audio object type - 1 (ADTS profile field) */
     int frame_len;    /* full frame length incl. header */
     int header_len;   /* 7 or 9 */
@@ -51,8 +51,12 @@ typedef struct basis_adts {
 /* Parses an ADTS header at `p`. Returns 0 on success. */
 int basis_adts_parse(const uint8_t* p, int len, basis_adts_t* out);
 
+/* Maps an AAC channelConfiguration to a channel count. Configs 1-6 equal their
+ * count; config 7 is 7.1 (8 channels). */
+int basis_aac_channels_from_config(int config);
+
 /* Builds a 2-byte AudioSpecificConfig from object type (=profile+1), sample rate
- * and channel count. Returns 2. */
+ * and channelConfiguration. Returns 2. */
 int basis_aac_build_asc(int object_type, int sample_rate, int channels, uint8_t out[2]);
 
 /* Builds a 7-byte ADTS header for a raw AAC frame of `aac_len` bytes. Returns 7. */

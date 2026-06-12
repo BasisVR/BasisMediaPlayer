@@ -7,7 +7,7 @@ using UnityEngine;
 //
 // List the AudioSources that should play content audio in Outputs. Each one
 // carries a BasisMediaAudioChannel component declaring which decoded channel(s)
-// it plays (mono 1-6, or a stereo downmix). Decoded audio arrives interleaved
+// it plays (a single channel 1-8, or a stereo downmix). Decoded audio arrives interleaved
 // from the native engine's PCM ring (NativePcmSource); a
 // BasisMultiChannelPcmSplitter broadcasts it so every output reads independently
 // — the same channel can feed two AudioSources in different places. The package
@@ -52,7 +52,8 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     public long CurrentMediaTimeUs => 0;
 
     // Read-only metrics for BasisMediaPlayerDiagnostics, so the CSV works for
-    // this sink too. Tracked on the audio thread from the primary output.
+    // this sink too. Tracked on the audio thread from the primary output (the
+    // first valid entry in Outputs).
     private long consumedSamples;
     private float lastPcmPeak;
     private float lastPcmRms;
@@ -75,13 +76,14 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     public IBasisPcmSource NativePcmSource
     {
         get => nativePcmSource;
-        set { if (!ReferenceEquals(nativePcmSource, value)) { nativePcmSource = value; rebuildRequested = true; } }
+        set { if (!ReferenceEquals(nativePcmSource, value)) { nativePcmSource = value; formatKnown = false; rebuildRequested = true; } }
     }
 
     private sealed class Binding
     {
         public AudioSource Source;
         public AudioClip Clip;
+        public BasisMultiChannelPcmSplitter Splitter;
         public BasisMultiChannelPcmSplitter.Reader Reader;
         public BasisMultiChannelPcmSplitter.Tap[] Taps;
         public int OutChannels;
@@ -93,12 +95,14 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     private int builtChannels;
     private int builtRate;
     private bool rebuildRequested;
+    private bool formatKnown;
     private volatile int pendingFormatRate;
     private volatile int pendingFormatChannels;
 
     public void SetExpectedFormat(int sampleRate, int channels)
     {
         if (sampleRate <= 0 || channels <= 0) return;
+        formatKnown = true;
         if (sampleRate == builtRate && channels == builtChannels) return;
         pendingFormatRate = sampleRate;
         pendingFormatChannels = Mathf.Clamp(channels, 1, 8);
@@ -150,6 +154,11 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
 
         if (nativePcmSource == null || Outputs == null) { splitter = null; return; }
 
+        // Don't build clips from the serialized format guess — wait for the
+        // decoder's real format. Teardown above zeroed builtRate/builtChannels,
+        // so the SetExpectedFormat that announces it re-requests this rebuild.
+        if (!formatKnown) { splitter = null; return; }
+
         int rate = Mathf.Max(8000, SampleRate);
         int channels = Mathf.Clamp(ChannelCount, 1, 8);
         int windowSamples = Mathf.RoundToInt(rate * Mathf.Min(ClipLengthSeconds, BasisMediaPlayerSecurity.ClipLengthSecondsCap));
@@ -181,7 +190,7 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
                 if (sel == null)
                 {
                     BasisDebug.LogWarning(
-                        $"BasisMediaPlayerMultiChannelAudio: '{src.name}' has no BasisMediaAudioChannel; defaulting it to mono channel {i + 1}.",
+                        $"BasisMediaPlayerMultiChannelAudio: '{src.name}' has no BasisMediaAudioChannel; defaulting it to channel {i + 1}.",
                         BasisDebug.LogTag.Video);
                 }
                 int monoChannel = sel != null ? sel.PrimaryChannel : i;
@@ -198,7 +207,7 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
                 taps = new[] { new BasisMultiChannelPcmSplitter.Tap(monoChannel, 0, 1f) };
             }
 
-            var b = new Binding { Source = src, Reader = splitter.CreateReader(), OutChannels = outChannels, Taps = taps };
+            var b = new Binding { Source = src, Splitter = splitter, Reader = splitter.CreateReader(), OutChannels = outChannels, Taps = taps };
             b.Clip = AudioClip.Create(
                 name: $"BasisMultiChannelAudio_{i}",
                 lengthSamples: clipLenSamples,
@@ -209,43 +218,73 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
             src.clip = b.Clip;
             src.loop = true;
             b.Primary = built.Count == 0;
-            if (isActiveAndEnabled && AutoPlayOnEnable) src.Play();
             built.Add(b);
         }
         bindings = built.ToArray();
+        if (isActiveAndEnabled && AutoPlayOnEnable) PlayAll();
     }
 
-    // Stereo fold-down of the available channels. 5.1 uses the ITU coefficients
-    // (centre and surrounds at -3 dB, LFE dropped); fewer channels fall back to
-    // the front pair, mono duplicated to both.
+    // Stereo fold-down of the available channels, assuming the decoder's WAVE
+    // channel order: the front pair passes straight through, the centre folds
+    // into both sides at -3 dB, the LFE (index 3 in 6+ channel layouts) is
+    // dropped, and the remaining channels alternate left/right at -3 dB. The
+    // taps are then scaled so a full-scale input can't exceed +/-1.0 on either
+    // output. Mono duplicates to both sides.
     private static BasisMultiChannelPcmSplitter.Tap[] BuildDownmixTaps(int channels)
     {
         const float att = 0.70710678f;
-        if (channels >= 6)
-        {
-            return new[]
-            {
-                new BasisMultiChannelPcmSplitter.Tap(0, 0, 1f),    // FL -> L
-                new BasisMultiChannelPcmSplitter.Tap(2, 0, att),   // FC -> L
-                new BasisMultiChannelPcmSplitter.Tap(4, 0, att),   // BL -> L
-                new BasisMultiChannelPcmSplitter.Tap(1, 1, 1f),    // FR -> R
-                new BasisMultiChannelPcmSplitter.Tap(2, 1, att),   // FC -> R
-                new BasisMultiChannelPcmSplitter.Tap(5, 1, att),   // BR -> R
-            };
-        }
-        if (channels >= 2)
+        if (channels <= 1)
         {
             return new[]
             {
                 new BasisMultiChannelPcmSplitter.Tap(0, 0, 1f),
-                new BasisMultiChannelPcmSplitter.Tap(1, 1, 1f),
+                new BasisMultiChannelPcmSplitter.Tap(0, 1, 1f),
             };
         }
-        return new[]
+
+        var taps = new List<BasisMultiChannelPcmSplitter.Tap>(channels + 2)
         {
             new BasisMultiChannelPcmSplitter.Tap(0, 0, 1f),
-            new BasisMultiChannelPcmSplitter.Tap(0, 1, 1f),
+            new BasisMultiChannelPcmSplitter.Tap(1, 1, 1f),
         };
+        if (channels >= 3)
+        {
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(2, 0, att));
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(2, 1, att));
+        }
+        int next = 3;
+        if (channels == 4)
+        {
+            // 4.0's fourth channel is the back centre; fold it into both sides.
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(3, 0, att));
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(3, 1, att));
+            next = 4;
+        }
+        else if (channels >= 6)
+        {
+            next = 4;
+        }
+        bool intoLeft = true;
+        for (int c = next; c < channels; c++)
+        {
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(c, intoLeft ? 0 : 1, att));
+            intoLeft = !intoLeft;
+        }
+
+        float sumL = 0f, sumR = 0f;
+        int tapCount = taps.Count;
+        for (int i = 0; i < tapCount; i++)
+        {
+            if (taps[i].Out == 0) sumL += taps[i].Coeff;
+            else sumR += taps[i].Coeff;
+        }
+        float norm = 1f / Mathf.Max(1f, Mathf.Max(sumL, sumR));
+        var result = new BasisMultiChannelPcmSplitter.Tap[tapCount];
+        for (int i = 0; i < tapCount; i++)
+        {
+            result[i] = new BasisMultiChannelPcmSplitter.Tap(taps[i].Source, taps[i].Out, taps[i].Coeff * norm);
+        }
+        return result;
     }
 
     private void TeardownClips()
@@ -266,8 +305,12 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     private void PlayAll()
     {
         if (bindings == null) return;
+        // One shared DSP start time keeps the channels sample-aligned;
+        // sequential Play() calls can land on different DSP ticks and leave a
+        // constant inter-channel offset.
+        double start = AudioSettings.dspTime + 0.05;
         foreach (var b in bindings)
-            if (b.Source != null && b.Clip != null && !b.Source.isPlaying) b.Source.Play();
+            if (b.Source != null && b.Clip != null && !b.Source.isPlaying) b.Source.PlayScheduled(start);
     }
 
     private void StopAll()
@@ -281,7 +324,7 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     // broadcast window; the splitter handles the source ring and de-interleave.
     private void OnPcmRead(Binding b, float[] data)
     {
-        var s = splitter;
+        var s = b.Splitter;
         Array.Clear(data, 0, data.Length);
         if (s != null)
         {
