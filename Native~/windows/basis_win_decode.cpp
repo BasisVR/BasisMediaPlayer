@@ -51,27 +51,101 @@
 
 /* ---- PCM ring ----------------------------------------------------------- */
 
+/* Interleaved float FIFO with per-chunk PTS metadata. The producer (decode
+ * thread) writes decoded chunks tagged with their media timestamps; the
+ * consumer (Unity audio thread) reads gated against the presentation clock so
+ * audio release is paced to the same timeline video presents on. All drops are
+ * whole-frame multiples — a non-frame-sized drop would permanently rotate the
+ * channel order for every consumer downstream. */
 struct PcmRing {
     float* buf = nullptr;
     int cap = 0;     /* in floats */
     int head = 0, tail = 0;
+    int frame = 1;   /* floats per interleaved frame (channel count) */
+    int sr = 48000;  /* sample rate, for chunk durations */
     CRITICAL_SECTION cs;
+
+    static const int CHUNKS = 1024;
+    struct Chunk { int64_t pts; int floats; };
+    Chunk chunks[CHUNKS] = {};
+    int chead = 0, ccount = 0;
+
+    /* Serving is sequential and never blocks on future timestamps — the
+     * consumer's own prefetch owns short-term timing. The clock is only used
+     * to detect a stale head (connect burst, post-stall backlog): when the
+     * oldest queued audio falls further than TRIM_LATE behind the clock, the
+     * queue is trimmed so the head sits CONSUMER_LEAD ahead of it. The lead
+     * compensates the consumer-side pipeline (Unity streaming-clip prefetch +
+     * DSP output latency): samples handed over now become audible roughly that
+     * much later, so a future-biased head lands on the clock at the speaker. */
+    static const int64_t TRIM_LATE_US = 150000;
+    static const int64_t CONSUMER_LEAD_US = 380000;
 
     void init(int floats) { cap = floats; buf = (float*)malloc(sizeof(float) * cap); InitializeCriticalSection(&cs); }
     void destroy() { free(buf); buf = nullptr; DeleteCriticalSection(&cs); }
-    void write(const float* s, int n) {
+
+    int fill() const { return (tail - head + cap) % cap; }
+
+    /* Drops the oldest `n` floats (rounded down to whole frames) from the float
+     * ring and the chunk metadata together. Caller holds cs. */
+    void drop_oldest(int n) {
+        n -= n % frame;
+        int avail = fill();
+        if (n > avail) n = avail - (avail % frame);
+        if (n <= 0) return;
+        head = (head + n) % cap;
+        while (n > 0 && ccount > 0) {
+            Chunk& c = chunks[chead];
+            if (c.floats <= n) { n -= c.floats; chead = (chead + 1) % CHUNKS; ccount--; }
+            else {
+                c.floats -= n;
+                c.pts += (int64_t)(n / frame) * 1000000LL / (sr > 0 ? sr : 48000);
+                n = 0;
+            }
+        }
+    }
+
+    void write(const float* s, int n, int64_t pts) {
+        if (n <= 0) return;
         EnterCriticalSection(&cs);
-        for (int i = 0; i < n; ++i) {
-            int nt = (tail + 1) % cap;
-            if (nt == head) head = (head + 1) % cap; /* overwrite oldest */
-            buf[tail] = s[i]; tail = nt;
+        if (n > cap - 1) { s += n - (cap - 1); n = cap - 1; }
+        int space = cap - 1 - fill();
+        if (n > space) {
+            int need = (n - space) + frame - 1;
+            drop_oldest(need - need % frame);
+        }
+        for (int i = 0; i < n; ++i) { buf[tail] = s[i]; tail = (tail + 1) % cap; }
+        if (ccount == CHUNKS) {
+            chunks[(chead + ccount - 1) % CHUNKS].floats += n;
+        } else {
+            Chunk& c = chunks[(chead + ccount) % CHUNKS];
+            c.pts = pts; c.floats = n; ccount++;
         }
         LeaveCriticalSection(&cs);
     }
-    int read(float* out, int n) {
+
+    /* now_us = INT64_MIN reads ungated (no presentation clock yet). */
+    int read(float* out, int n, int64_t now_us) {
         EnterCriticalSection(&cs);
+        int64_t srr = sr > 0 ? sr : 48000;
+        if (now_us != INT64_MIN && ccount > 0) {
+            int64_t late = now_us - chunks[chead].pts;
+            if (late > TRIM_LATE_US) {
+                drop_oldest((int)((late + CONSUMER_LEAD_US) * srr / 1000000LL) * frame);
+            }
+        }
         int got = 0;
-        while (got < n && head != tail) { out[got++] = buf[head]; head = (head + 1) % cap; }
+        while (got < n && ccount > 0) {
+            Chunk& c = chunks[chead];
+            int take = c.floats < n - got ? c.floats : n - got;
+            for (int i = 0; i < take; ++i) { out[got + i] = buf[head]; head = (head + 1) % cap; }
+            got += take;
+            if (take == c.floats) { chead = (chead + 1) % CHUNKS; ccount--; }
+            else {
+                c.floats -= take;
+                c.pts += (int64_t)take * 1000000LL / (frame * srr);
+            }
+        }
         LeaveCriticalSection(&cs);
         return got;
     }
@@ -160,6 +234,13 @@ struct basis_decoder {
     bool aconfigured = false;
     volatile LONG dbg_aout = 0;     /* AAC PCM outputs produced */
     PcmRing pcm;
+    int64_t aPtsFallback = 0;       /* next chunk PTS when MF gives no sample time */
+
+    /* Presentation-clock snapshot for the audio gate, published by
+     * render_update each frame and extrapolated on the audio thread via QPC.
+     * Zero QPC = clock not started (audio reads ungated). */
+    volatile LONGLONG audClockMediaUs = 0;
+    volatile LONGLONG audClockQpc = 0;
 };
 
 /* ---- D3D / MF helpers --------------------------------------------------- */
@@ -490,10 +571,11 @@ static bool configure_audio_mft(basis_decoder* d, const uint8_t* asc, int asc_le
     in->Release();
     if (FAILED(hr)) { SAFE_RELEASE(d->adec); return false; }
 
-    /* Pick the output type the decoder offers. Prefer IEEE float, then a channel
-     * count matching the input, then more channels. For >2-channel AAC the
+    /* Pick the output type the decoder offers. Prefer a channel count matching
+     * the input, then IEEE float, then more channels. For >2-channel AAC the
      * decoder also offers a stereo fold-down, so matching the input channel
-     * count is what keeps the discrete surround channels (e.g. 5.1). */
+     * count is what keeps the discrete surround channels (e.g. 5.1); float vs
+     * 16-bit PCM only changes the conversion in drain_audio. */
     IMFMediaType* chosen = nullptr; int bits = 0; int chosenRank = -1;
     int target = d->ach ? d->ach : 2;
     for (DWORD i = 0; ; ++i) {
@@ -506,7 +588,7 @@ static bool configure_audio_mft(basis_decoder* d, const uint8_t* asc, int asc_le
         bool isFloat = (sub == MFAudioFormat_Float);
         bool isPcm = (sub == MFAudioFormat_PCM);
         if (!isFloat && !isPcm) { t->Release(); continue; }
-        int rank = (isFloat ? 1000 : 0) + ((int)tch == target ? 500 : 0) + (int)tch;
+        int rank = ((int)tch == target ? 10000 : 0) + (isFloat ? 1000 : 0) + (int)tch;
         if (rank > chosenRank) {
             if (chosen) chosen->Release();
             chosen = t; chosenRank = rank;
@@ -546,8 +628,15 @@ static void drain_audio(basis_decoder* d) {
         HRESULT hr = d->adec->ProcessOutput(0, 1, &ob, &status);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(hr)) { mb->Release(); sample->Release(); break; }
 
+        /* The decoder propagates input sample times to its outputs; fall back
+         * to a sample-counted timeline if one comes back without a time. */
+        LONGLONG st100 = 0;
+        int64_t pts = SUCCEEDED(sample->GetSampleTime(&st100)) ? st100 / 10 : d->aPtsFallback;
+
         BYTE* p = nullptr; DWORD cur = 0;
         if (SUCCEEDED(mb->Lock(&p, nullptr, &cur)) && cur > 0) {
+            int srr = d->asr > 0 ? d->asr : 48000;
+            int ch = d->ach > 0 ? d->ach : 1;
             if (d->aBits == 16) {
                 int n = (int)(cur / 2);
                 const int16_t* s16 = (const int16_t*)p;
@@ -556,11 +645,14 @@ static void drain_audio(basis_decoder* d) {
                 while (off < n) {
                     int c = n - off; if (c > 4096) c = 4096;
                     for (int i = 0; i < c; ++i) tmp[i] = s16[off + i] / 32768.0f;
-                    d->pcm.write(tmp, c);
+                    d->pcm.write(tmp, c, pts + (int64_t)(off / ch) * 1000000LL / srr);
                     off += c;
                 }
+                d->aPtsFallback = pts + (int64_t)(n / ch) * 1000000LL / srr;
             } else {
-                d->pcm.write((const float*)p, (int)(cur / sizeof(float)));
+                int n = (int)(cur / sizeof(float));
+                d->pcm.write((const float*)p, n, pts);
+                d->aPtsFallback = pts + (int64_t)(n / ch) * 1000000LL / srr;
             }
             mb->Unlock();
             InterlockedIncrement(&d->dbg_aout);
@@ -630,7 +722,11 @@ extern "C" int basis_decoder_set_audio_format(basis_decoder_t* d, basis_codec_t 
                                               int sample_rate, int channels, const uint8_t* asc, int asc_len) {
     if (!d || d->aconfigured || codec != BASIS_CODEC_AAC) return 0;
     d->asr = sample_rate; d->ach = channels;
-    if (configure_audio_mft(d, asc, asc_len)) d->aconfigured = true;
+    if (configure_audio_mft(d, asc, asc_len)) {
+        d->aconfigured = true;
+        d->pcm.frame = d->ach > 0 ? d->ach : 1;
+        d->pcm.sr = d->asr > 0 ? d->asr : 48000;
+    }
     return 0;
 }
 
@@ -753,7 +849,12 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
         if (fill < 2 * interval) buf += interval;
         else if (fill > buf + 200000) buf -= 10000;
     }
-    if (buf < 40000) buf = 40000;
+    /* With audio configured, the buffer must cover the audio consumer's
+     * pipeline depth (streaming-clip prefetch + DSP latency, ~400ms): audio
+     * cannot be released from ahead of the live decode edge, so video must
+     * present at least that far behind it for the two to land together. */
+    int64_t minBuf = d->aconfigured ? 460000 : 40000;
+    if (buf < minBuf) buf = minBuf;
     if (buf > maxBuf) buf = maxBuf;
     d->bufferUs = (LONG)buf;
 
@@ -765,6 +866,11 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
     int64_t effBuf = (wallElapsed < 1200000) ? (buf * wallElapsed / 1200000) : buf;
     int64_t nowMedia = liveClock - effBuf;
     d->dbg_lagms = (LONG)((newest - nowMedia) / 1000);
+
+    /* Snapshot the clock for the audio gate; the audio thread extrapolates
+     * from this anchor via QPC between renders. */
+    InterlockedExchange64(&d->audClockMediaUs, nowMedia);
+    InterlockedExchange64(&d->audClockQpc, nowq.QuadPart);
 
     /* recover from non-monotonic/bogus PTS (lastPresentedPts stuck above the ring) */
     if (d->lastPresentedPts != INT64_MIN && d->lastPresentedPts > newest) d->lastPresentedPts = INT64_MIN;
@@ -835,7 +941,19 @@ extern "C" int basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c
 }
 extern "C" int basis_decoder_read_audio(basis_decoder_t* d, float* out, int max_floats) {
     if (!d) return 0;
-    int n = d->pcm.read(out, max_floats);
+    if (basis_engine_is_paused(d->engine)) return 0;
+    /* Extrapolate the presentation clock from the last published anchor so
+     * audio release is paced to the timeline video presents on. No anchor yet
+     * (no video frame presented, or an audio-only stream) reads ungated. */
+    int64_t now = INT64_MIN;
+    LONGLONG aq = InterlockedCompareExchange64(&d->audClockQpc, 0, 0);
+    if (aq != 0) {
+        LONGLONG am = InterlockedCompareExchange64(&d->audClockMediaUs, 0, 0);
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        int64_t freq = d->qpcFreq.QuadPart ? d->qpcFreq.QuadPart : 1;
+        now = am + (q.QuadPart - aq) * 1000000LL / freq;
+    }
+    int n = d->pcm.read(out, max_floats, now);
     if (n > 0 && d->ach > 0) InterlockedAdd64(&d->audioSamplesRead, (LONGLONG)(n / d->ach));
     return n;
 }
