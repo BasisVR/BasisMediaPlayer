@@ -123,6 +123,9 @@ public sealed class BasisMultiChannelPcmSplitter
     // an underrun -> silence). Caller holds gate.
     private bool Pump()
     {
+        // ReadPcm runs on Unity's audio thread (via the clip PCM callback) under
+        // `gate`; IBasisPcmSource implementations must be non-blocking and
+        // allocation-free here.
         int got = source != null ? source.ReadPcm(readBuf) : 0;
         int total = carryLen + got;
         int frames = total / channelCount;
@@ -146,6 +149,9 @@ public sealed class BasisMultiChannelPcmSplitter
 
         int usable = frames * channelCount;
         int leftover = total - usable;
+        // carryLen is always a sub-frame remainder (< channelCount), and frames
+        // >= 1 here, so usable >= channelCount > carryLen: the leftover lies
+        // wholly within readBuf and the index is never negative.
         for (int i = 0; i < leftover; i++) carry[i] = readBuf[usable + i - carryLen];
         carryLen = leftover;
         return true;

@@ -95,7 +95,7 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
     private int builtChannels;
     private int builtRate;
     private bool rebuildRequested;
-    private bool formatKnown;
+    private volatile bool formatKnown;
     private volatile int pendingFormatRate;
     private volatile int pendingFormatChannels;
 
@@ -200,7 +200,7 @@ public sealed class BasisMediaPlayerMultiChannelAudio : MonoBehaviour, IBasisMed
                     // output on a stereo stream) — leave this AudioSource silent
                     // rather than doubling another channel onto it.
                     src.Stop();
-                    if (src.clip != null) src.clip = null;
+                    src.clip = null;
                     continue;
                 }
                 outChannels = 1;

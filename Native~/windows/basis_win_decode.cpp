@@ -108,7 +108,16 @@ struct PcmRing {
     void write(const float* s, int n, int64_t pts) {
         if (n <= 0) return;
         EnterCriticalSection(&cs);
-        if (n > cap - 1) { s += n - (cap - 1); n = cap - 1; }
+        if (n > cap - 1) {
+            /* Drop the oldest whole frames of an over-capacity write and carry
+             * the timestamp forward, so the retained tail keeps a correct PTS
+             * and the channel order isn't rotated by a sub-frame trim. */
+            int keep = (cap - 1) - ((cap - 1) % frame);
+            int drop = n - keep;
+            s += drop;
+            pts += (int64_t)(drop / frame) * 1000000LL / (sr > 0 ? sr : 48000);
+            n = keep;
+        }
         int space = cap - 1 - fill();
         if (n > space) {
             int need = (n - space) + frame - 1;
@@ -649,9 +658,13 @@ static void drain_audio(basis_decoder* d) {
                 int n = (int)(cur / 2);
                 const int16_t* s16 = (const int16_t*)p;
                 float tmp[4096];
+                int maxFrames = 4096 / ch; if (maxFrames < 1) maxFrames = 1;
                 int off = 0;
-                while (off < n) {
-                    int c = n - off; if (c > 4096) c = 4096;
+                /* Write whole interleaved frames only: a sub-frame chunk would
+                 * give the ring's per-chunk PTS a fractional sample count. */
+                while (off + ch <= n) {
+                    int framesLeft = (n - off) / ch;
+                    int c = (framesLeft > maxFrames ? maxFrames : framesLeft) * ch;
                     for (int i = 0; i < c; ++i) tmp[i] = s16[off + i] / 32768.0f;
                     d->pcm.write(tmp, c, pts + (int64_t)(off / ch) * 1000000LL / srr);
                     off += c;
@@ -733,9 +746,11 @@ extern "C" int basis_decoder_set_audio_format(basis_decoder_t* d, basis_codec_t 
 
     if (codec == BASIS_CODEC_LPCM) {
         /* No decoder involved — submit_audio converts straight into the ring.
-         * 48 kHz only (the streaming-clip consumer plays at the clip rate, so
-         * 96/192 kHz needs the resampler this player doesn't have yet); the
-         * config blob carries the Blu-ray channel_assignment + bits code. */
+         * 48 kHz / 16- or 24-bit only (the streaming-clip consumer plays at the
+         * clip rate, so 96/192 kHz needs a resampler this player doesn't have
+         * yet). The TS demuxer already filters to these formats before
+         * announcing; this guard is the matching backstop. The config blob
+         * carries the Blu-ray channel_assignment + bits code. */
         if (sample_rate != 48000 || channels < 1 || channels > 8 || asc_len < 2) return 0;
         int bits = asc[1] == 1 ? 16 : asc[1] == 3 ? 24 : 0;
         if (!bits) return 0; /* 20-bit unsupported */
@@ -799,9 +814,12 @@ extern "C" int basis_decoder_submit_video(basis_decoder_t* d, const uint8_t* ann
     return 0;
 }
 
-/* Source-order -> WAVE-order channel map for the Blu-ray assignments whose
- * orders differ (5.1, 7.0, 7.1: Blu-ray puts the LFE last and the side pair
- * before the rears). NULL = identity. */
+/* Source-order -> WAVE-order channel map for the Blu-ray HDMV LPCM
+ * channel_assignment values whose stream order differs from WAVE (Blu-ray
+ * places the LFE last and the side pair before the rears). The index tables
+ * match ffmpeg's pcm_bluray decoder remap for assignments 9 (5.1), 10 (7.0)
+ * and 11 (7.1), and were verified by ear against a 7.1 channel-marker stream.
+ * NULL = identity (mono/stereo/3.0/4.0/5.0 already arrive in WAVE order). */
 static const int* lpcm_remap(int assign) {
     static const int k51[6] = { 0, 1, 2, 4, 5, 3 };
     static const int k70[7] = { 0, 1, 2, 5, 3, 4, 6 };

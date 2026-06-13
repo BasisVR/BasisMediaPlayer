@@ -119,12 +119,18 @@ static void flush_audio_lpcm(ts_t* t, const uint8_t* p, int remain, int64_t pts_
     if (!t->audio_announced) {
         int assign = (p[2] >> 4) & 0xF;
         int rate_code = p[2] & 0xF;
-        int sr = rate_code == 1 ? 48000 : rate_code == 4 ? 96000 : rate_code == 5 ? 192000 : 0;
+        int bits_code = (p[3] >> 6) & 0x3;   /* 1 = 16-bit, 3 = 24-bit */
         int ch = kLpcmChannels[assign];
-        if (sr <= 0 || ch <= 0) return;
-        uint8_t cfg[2] = { (uint8_t)assign, (uint8_t)((p[3] >> 6) & 0x3) };
-        t->audio_sr = sr; t->audio_ch = ch; t->audio_profile = 0;
-        t->sink->on_audio_format(t->sink->user, BASIS_CODEC_LPCM, sr, ch, cfg, 2);
+        /* Only announce formats the LPCM decode path actually plays: 48 kHz,
+         * 16- or 24-bit. The decode layer plays at the stream rate with no
+         * resampler and no 20-bit unpack, so announcing 96/192 kHz or 20-bit
+         * would have the decoder drop it and leave the sink half-configured.
+         * Leaving them unannounced is graceful silence (video keeps playing),
+         * matching the AAC path's behaviour for unsupported audio. */
+        if (rate_code != 1 || (bits_code != 1 && bits_code != 3) || ch <= 0) return;
+        uint8_t cfg[2] = { (uint8_t)assign, (uint8_t)bits_code };
+        t->audio_sr = 48000; t->audio_ch = ch; t->audio_profile = 0;
+        t->sink->on_audio_format(t->sink->user, BASIS_CODEC_LPCM, 48000, ch, cfg, 2);
         t->audio_announced = 1;
     }
     int dlen = (p[0] << 8) | p[1];
