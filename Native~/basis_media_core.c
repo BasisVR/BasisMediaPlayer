@@ -22,6 +22,7 @@
 #include "protocol/basis_mp4.h"
 #include "protocol/basis_http.h"
 #include "protocol/basis_hls.h"
+#include "protocol/basis_rist.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -281,6 +282,19 @@ static void run_http_like(basis_media_engine_t* e) {
 #endif
 }
 
+/* RIST: librist recovers an MPEG-TS byte stream over UDP (ARQ + optional PSK-AES);
+ * once recovered it's the same MPEG-TS the player already demuxes, so we feed
+ * basis_rist_read straight into basis_ts_run. The receiver is built only when the
+ * plugin is compiled with BASIS_WITH_RIST; otherwise basis_rist_open reports a
+ * clear error via the sink and returns NULL. */
+static void run_rist(basis_media_engine_t* e) {
+    void* rist = basis_rist_open(&e->parts, &e->sink);
+    if (!rist) return;  /* basis_rist_open set the error on the sink */
+    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
+    basis_ts_run(&e->sink, basis_rist_read, rist);
+    basis_rist_close(rist);
+}
+
 /* Dispatch the URL to its protocol handler. Blocks until the stream drops, the
  * engine is stopped, or a hard error is set. */
 static void run_protocol_once(basis_media_engine_t* e) {
@@ -292,6 +306,8 @@ static void run_protocol_once(basis_media_engine_t* e) {
         } else {
             basis_rtmp_run(&e->sink, &e->parts);
         }
+    } else if (basis_url_is_rist(&e->parts)) {
+        run_rist(e);
     } else { /* http / https */
         run_http_like(e);
     }

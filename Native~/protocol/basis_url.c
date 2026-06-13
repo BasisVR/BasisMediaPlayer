@@ -41,8 +41,10 @@ int basis_url_parse(const char* url, basis_url_t* out) {
         slash = strchr(authority, '/');
     }
 
-    /* host[:port] */
-    const char* host_end = slash ? slash : (authority + strlen(authority));
+    /* host[:port] ends at the first '/' (path) or '?' (query). A RIST URL carries the
+     * query straight after the authority — rist://host:port?secret=… — with no path. */
+    const char* host_end = authority;
+    while (*host_end && *host_end != '/' && *host_end != '?') ++host_end;
     const char* colon = NULL;
     if (authority[0] == '[') {
         /* IPv6 literal */
@@ -65,11 +67,12 @@ int basis_url_parse(const char* url, basis_url_t* out) {
         out->port = atoi(colon + 1);
     }
 
-    /* path (+ query) */
-    if (slash) {
-        size_t pathlen = strlen(slash);
+    /* path and/or query: everything from the first '/' or '?'. Default "/" for a bare
+     * host:port. */
+    if (*host_end) {
+        size_t pathlen = strlen(host_end);
         if (pathlen >= sizeof(out->path)) pathlen = sizeof(out->path) - 1;
-        memcpy(out->path, slash, pathlen);
+        memcpy(out->path, host_end, pathlen);
         out->path[pathlen] = 0;
     } else {
         out->path[0] = '/';
@@ -94,6 +97,10 @@ int basis_url_parse(const char* url, basis_url_t* out) {
     } else if (strcmp(out->scheme, "https") == 0) {
         if (out->port == 0) out->port = 443;
         out->tls = 1;
+    } else if (strcmp(out->scheme, "rist") == 0) {
+        /* RIST has no well-known port; the caller always supplies host:port.
+         * Encryption (secret/aes-type) rides in the query, parsed by librist. */
+        out->tls = 0;
     } else {
         return -1; /* unsupported scheme */
     }
@@ -106,4 +113,8 @@ int basis_url_is_rtsp(const basis_url_t* u) {
 
 int basis_url_is_rtmp(const basis_url_t* u) {
     return u && (strcmp(u->scheme, "rtmp") == 0 || strcmp(u->scheme, "rtmps") == 0);
+}
+
+int basis_url_is_rist(const basis_url_t* u) {
+    return u && strcmp(u->scheme, "rist") == 0;
 }

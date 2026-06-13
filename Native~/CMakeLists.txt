@@ -56,6 +56,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(UNITY_PLUGIN_API_DIR "" CACHE PATH "Path to Unity's Editor/Data/PluginAPI headers")
 
+# RIST live-ingest transport (protocol/basis_rist.c). OFF by default: the plugin
+# then links only OS frameworks exactly as before, and basis_rist.c compiles to a
+# graceful "not built" stub. ON links the librist static (built from source by
+# Native~/build-librist.*, mbedTLS bundled in) from third_party/ into the plugin —
+# see third_party/README.md.
+option(BASIS_WITH_RIST "Build the RIST transport (links librist built from source by build-librist.*)" OFF)
+
 # Portable core (every platform)
 set(CORE_SOURCES
     basis_media_core.c
@@ -68,6 +75,7 @@ set(CORE_SOURCES
     protocol/basis_ts.c
     protocol/basis_mp4.c
     protocol/basis_hls.c
+    protocol/basis_rist.c
 )
 
 # ---------------------------------------------------------------------------
@@ -150,6 +158,48 @@ else()
     # Linux stub.
     find_package(Threads REQUIRED)
     target_link_libraries(basis_media_native PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+# ---------------------------------------------------------------------------
+# RIST: link the librist static for the target platform. librist vendors its own
+# mbedTLS and links it into the archive, so a single library per platform is all
+# that's needed. The static is built from source by Native~/build-librist.* into
+# third_party/<rid>/ (see third_party/README.md); headers under third_party/include.
+# They stay out of Unity's import (Native~/ is hidden by the trailing ~), so they're
+# pure build inputs — never committed, never shipped as separate Unity plugins; they
+# link into basis_media_native itself.
+# ---------------------------------------------------------------------------
+if(BASIS_WITH_RIST)
+    set(RIST_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+    # Map the target to its librist static directory (mirrors the runtime-identifier
+    # naming Basis already uses for Opus's native binaries).
+    if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT (CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64"))
+        set(RIST_RID win-x64)
+    elseif(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+        set(RIST_RID android-arm64)
+    else()
+        message(FATAL_ERROR "BASIS_WITH_RIST: no librist static for this target yet. "
+                            "Supported: Windows x64, Android arm64-v8a. See third_party/README.md.")
+    endif()
+
+    set(RIST_LIBDIR ${RIST_ROOT}/${RIST_RID})
+    find_library(RIST_LIB rist PATHS ${RIST_LIBDIR} NO_DEFAULT_PATH)  # rist.lib (win) / librist.a (android)
+    if(NOT RIST_LIB)
+        message(FATAL_ERROR "BASIS_WITH_RIST: librist not found in ${RIST_LIBDIR}. "
+                            "Build it from source first: run Native~/build-librist.* (see third_party/README.md).")
+    endif()
+
+    target_compile_definitions(basis_media_native PRIVATE BASIS_WITH_RIST)
+    target_include_directories(basis_media_native PRIVATE ${RIST_ROOT}/include)
+    target_link_libraries(basis_media_native PRIVATE ${RIST_LIB})
+
+    if(WIN32)
+        # librist's transitive Windows deps (a static archive doesn't carry them):
+        # ws2_32 (UDP sockets), bcrypt (bundled mbedTLS entropy), iphlpapi
+        # (GetAdaptersInfo, used by librist's network code for the adapter MAC).
+        target_link_libraries(basis_media_native PRIVATE ws2_32 bcrypt iphlpapi)
+    endif()
 endif()
 
 if(MSVC)

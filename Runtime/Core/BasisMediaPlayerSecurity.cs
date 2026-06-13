@@ -33,9 +33,11 @@ public static class BasisMediaPlayerSecurity
         //   rtsp/rtspt  RTSP over UDP/TCP (rtspt = interleaved over TCP, low latency)
         //   rtmp/rtmps  RTMP / RTMP-over-TLS
         //   http/https  fragmented MP4 (.mp4) and MPEG-TS (.ts) over HTTP(S)
+        //   rist        RIST live ingest (MPEG-TS over UDP; requires a BASIS_WITH_RIST build)
         if (scheme != "http" && scheme != "https" &&
             scheme != "rtsp" && scheme != "rtspt" &&
-            scheme != "rtmp" && scheme != "rtmps")
+            scheme != "rtmp" && scheme != "rtmps" &&
+            scheme != "rist")
         {
             reason = $"Scheme '{scheme}' is not allowed.";
             return false;
