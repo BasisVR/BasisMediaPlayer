@@ -564,9 +564,8 @@ namespace Basis.BasisUI.MediaPlayer
             var audio = _activePlayer.AudioComponent;
             if (audio != null)
             {
-                var src = audio.ActiveAudioSource;
                 _debugBuilder.Append("\nAudio: ")
-                    .Append(src != null && src.isPlaying ? "playing" : "idle")
+                    .Append(audio.IsAnyOutputPlaying ? "playing" : "idle")
                     .Append(" peak ").Append(audio.LastPcmPeak.ToString("F3"))
                     .Append(" rms ").Append(audio.LastPcmRms.ToString("F3"));
             }

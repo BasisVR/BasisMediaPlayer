@@ -8,12 +8,10 @@ public class BasisMediaPlayerAudioInspector : Editor
     private const string UxmlPath = "Packages/com.basis.mediaplayer/Editor/StyleSheets/MediaPlayerAudioSDK.uxml";
     private const string UssPath = "Packages/com.basis.mediaplayer/Editor/StyleSheets/MediaPlayerSDK.uss";
 
-    private BasisMediaPlayerAudio _target;
     private VisualElement _root;
 
     public override VisualElement CreateInspectorGUI()
     {
-        _target = (BasisMediaPlayerAudio)target;
         _root = new VisualElement();
 
         var tree = AssetDatabase.LoadAssetAtPath<VisualTreeAsset>(UxmlPath);
@@ -26,27 +24,15 @@ public class BasisMediaPlayerAudioInspector : Editor
         tree.CloneTree(_root);
         if (sheet != null) _root.styleSheets.Add(sheet);
 
-        BindByName("TargetAudioSourceField", "TargetAudioSource");
-        BindByName("AssignClipOnAwakeField", "AssignClipOnAwake");
-        BindByName("ClipNameField", "ClipName");
+        BindByName("OutputsField", "Outputs");
         BindByName("SampleRateField", "SampleRate");
         BindByName("ChannelCountField", "ChannelCount");
         BindByName("ClipLengthField", "ClipLengthSeconds");
-        BindByName("MaxQueuedField", "MaxQueuedFrames");
-        BindByName("DropOldestField", "DropOldestOnOverflow");
-        BindByName("RebufferField", "RebufferFrames");
         BindByName("AutoPlayField", "AutoPlayOnEnable");
         BindByName("StopOnDisableField", "StopOnDisable");
-        BindByName("ClearQueueOnEnableField", "ClearQueueOnEnable");
         BindByName("VolumeGainField", "VolumeGain");
         BindByName("MuteField", "Mute");
         _root.Bind(serializedObject);
-
-        var clearBtn = _root.Q<Button>("ClearQueueButton");
-        if (clearBtn != null) clearBtn.clicked += () => { if (_target != null) _target.ClearQueue(); };
-
-        var resetBtn = _root.Q<Button>("ResetAnchorButton");
-        if (resetBtn != null) resetBtn.clicked += () => { if (_target != null) _target.ResetSyncAnchor(); };
 
         return _root;
     }

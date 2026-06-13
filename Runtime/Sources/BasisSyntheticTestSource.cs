@@ -37,7 +37,6 @@ public sealed class BasisSyntheticTestSource : IBasisFrameSource
     public long FramesEmitted => System.Threading.Interlocked.Read(ref framesEmitted);
 
     public event Action<BasisVideoFrame> OnVideoFrame;
-    public event Action<BasisAudioFrame> OnAudioFrame { add { } remove { } }
     public event Action<Exception> OnError;
     public event Action OnEndOfStream;
     public event Action OnReady;

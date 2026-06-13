@@ -1,383 +1,358 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using UnityEngine;
 
-// Drains BasisAudioFrames into a streaming AudioClip via a PCM read callback.
-// Wire it to BasisMediaPlayer by subscribing Source.OnAudioFrame -> Enqueue.
-// The callback runs on Unity's audio thread; Enqueue may be called from any thread.
+// Routes the decoded audio stream to one or more Unity AudioSources, so each
+// channel can be positioned independently in the world.
+//
+// List the AudioSources in Outputs, each carrying a BasisMediaAudioChannel that
+// declares which decoded channel(s) it plays — a single channel 1-8, or a stereo
+// downmix of the whole stream. Stereo content uses one Output set to Stereo (the
+// MediaPlayerStreaming prefab); a 5.1 / 7.1 mix uses one Output per channel (the
+// MediaPlayerMultiChannelStreaming prefab), positioned speaker-by-speaker.
+//
+// Decoded audio arrives interleaved from the native engine's PCM ring
+// (NativePcmSource); a BasisMultiChannelPcmSplitter broadcasts it so every output
+// reads independently — the same channel can feed two AudioSources in different
+// places. The package owns playback; the consumer owns positioning.
 public sealed class BasisMediaPlayerAudio : MonoBehaviour, IBasisMediaClockSource
 {
     [Header("Output")]
-    [Tooltip("AudioSource that will play the streaming clip. Leave empty to fall back to an AudioSource on this GameObject.")]
-    public AudioSource TargetAudioSource;
-
-    [Tooltip("If true, the streaming AudioClip is assigned to TargetAudioSource.clip on Awake. Disable to manage the clip yourself.")]
-    public bool AssignClipOnAwake = true;
-
-    [Tooltip("Name applied to the generated streaming AudioClip. Cosmetic; helps identify the clip in the profiler/audio mixer.")]
-    public string ClipName = "BasisMediaPlayerAudio";
+    [Tooltip("AudioSources that play content audio. Each needs a BasisMediaAudioChannel selecting its channel(s) — a single channel, or a stereo downmix. Position each where its speaker should sit. This is the path for both stereo and surround setups.")]
+    public AudioSource[] Outputs = Array.Empty<AudioSource>();
 
     [Header("Format")]
-    [Tooltip("Sample rate of the active AudioClip. Auto-updated from the first incoming audio frame; the value here is the initial guess used before any frames arrive.")]
+    [Tooltip("Sample rate of the active stream. Auto-updated from the decoder; the value here is the guess used before the format is known.")]
     public int SampleRate = 48000;
 
-    [Tooltip("Channel count of the active AudioClip. Auto-updated from the first incoming audio frame; the value here is the initial guess used before any frames arrive.")]
-    [Range(1, 2)] public int ChannelCount = 2;
+    [Tooltip("Channel count of the active stream. Auto-updated from the decoder.")]
+    [Range(1, 8)] public int ChannelCount = 6;
 
     [Header("Buffering")]
-    [Tooltip("Length of the internal streaming AudioClip in seconds. Unity fills the streaming clip in chunks ≈ this/12, so larger values produce coarser PCM callbacks and worse video sync. 1.0 keeps callbacks around 80 ms.")]
-    [Min(0.1f)] public float ClipLengthSeconds = 1f;
-
-    [Tooltip("Maximum number of pending audio frames before the overflow policy kicks in. Set to 0 for unbounded.")]
-    [Min(0)] public int MaxQueuedFrames = 64;
-
-    [Tooltip("If true, oldest frames are dropped once the queue is full. If false, new frames are dropped instead.")]
-    public bool DropOldestOnOverflow = true;
-
-    [Tooltip("After an underrun, the PCM callback stays silent until this many frames have queued. Prevents start-stop stutter when the source rate dips. 8 ≈ 160 ms at 20 ms/frame.")]
-    [Min(1)] public int RebufferFrames = 8;
+    [Tooltip("Length of each streaming AudioClip in seconds, and the depth of the broadcast window. Larger values are steadier but add latency.")]
+    [Min(0.1f)] public float ClipLengthSeconds = 0.5f;
 
     [Header("Playback")]
-    [Tooltip("If true, the AudioSource is played automatically when this component is enabled.")]
+    [Tooltip("If true, the output AudioSources are played automatically when this component is enabled.")]
     public bool AutoPlayOnEnable = true;
 
-    [Tooltip("If true, the AudioSource is stopped when this component is disabled.")]
+    [Tooltip("If true, the output AudioSources are stopped when this component is disabled.")]
     public bool StopOnDisable = true;
 
-    [Tooltip("If true, the pending queue and partial frame are cleared on enable to avoid playing stale samples after a long pause.")]
-    public bool ClearQueueOnEnable = false;
-
-    [Tooltip("Sample-domain volume multiplier applied after decode. Use AudioSource.volume for spatial mixing; this exists to compensate for quiet/loud streams. Hard-capped at 2.0 at runtime so hostile content can't damage hearing or speakers.")]
+    [Tooltip("Sample-domain volume multiplier applied after decode. Use each AudioSource.volume for spatial mixing; this compensates for quiet/loud streams. Hard-capped at 2.0 at runtime.")]
     [Range(0f, 2f)] public float VolumeGain = 1f;
 
-    [Tooltip("If true, decoded samples are zeroed before write. Use this to mute without stopping the AudioSource.")]
+    [Tooltip("If true, decoded samples are zeroed before write. Mutes without stopping the AudioSources.")]
     public bool Mute = false;
 
-    [Header("Status (read-only)")]
-    [SerializeField] private int runtimeQueuedFrames;
-    [SerializeField] private long runtimeConsumedSamples;
-    [SerializeField] private long runtimeDroppedFrames;
-    [SerializeField] private float runtimeLastPcmPeak;
-    [SerializeField] private float runtimeLastPcmRms;
+    // Native-engine path only: this component is fed by the OS-codec engine's
+    // PCM ring. The engine owns the media clock (BasisMediaPlayer syncs off its
+    // PositionUs), so this clock source stays inert.
+    public bool HasMediaTime => false;
+    public long CurrentMediaTimeUs => 0;
 
-    public int QueuedFrameCount => pending.Count;
-    public long ConsumedSampleCount => System.Threading.Interlocked.Read(ref runtimeConsumedSamples);
-    public long DroppedFrameCount => runtimeDroppedFrames;
-    public AudioSource ActiveAudioSource => audioSource;
-    public AudioClip StreamingClip => clip;
-
-    // When set, OnPcmRead pulls interleaved float PCM from here (the OS-codec
-    // engine's native ring) instead of the decoded-frame queue. Assigned/cleared
-    // by BasisMediaPlayer when a BasisNativeVideoSource becomes the backend.
-    public IBasisPcmSource NativePcmSource { get; set; }
-    public float LastPcmPeak => runtimeLastPcmPeak;
-    public float LastPcmRms => runtimeLastPcmRms;
-
-    // IBasisMediaClockSource — exposes media time driven by how many samples
-    // the audio system has demanded since the first frame was actually played.
-    // Sample counts come from the audio thread via Interlocked.Add; the read
-    // side here is a relaxed Interlocked.Read so the value is consistent on
-    // 32-bit platforms (no torn long reads).
-    public bool HasMediaTime => hasFirstFramePts;
-    public long CurrentMediaTimeUs
+    // Read-only metrics for BasisMediaPlayerDiagnostics, so the CSV works for
+    // this sink too. Tracked on the audio thread from the primary output (the
+    // first valid entry in Outputs).
+    private long consumedSamples;
+    private float lastPcmPeak;
+    private float lastPcmRms;
+    public long ConsumedSampleCount => System.Threading.Interlocked.Read(ref consumedSamples);
+    public float LastPcmPeak => lastPcmPeak;
+    public float LastPcmRms => lastPcmRms;
+    public bool IsAnyOutputPlaying
     {
         get
         {
-            if (!hasFirstFramePts) return 0;
-            long consumed = System.Threading.Interlocked.Read(ref runtimeConsumedSamples);
-            int channels = Mathf.Max(1, ChannelCount);
-            int rate = Mathf.Max(1, SampleRate);
-            long samplesPerChannel = consumed / channels;
-            long elapsedUs = samplesPerChannel * 1_000_000L / rate;
-            long heardUs = firstFramePtsUs + elapsedUs - cachedAudioLatencyUs;
-            return heardUs < firstFramePtsUs ? firstFramePtsUs : heardUs;
+            if (bindings == null) return false;
+            foreach (var b in bindings) if (b.Source != null && b.Source.isPlaying) return true;
+            return false;
         }
     }
+    public float RepresentativeVolume => bindings != null && bindings.Length > 0 && bindings[0].Source != null ? bindings[0].Source.volume : 0f;
+    public float RepresentativeSpatialBlend => bindings != null && bindings.Length > 0 && bindings[0].Source != null ? bindings[0].Source.spatialBlend : 0f;
 
-    public long AudioOutputLatencyUs => cachedAudioLatencyUs;
+    private IBasisPcmSource nativePcmSource;
+    public IBasisPcmSource NativePcmSource
+    {
+        get => nativePcmSource;
+        set { if (!ReferenceEquals(nativePcmSource, value)) { nativePcmSource = value; formatKnown = false; announcedRate = 0; announcedChannels = 0; rebuildRequested = true; } }
+    }
 
-    private AudioSource audioSource;
-    private AudioClip clip;
-    private readonly ConcurrentQueue<BasisAudioFrame> pending = new ConcurrentQueue<BasisAudioFrame>();
-    private float[] currentSamples;
-    private int currentOffset;
-    private int currentLimit;
-    private long firstFramePtsUs;
-    private volatile bool hasFirstFramePts;
-    private volatile bool rebuffering = true;
+    private sealed class Binding
+    {
+        public AudioSource Source;
+        public AudioClip Clip;
+        public BasisMultiChannelPcmSplitter Splitter;
+        public BasisMultiChannelPcmSplitter.Reader Reader;
+        public BasisMultiChannelPcmSplitter.Tap[] Taps;
+        public int OutChannels;
+        public bool Primary;
+    }
+
+    private BasisMultiChannelPcmSplitter splitter;
+    private Binding[] bindings;
+    private int builtChannels;
+    private int builtRate;
+    private bool rebuildRequested;
+    private volatile bool formatKnown;
     private volatile int pendingFormatRate;
     private volatile int pendingFormatChannels;
-    private long cachedAudioLatencyUs;
+    // Last format announced to SetExpectedFormat. Deduped here rather than
+    // against the built format so an aborted rebuild (e.g. no Outputs wired)
+    // isn't re-requested every frame when the decoder re-reports the same format.
+    private int announcedRate;
+    private int announcedChannels;
 
-    public void Enqueue(BasisAudioFrame frame)
-    {
-        if (frame?.Samples == null || frame.SampleCount <= 0) return;
-
-        if (frame.SampleRate > 0 && frame.ChannelCount > 0 &&
-            (frame.SampleRate != SampleRate || frame.ChannelCount != ChannelCount))
-        {
-            pendingFormatRate = frame.SampleRate;
-            pendingFormatChannels = frame.ChannelCount;
-        }
-
-        int cap = MaxQueuedFrames;
-        if (cap <= 0 || cap > BasisMediaPlayerSecurity.MaxQueuedAudioFramesCap) cap = BasisMediaPlayerSecurity.MaxQueuedAudioFramesCap;
-        if (pending.Count >= cap)
-        {
-            if (DropOldestOnOverflow)
-            {
-                while (pending.Count >= cap && pending.TryDequeue(out _))
-                {
-                    runtimeDroppedFrames++;
-                }
-            }
-            else
-            {
-                runtimeDroppedFrames++;
-                return;
-            }
-        }
-
-        pending.Enqueue(frame);
-    }
-
-    public void ClearQueue()
-    {
-        while (pending.TryDequeue(out _)) { }
-        currentSamples = null;
-        currentOffset = 0;
-        currentLimit = 0;
-        rebuffering = true;
-    }
-
-    // Requests a clip rebuild to the given format. Used by the native-engine path,
-    // which decodes audio at the stream's rate and has no BasisAudioFrames to
-    // infer the format from. Picked up by Update() (main thread).
     public void SetExpectedFormat(int sampleRate, int channels)
     {
         if (sampleRate <= 0 || channels <= 0) return;
-        if (sampleRate == SampleRate && channels == ChannelCount) return;
+        formatKnown = true;
+        channels = Mathf.Clamp(channels, 1, 8);
+        if (sampleRate == announcedRate && channels == announcedChannels) return;
+        announcedRate = sampleRate;
+        announcedChannels = channels;
         pendingFormatRate = sampleRate;
-        pendingFormatChannels = Mathf.Clamp(channels, 1, 2);
+        pendingFormatChannels = channels;
     }
 
-    // Wipes the media-time anchor and the consumed-sample counter so the next
-    // arriving audio frame re-anchors this clock source. Called by BasisMediaPlayer
-    // on Play() / Stop() to keep video presentation aligned across restarts.
     public void ResetSyncAnchor()
     {
-        hasFirstFramePts = false;
-        firstFramePtsUs = 0;
-        rebuffering = true;
-        System.Threading.Interlocked.Exchange(ref runtimeConsumedSamples, 0);
-    }
-
-    private void Awake()
-    {
-        if (TargetAudioSource != null)
-        {
-            audioSource = TargetAudioSource;
-        }
-        else if (!TryGetComponent(out audioSource))
-        {
-            audioSource = null;
-        }
-        if (audioSource == null)
-        {
-            BasisDebug.LogError(
-                "BasisMediaPlayerAudio: no AudioSource assigned and none found on this GameObject. Assign TargetAudioSource or add an AudioSource component.",
-                BasisDebug.LogTag.Video);
-            return;
-        }
-
-        BuildClipForCurrentFormat();
-    }
-
-    private void BuildClipForCurrentFormat()
-    {
-        if (audioSource == null) return;
-
-        try
-        {
-            AudioConfiguration cfg = AudioSettings.GetConfiguration();
-            if (cfg.sampleRate > 0)
-            {
-                cachedAudioLatencyUs = (long)cfg.dspBufferSize * 1_000_000L / cfg.sampleRate;
-            }
-        }
-        catch { cachedAudioLatencyUs = 0; }
-
-        bool wasPlaying = audioSource.isPlaying;
-        if (wasPlaying) audioSource.Stop();
-
-        if (clip != null)
-        {
-            if (audioSource.clip == clip) audioSource.clip = null;
-            Destroy(clip);
-            clip = null;
-        }
-
-        int rate = Mathf.Max(8000, SampleRate);
-        int channels = Mathf.Clamp(ChannelCount, 1, 2);
-        float clipLen = Mathf.Min(ClipLengthSeconds, BasisMediaPlayerSecurity.ClipLengthSecondsCap);
-        int lengthSamples = Mathf.Max(rate, Mathf.RoundToInt(rate * clipLen));
-        clip = AudioClip.Create(
-            name: string.IsNullOrEmpty(ClipName) ? "BasisMediaPlayerAudio" : ClipName,
-            lengthSamples: lengthSamples,
-            channels: channels,
-            frequency: rate,
-            stream: true,
-            pcmreadercallback: OnPcmRead);
-
-        if (AssignClipOnAwake)
-        {
-            audioSource.clip = clip;
-            audioSource.loop = true;
-            if (wasPlaying) audioSource.Play();
-        }
+        splitter?.Clear();
     }
 
     private void OnEnable()
     {
-        if (ClearQueueOnEnable) ClearQueue();
-        if (AutoPlayOnEnable && audioSource != null && !audioSource.isPlaying) audioSource.Play();
+        if (AutoPlayOnEnable) PlayAll();
     }
 
     private void OnDisable()
     {
-        if (StopOnDisable && audioSource != null) audioSource.Stop();
+        if (StopOnDisable) StopAll();
     }
 
     private void Update()
     {
-        runtimeQueuedFrames = pending.Count;
-
         int rate = pendingFormatRate;
         int ch = pendingFormatChannels;
-        if (rate > 0 && ch > 0 && (rate != SampleRate || ch != ChannelCount))
+        if (rate > 0 && ch > 0 && (rate != builtRate || ch != builtChannels))
         {
             SampleRate = rate;
             ChannelCount = ch;
             pendingFormatRate = 0;
             pendingFormatChannels = 0;
-            BuildClipForCurrentFormat();
-            ResetSyncAnchor();
-            ClearQueue();
+            rebuildRequested = true;
+        }
+
+        if (rebuildRequested)
+        {
+            rebuildRequested = false;
+            Rebuild();
         }
     }
 
     private void OnDestroy()
     {
-        if (clip != null)
-        {
-            Destroy(clip);
-            clip = null;
-        }
+        TeardownClips();
     }
 
-    // Runs on the audio thread. Must not touch Unity APIs other than what's safe
-    // from background threads. ConcurrentQueue access is fine.
-    private void OnPcmRead(float[] data)
+    private void Rebuild()
     {
-        // OS-codec engine path: pull interleaved PCM straight from the native ring.
-        var pcm = NativePcmSource;
-        if (pcm != null)
-        {
-            int n = pcm.ReadPcm(data);
-            if (n < 0) n = 0;
-            else if (n > data.Length) n = data.Length;
-            float g = Mute ? 0f : Mathf.Clamp(VolumeGain, 0f, 2f);
-            if (g == 0f) Array.Clear(data, 0, n);
-            else if (Math.Abs(g - 1f) > 0.0001f) { for (int i = 0; i < n; i++) data[i] *= g; }
-            if (n < data.Length) Array.Clear(data, n, data.Length - n);
-            System.Threading.Interlocked.Add(ref runtimeConsumedSamples, data.Length);
-            float pk = 0f; double ss = 0;
-            for (int i = 0; i < n; i++) { float v = data[i]; float a = v < 0f ? -v : v; if (a > pk) pk = a; ss += v * v; }
-            runtimeLastPcmPeak = pk;
-            runtimeLastPcmRms = n > 0 ? (float)Math.Sqrt(ss / n) : 0f;
-            return;
-        }
+        TeardownClips();
 
-        int channels = ChannelCount;
-        int needed = data.Length;
-        int written = 0;
-        float gain = Mute ? 0f : Mathf.Clamp(VolumeGain, 0f, 2f);
-        float peak = 0f;
-        double sumSq = 0;
-        int summed = 0;
+        AudioSource[] outputs = Outputs;
+        if (nativePcmSource == null || outputs == null || outputs.Length == 0) { splitter = null; return; }
 
-        if (rebuffering)
+        // Don't build clips from the serialized format guess — wait for the
+        // decoder's real format. SetExpectedFormat flips formatKnown and queues
+        // the rebuild once the decoder reports.
+        if (!formatKnown) { splitter = null; return; }
+
+        int rate = Mathf.Max(8000, SampleRate);
+        int channels = Mathf.Clamp(ChannelCount, 1, 8);
+        int windowSamples = Mathf.RoundToInt(rate * Mathf.Min(ClipLengthSeconds, BasisMediaPlayerSecurity.ClipLengthSecondsCap));
+
+        splitter = new BasisMultiChannelPcmSplitter(nativePcmSource, channels, windowSamples);
+        builtRate = rate;
+        builtChannels = channels;
+        System.Threading.Interlocked.Exchange(ref consumedSamples, 0);
+        lastPcmPeak = 0f;
+        lastPcmRms = 0f;
+
+        int clipLenSamples = Mathf.Max(rate, windowSamples);
+        var built = new List<Binding>(outputs.Length);
+        for (int i = 0; i < outputs.Length; i++)
         {
-            bool stillBuffering = pending.Count < Mathf.Max(1, RebufferFrames) && (currentSamples == null || currentOffset >= currentLimit);
-            if (stillBuffering)
+            AudioSource src = outputs[i];
+            if (src == null) continue;
+
+            src.TryGetComponent(out BasisMediaAudioChannel sel);
+            int outChannels;
+            BasisMultiChannelPcmSplitter.Tap[] taps;
+            // A BasisMediaAudioChannel set to Stereo folds the whole stream to 2
+            // channels; any other selection plays a single decoded channel.
+            if (sel != null && sel.IsStereo)
             {
-                Array.Clear(data, 0, needed);
-                System.Threading.Interlocked.Add(ref runtimeConsumedSamples, needed);
-                runtimeLastPcmPeak = 0f;
-                runtimeLastPcmRms = 0f;
-                return;
+                outChannels = 2;
+                taps = BuildDownmixTaps(channels);
             }
-            rebuffering = false;
-        }
-
-        while (written < needed)
-        {
-            if (currentSamples != null && currentOffset < currentLimit)
+            else
             {
-                int available = currentLimit - currentOffset;
-                int take = Mathf.Min(needed - written, available);
-                if (Math.Abs(gain - 1f) < 0.0001f)
+                if (sel == null)
                 {
-                    Array.Copy(currentSamples, currentOffset, data, written, take);
+                    BasisDebug.LogWarning(
+                        $"BasisMediaPlayerAudio: '{src.name}' has no BasisMediaAudioChannel; defaulting it to Channel {i + 1} (decoded channel index {i}).",
+                        BasisDebug.LogTag.Video);
                 }
-                else if (gain == 0f)
+                int monoChannel = sel != null ? sel.PrimaryChannel : i;
+                if (monoChannel < 0 || monoChannel >= channels)
                 {
-                    Array.Clear(data, written, take);
+                    // Selected channel isn't present in this stream (e.g. a 5.1
+                    // output on a stereo stream) — leave this AudioSource silent
+                    // rather than doubling another channel onto it.
+                    src.Stop();
+                    src.clip = null;
+                    continue;
                 }
-                else
-                {
-                    for (int i = 0; i < take; i++) data[written + i] = currentSamples[currentOffset + i] * gain;
-                }
-                currentOffset += take;
-                written += take;
-                System.Threading.Interlocked.Add(ref runtimeConsumedSamples, take);
-                continue;
+                outChannels = 1;
+                taps = new[] { new BasisMultiChannelPcmSplitter.Tap(monoChannel, 0, 1f) };
             }
 
-            if (!pending.TryDequeue(out var next))
-            {
-                int silence = needed - written;
-                Array.Clear(data, written, silence);
-                System.Threading.Interlocked.Add(ref runtimeConsumedSamples, silence);
-                rebuffering = true;
-                return;
-            }
-
-            currentSamples = next.Samples;
-            currentOffset = 0;
-            // Trust SampleCount as the source-of-truth length; cap to array
-            // length to stay safe if a producer passes a padded buffer.
-            currentLimit = Mathf.Min(next.SampleCount * channels, next.Samples.Length);
-
-            // Anchor the media clock at the first frame the audio system
-            // actually starts consuming. This is what video presentation will
-            // be slaved to via BasisAVSyncClock.ExternalSource.
-            if (!hasFirstFramePts)
-            {
-                firstFramePtsUs = next.PresentationTimeUs;
-                hasFirstFramePts = true;
-            }
+            var b = new Binding { Source = src, Splitter = splitter, Reader = splitter.CreateReader(), OutChannels = outChannels, Taps = taps };
+            b.Clip = AudioClip.Create(
+                name: $"BasisMediaPlayerAudio_{i}",
+                lengthSamples: clipLenSamples,
+                channels: b.OutChannels,
+                frequency: rate,
+                stream: true,
+                pcmreadercallback: data => OnPcmRead(b, data));
+            src.clip = b.Clip;
+            src.loop = true;
+            b.Primary = built.Count == 0;
+            built.Add(b);
         }
+        bindings = built.ToArray();
+        if (isActiveAndEnabled && AutoPlayOnEnable) PlayAll();
+    }
 
-        for (int i = 0; i < written; i++)
+    // Stereo fold-down of the available channels, assuming the decoder's WAVE
+    // channel order: the front pair passes straight through, the centre folds
+    // into both sides at -3 dB, the LFE (index 3 in 6+ channel layouts) is
+    // dropped, and the remaining channels alternate left/right at -3 dB. The
+    // taps are then scaled so a full-scale input can't exceed +/-1.0 on either
+    // output. Mono duplicates to both sides.
+    private static BasisMultiChannelPcmSplitter.Tap[] BuildDownmixTaps(int channels)
+    {
+        const float att = 0.70710678f;
+        if (channels <= 1)
         {
-            float v = data[i];
-            float a = v < 0f ? -v : v;
-            if (a > peak) peak = a;
-            sumSq += v * v;
-            summed++;
+            return new[]
+            {
+                new BasisMultiChannelPcmSplitter.Tap(0, 0, 1f),
+                new BasisMultiChannelPcmSplitter.Tap(0, 1, 1f),
+            };
         }
-        runtimeLastPcmPeak = peak;
-        runtimeLastPcmRms = summed > 0 ? (float)Math.Sqrt(sumSq / summed) : 0f;
+
+        var taps = new List<BasisMultiChannelPcmSplitter.Tap>(channels + 2)
+        {
+            new BasisMultiChannelPcmSplitter.Tap(0, 0, 1f),
+            new BasisMultiChannelPcmSplitter.Tap(1, 1, 1f),
+        };
+        if (channels >= 3)
+        {
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(2, 0, att));
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(2, 1, att));
+        }
+        int next = 3;
+        if (channels == 4)
+        {
+            // 4.0's fourth channel is the back centre; fold it into both sides.
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(3, 0, att));
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(3, 1, att));
+            next = 4;
+        }
+        else if (channels >= 6)
+        {
+            next = 4;
+        }
+        bool intoLeft = true;
+        for (int c = next; c < channels; c++)
+        {
+            taps.Add(new BasisMultiChannelPcmSplitter.Tap(c, intoLeft ? 0 : 1, att));
+            intoLeft = !intoLeft;
+        }
+
+        float sumL = 0f, sumR = 0f;
+        int tapCount = taps.Count;
+        for (int i = 0; i < tapCount; i++)
+        {
+            if (taps[i].Out == 0) sumL += taps[i].Coeff;
+            else sumR += taps[i].Coeff;
+        }
+        float norm = 1f / Mathf.Max(1f, Mathf.Max(sumL, sumR));
+        var result = new BasisMultiChannelPcmSplitter.Tap[tapCount];
+        for (int i = 0; i < tapCount; i++)
+        {
+            result[i] = new BasisMultiChannelPcmSplitter.Tap(taps[i].Source, taps[i].Out, taps[i].Coeff * norm);
+        }
+        return result;
+    }
+
+    private void TeardownClips()
+    {
+        if (bindings != null)
+        {
+            foreach (var b in bindings)
+            {
+                if (b.Source != null && b.Source.clip == b.Clip) { b.Source.Stop(); b.Source.clip = null; }
+                if (b.Clip != null) Destroy(b.Clip);
+            }
+            bindings = null;
+        }
+        builtChannels = 0;
+        builtRate = 0;
+    }
+
+    private void PlayAll()
+    {
+        if (bindings == null) return;
+        // One shared DSP start time keeps the channels sample-aligned;
+        // sequential Play() calls can land on different DSP ticks and leave a
+        // constant inter-channel offset.
+        double start = AudioSettings.dspTime + 0.05;
+        foreach (var b in bindings)
+            if (b.Source != null && b.Clip != null && !b.Source.isPlaying) b.Source.PlayScheduled(start);
+    }
+
+    private void StopAll()
+    {
+        if (bindings == null) return;
+        foreach (var b in bindings)
+            if (b.Source != null) b.Source.Stop();
+    }
+
+    // Runs on the audio thread. Mixes this output's channel(s) from the shared
+    // broadcast window; the splitter handles the source ring and de-interleave.
+    private void OnPcmRead(Binding b, float[] data)
+    {
+        var s = b.Splitter;
+        Array.Clear(data, 0, data.Length);
+        if (s != null)
+        {
+            float gain = Mute ? 0f : Mathf.Clamp(VolumeGain, 0f, 2f);
+            s.ReadMixed(b.Reader, data, data.Length / b.OutChannels, b.OutChannels, b.Taps, gain);
+        }
+
+        if (b.Primary)
+        {
+            int n = data.Length;
+            float peak = 0f; double sumSq = 0;
+            for (int i = 0; i < n; i++) { float v = data[i]; float a = v < 0f ? -v : v; if (a > peak) peak = a; sumSq += v * v; }
+            lastPcmPeak = peak;
+            lastPcmRms = n > 0 ? (float)Math.Sqrt(sumSq / n) : 0f;
+            // Count sample-frames, not interleaved floats, so the metric is the
+            // same whether the primary output is mono (per-channel) or stereo.
+            System.Threading.Interlocked.Add(ref consumedSamples, n / Mathf.Max(1, b.OutChannels));
+        }
     }
 }

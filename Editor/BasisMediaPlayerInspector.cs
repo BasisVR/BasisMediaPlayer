@@ -48,7 +48,6 @@ public class BasisMediaPlayerInspector : Editor
         BindByName("LoopRestartDelayField", "LoopRestartDelaySeconds");
         BindByName("PresentationOffsetField", "PresentationOffsetUs");
 
-        BindByName("AudioRoutingField", "AudioRouting");
         BindByName("VolumeField", "Volume");
         BindByName("MuteField", "Mute");
         BindByName("PlaybackRateField", "PlaybackRate");

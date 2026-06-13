@@ -11,8 +11,9 @@ GameObject:
   - component: {fileID: 2265814159907839490}
   - component: {fileID: 136030129054553920}
   - component: {fileID: 4300968560286109803}
+  - component: {fileID: 1325980082505240854}
   m_Layer: 8
-  m_Name: Audio Source
+  m_Name: Stereo Downmix
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -216,6 +217,19 @@ MonoBehaviour:
   Transform: {fileID: 0}
   IsUnityEngineUsed: 0
   AllowsUpdateParameters: 0
+--- !u!114 &1325980082505240854
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 6715880030743322348}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9c6b7b2c05994a39af3d716d092dddc7, type: 3}
+  m_Name:
+  m_EditorClassIdentifier: BasisMediaPlayer::BasisMediaAudioChannel
+  Channel: 100
 --- !u!1 &8238937759899344198
 GameObject:
   m_ObjectHideFlags: 0
@@ -340,7 +354,6 @@ MonoBehaviour:
   Loop: 0
   LoopRestartDelaySeconds: 0
   PresentationOffsetUs: 0
-  AudioRouting: 0
   Volume: 1
   Mute: 0
   PlaybackRate: 1
@@ -389,25 +402,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b8f0e4832d2e9ba4bbf3db4b90cc1c7c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: BasisMediaPlayer::BasisMediaPlayerAudio
-  TargetAudioSource: {fileID: 136030129054553920}
-  AssignClipOnAwake: 1
-  ClipName: BasisMediaPlayerAudio
+  Outputs:
+  - {fileID: 136030129054553920}
   SampleRate: 48000
-  ChannelCount: 2
-  ClipLengthSeconds: 1
-  MaxQueuedFrames: 64
-  DropOldestOnOverflow: 1
-  RebufferFrames: 8
+  ChannelCount: 6
+  ClipLengthSeconds: 0.5
   AutoPlayOnEnable: 1
   StopOnDisable: 1
-  ClearQueueOnEnable: 0
   VolumeGain: 1
   Mute: 0
-  runtimeQueuedFrames: 0
-  runtimeConsumedSamples: 0
-  runtimeDroppedFrames: 0
-  runtimeLastPcmPeak: 0
-  runtimeLastPcmRms: 0
 --- !u!114 &2859578426207650292
 MonoBehaviour:
   m_ObjectHideFlags: 0

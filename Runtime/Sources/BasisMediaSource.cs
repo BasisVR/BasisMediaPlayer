@@ -42,10 +42,6 @@ public sealed class BasisMediaSource
     // Initial mute state. Mirrors BasisMediaPlayer.Mute.
     public bool Mute;
 
-    // Where audio should flow. Currently always UnityAudioSource; held as the
-    // enum so additional routings can be added without breaking call sites.
-    public BasisAudioRouting AudioRouting = BasisAudioRouting.UnityAudioSource;
-
     // If set, the player will Seek to this position once OnReady fires.
     // Use TimeSpan.Zero to start at the beginning explicitly.
     public TimeSpan StartPosition = TimeSpan.Zero;

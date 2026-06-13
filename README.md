@@ -70,13 +70,13 @@ available by assigning `player.Source` directly — useful for tests without a f
 
 ### Audio (stereo and multichannel)
 
-Stereo or mono audio routes through a `BasisMediaPlayerAudio` (+ `AudioSource`)
-on the player GameObject. For surround content, set `BasisMediaSource.AudioRouting`
-to `UnityMultiChannelSources` and add a `BasisMediaPlayerMultiChannelAudio`
-instead: it splits the decoded stream (up to 8 channels) across one `AudioSource`
-per channel — each tagged with a `BasisMediaAudioChannel` — so a 5.1 / 7.1 mix
-can be positioned speaker-by-speaker in the world. The
-`Prefabs/MediaPlayerMultiChannelStreaming` prefab is wired up for this.
+Audio routes through a `BasisMediaPlayerAudio` on the player GameObject. List the
+`AudioSource`s in `Outputs`, each carrying a `BasisMediaAudioChannel` that selects
+what it plays — a single decoded channel, or a stereo downmix of the whole stream.
+For stereo, use a single `Output` set to `Stereo` (the `Prefabs/MediaPlayerStreaming`
+prefab); for surround, one `Output` per channel so a 5.1 / 7.1 mix (up to 8
+channels) can be positioned speaker-by-speaker in the world (the
+`Prefabs/MediaPlayerMultiChannelStreaming` prefab).
 
 Channel ceiling depends on the source: **LPCM over MPEG-TS** carries a full 7.1
 (8 channels); **AAC on Windows** decodes up to 5.1 (the Media Foundation

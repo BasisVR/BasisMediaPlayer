@@ -372,37 +372,9 @@ public class BasisMediaPlayerDebugWindow : EditorWindow
         var audio = _target.AudioComponent;
         var eng = _target.NativeEngine;
 
-        if (eng != null)
+        if (eng == null)
         {
-            SetText("AQ_Backend", "OS-codec PCM ring (pulled on audio thread)");
-            SetText("AQ_Format", eng.TryGetPcmFormat(out int sr, out int ch) ? $"{sr} Hz / {ch} ch" : "(pending first audio frame)");
-            if (audio != null)
-            {
-                var asrc = audio.ActiveAudioSource;
-                SetPill("AQ_SourcePlaying", asrc != null && asrc.isPlaying);
-                SetText("AQ_PcmLevels", $"{audio.LastPcmPeak:F3} / {audio.LastPcmRms:F3}");
-                SetText("AQ_Dropped", audio.DroppedFrameCount.ToString());
-                SetText("AQ_DropPolicy", audio.DropOldestOnOverflow ? "DropOldest" : "DropNewest");
-                SetBar("AQ_DepthFill", audio.MaxQueuedFrames > 0 ? (float)audio.QueuedFrameCount / Mathf.Max(1, audio.MaxQueuedFrames) : Mathf.Min(1f, audio.QueuedFrameCount / 64f), null);
-                SetText("AQ_DepthValue", audio.MaxQueuedFrames > 0 ? $"{audio.QueuedFrameCount} / {audio.MaxQueuedFrames}" : $"{audio.QueuedFrameCount} / unbounded");
-                HideHelp("AQ_Help");
-            }
-            else
-            {
-                SetPill("AQ_SourcePlaying", false);
-                SetText("AQ_PcmLevels", "—");
-                SetText("AQ_Dropped", "—");
-                SetText("AQ_DropPolicy", "—");
-                SetBar("AQ_DepthFill", 0f, null);
-                SetText("AQ_DepthValue", "—");
-                ShowHelp("AQ_Help", "No BasisMediaPlayerAudio on the GameObject — add one (with an AudioSource) for sound.", "bvp-help-info");
-            }
-            return;
-        }
-
-        if (audio == null)
-        {
-            SetText("AQ_Backend", "(no BasisMediaPlayerAudio on player's GameObject)");
+            SetText("AQ_Backend", "(CPU source — no OS audio decode)");
             SetText("AQ_Format", "—");
             SetPill("AQ_SourcePlaying", false);
             SetText("AQ_PcmLevels", "—");
@@ -414,18 +386,30 @@ public class BasisMediaPlayerDebugWindow : EditorWindow
             return;
         }
 
-        int depth = audio.QueuedFrameCount;
-        int max = audio.MaxQueuedFrames > 0 ? audio.MaxQueuedFrames : Mathf.Max(1, depth + 1);
-        SetText("AQ_Backend", "CPU PCM queue");
-        SetText("AQ_Format", $"{audio.SampleRate} Hz / {audio.ChannelCount} ch");
-        var asrcCpu = audio.ActiveAudioSource;
-        SetPill("AQ_SourcePlaying", asrcCpu != null && asrcCpu.isPlaying);
-        SetText("AQ_PcmLevels", $"{audio.LastPcmPeak:F3} / {audio.LastPcmRms:F3}");
-        SetText("AQ_Dropped", audio.DroppedFrameCount.ToString());
-        SetText("AQ_DropPolicy", audio.DropOldestOnOverflow ? "DropOldest" : "DropNewest");
-        SetBar("AQ_DepthFill", audio.MaxQueuedFrames > 0 ? (float)depth / max : Mathf.Min(1f, depth / 64f), null);
-        SetText("AQ_DepthValue", audio.MaxQueuedFrames > 0 ? $"{depth} / {max}" : $"{depth} / unbounded");
-        HideHelp("AQ_Help");
+        SetText("AQ_Backend", "OS-codec PCM ring (pulled on audio thread)");
+        SetText("AQ_Format", eng.TryGetPcmFormat(out int sr, out int ch) ? $"{sr} Hz / {ch} ch" : "(pending first audio frame)");
+        if (audio != null)
+        {
+            // The native ring is drained directly on the audio thread — there's no
+            // managed frame queue, so depth/drop metrics don't apply here.
+            SetPill("AQ_SourcePlaying", audio.IsAnyOutputPlaying);
+            SetText("AQ_PcmLevels", $"{audio.LastPcmPeak:F3} / {audio.LastPcmRms:F3}");
+            SetText("AQ_Dropped", "—");
+            SetText("AQ_DropPolicy", "native ring");
+            SetBar("AQ_DepthFill", 0f, null);
+            SetText("AQ_DepthValue", "n/a (native ring)");
+            HideHelp("AQ_Help");
+        }
+        else
+        {
+            SetPill("AQ_SourcePlaying", false);
+            SetText("AQ_PcmLevels", "—");
+            SetText("AQ_Dropped", "—");
+            SetText("AQ_DropPolicy", "—");
+            SetBar("AQ_DepthFill", 0f, null);
+            SetText("AQ_DepthValue", "—");
+            ShowHelp("AQ_Help", "No BasisMediaPlayerAudio on the GameObject — add one (with an AudioSource) for sound.", "bvp-help-info");
+        }
     }
 
     private void RefreshAudioOutput()
@@ -448,28 +432,21 @@ public class BasisMediaPlayerDebugWindow : EditorWindow
             return;
         }
 
-        var src = audio.ActiveAudioSource;
-        if (src == null)
-        {
-            SetText("AO_SourceName", "(no AudioSource)");
-            ShowHelp("AO_Help", "BasisMediaPlayerAudio has no AudioSource. Assign TargetAudioSource or add an AudioSource on the same GameObject.", "bvp-help-error");
-            return;
-        }
-
-        SetText("AO_SourceName", src.name);
-        SetPill("AO_IsPlaying", src.isPlaying);
-        SetText("AO_Volume", src.volume.ToString("F2"));
-        SetText("AO_SpatialBlend", src.spatialBlend.ToString("F2"));
+        int outputCount = audio.Outputs != null ? audio.Outputs.Length : 0;
+        SetText("AO_SourceName", outputCount > 0 ? $"{outputCount} output(s)" : "(no outputs)");
+        SetPill("AO_IsPlaying", audio.IsAnyOutputPlaying);
+        SetText("AO_Volume", audio.RepresentativeVolume.ToString("F2"));
+        SetText("AO_SpatialBlend", audio.RepresentativeSpatialBlend.ToString("F2"));
         SetPill("AO_Mute", audio.Mute);
         SetText("AO_Gain", audio.VolumeGain.ToString("F2"));
-        SetText("AO_Clip", src.clip != null ? src.clip.name : "(none)");
+        SetText("AO_Clip", "—");
         SetText("AO_Format", $"{audio.SampleRate} Hz / {audio.ChannelCount} ch");
         SetText("AO_Consumed", audio.ConsumedSampleCount.ToString());
         SetPill("AO_HasAnchor", audio.HasMediaTime);
         SetText("AO_MediaTime", FormatUs(audio.CurrentMediaTimeUs));
 
-        if (Application.isPlaying && src.isPlaying && audio.ConsumedSampleCount == 0 && audio.QueuedFrameCount > 0)
-            ShowHelp("AO_Help", "AudioSource reports playing and frames are queued, but the PCM callback hasn't been driven. The routing clip may not be assigned, or the AudioSource is muted at the mixer.", "bvp-help-warn");
+        if (outputCount == 0)
+            ShowHelp("AO_Help", "No audio output configured. Add one or more AudioSources to 'Outputs', each with a BasisMediaAudioChannel: choose Stereo for a stereo downmix, or a specific channel for surround.", "bvp-help-error");
         else HideHelp("AO_Help");
     }
 

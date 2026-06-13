@@ -28,7 +28,6 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
 
     private BasisMediaPlayer player;
     private BasisMediaPlayerAudio audioComponent;
-    private BasisMediaPlayerMultiChannelAudio multiChannelComponent;
     private StreamWriter writer;
     private StringBuilder lineBuilder;
     private float nextSnapshotTime;
@@ -40,7 +39,6 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
     {
         TryGetComponent(out player);
         TryGetComponent(out audioComponent);
-        TryGetComponent(out multiChannelComponent);
         lineBuilder = new StringBuilder(512);
         ResolvedLogPath = ResolvePath();
     }
@@ -295,52 +293,26 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
         public float Gain, Volume, Spatial, Peak, Rms;
     }
 
-    // Picks the active audio sink's metrics so the audio columns populate for
-    // either routing: the multichannel sink when present and routed, otherwise
-    // the stereo BasisMediaPlayerAudio.
+    // Populates the audio columns from the BasisMediaPlayerAudio sink.
+    // Queue/Dropped/LatencyUs/HasMedia/MediaUs stay defaulted: the sink reads the
+    // native ring directly (no frame queue) and the engine owns the media clock.
     private AudioSnapshot ResolveAudio()
     {
         var s = new AudioSnapshot();
-        var mc = multiChannelComponent;
-        if (mc != null && (audioComponent == null || player.AudioRouting == BasisAudioRouting.UnityMultiChannelSources))
-        {
-            // Queue/Dropped/LatencyUs/HasMedia/MediaUs stay defaulted here: the
-            // multichannel sink reads the native ring directly (no frame queue)
-            // and the engine owns the media clock.
-            s.Present = true;
-            s.Playing = mc.IsAnyOutputPlaying;
-            s.Consumed = mc.ConsumedSampleCount;
-            s.Mute = mc.Mute;
-            s.Gain = mc.VolumeGain;
-            s.Volume = mc.RepresentativeVolume;
-            s.Spatial = mc.RepresentativeSpatialBlend;
-            s.Peak = mc.LastPcmPeak;
-            s.Rms = mc.LastPcmRms;
-            s.SampleRate = mc.SampleRate;
-            s.Channels = mc.ChannelCount;
-            return s;
-        }
-
         var aud = audioComponent != null ? audioComponent : (player != null ? player.AudioComponent : null);
         if (aud != null)
         {
-            var asrc = aud.ActiveAudioSource;
             s.Present = true;
-            s.Playing = asrc != null && asrc.isPlaying;
+            s.Playing = aud.IsAnyOutputPlaying;
             s.Consumed = aud.ConsumedSampleCount;
-            s.Queue = aud.QueuedFrameCount;
-            s.Dropped = aud.DroppedFrameCount;
             s.Mute = aud.Mute;
             s.Gain = aud.VolumeGain;
-            s.Volume = asrc != null ? asrc.volume : 0f;
-            s.Spatial = asrc != null ? asrc.spatialBlend : 0f;
+            s.Volume = aud.RepresentativeVolume;
+            s.Spatial = aud.RepresentativeSpatialBlend;
             s.Peak = aud.LastPcmPeak;
             s.Rms = aud.LastPcmRms;
             s.SampleRate = aud.SampleRate;
             s.Channels = aud.ChannelCount;
-            s.LatencyUs = aud.AudioOutputLatencyUs;
-            s.HasMedia = aud.HasMediaTime;
-            s.MediaUs = aud.CurrentMediaTimeUs;
         }
         return s;
     }

@@ -1,9 +1,9 @@
 // A pull-based source of interleaved float PCM, read on the Unity audio thread.
 //
-// BasisMediaPlayerAudio normally drains decoded BasisAudioFrames from a queue,
-// but the OS-codec engine (BasisNativeVideoSource) decodes audio natively and
-// exposes it as a ring instead. When BasisMediaPlayerAudio.NativePcmSource is
-// set, OnPcmRead pulls from here directly rather than from the frame queue.
+// The OS-codec engine (BasisNativeVideoSource) decodes audio natively and exposes
+// it as a ring. BasisMediaPlayerAudio sets this as its NativePcmSource and pulls
+// from here on the audio thread, splitting/downmixing the interleaved samples
+// across its output AudioSources.
 public interface IBasisPcmSource
 {
     // Stream audio format, once known. Returns false until the first audio frame

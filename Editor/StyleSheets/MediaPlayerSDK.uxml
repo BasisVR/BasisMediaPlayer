@@ -27,7 +27,6 @@
         </engine:Foldout>
 
         <engine:Foldout text="Audio" name="AudioFoldout" value="true" class="bvp-foldout">
-            <engine:EnumField label="Audio Routing" name="AudioRoutingField"/>
             <engine:Slider label="Volume" name="VolumeField" low-value="0" high-value="1" show-input-field="true"/>
             <engine:Toggle label="Mute" name="MuteField"/>
             <engine:Slider label="Playback Rate" name="PlaybackRateField" low-value="0.25" high-value="4" show-input-field="true"/>

@@ -10,7 +10,6 @@ using System;
 public interface IBasisFrameSource : IDisposable
 {
     event Action<BasisVideoFrame> OnVideoFrame;
-    event Action<BasisAudioFrame> OnAudioFrame;
     event Action<Exception> OnError;
     event Action OnEndOfStream;
 

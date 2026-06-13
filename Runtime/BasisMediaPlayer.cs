@@ -59,8 +59,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public long PresentationOffsetUs = 0;
 
     [Header("Audio")]
-    [Tooltip("Where decoded audio is routed. UnityAudioSource hands frames to a BasisMediaPlayerAudio on this GameObject. Currently the only supported routing; the property exists so additional routings can be added without breaking call sites.")]
-    public BasisAudioRouting AudioRouting = BasisAudioRouting.UnityAudioSource;
     [Tooltip("Linear volume 0..1 applied to the audio path. Maps to BasisMediaPlayerAudio.VolumeGain.")]
     [Range(0f, 1f)] public float Volume = 1f;
     [Tooltip("If true, the audio path is silenced without stopping the source.")]
@@ -193,7 +191,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public long FormatErrorCount => runtimeFormatErrors;
     public long DroppedFrameCount => runtimeOverflowDrops + runtimeLateSkips + runtimeFormatErrors;
     public BasisMediaPlayerAudio AudioComponent => audioComponent;
-    public BasisMediaPlayerMultiChannelAudio MultiChannelAudioComponent => multiChannelComponent;
     public BasisMediaSource ActiveMediaSource => activeMediaSource;
 
     public System.Collections.Generic.IReadOnlyList<BasisBitrateTrack> BitrateTracks =>
@@ -250,8 +247,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private const int RestartMaxRechecks = 5;
     private const float RestartRecheckIntervalSeconds = 1f;
     private BasisMediaPlayerAudio audioComponent;
-    private BasisMediaPlayerMultiChannelAudio multiChannelComponent;
-    private bool warnedMultiChannelFallback;
     private long lastEnqueuedPtsUs;
     private BasisMediaSource activeMediaSource;
     private float sleepTimerRemainingSeconds;
@@ -285,9 +280,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         // playback instead of wall time. Falls back to wall-clock pacing
         // automatically when no audio component is present (e.g. video-only).
         TryGetComponent(out audioComponent);
-        TryGetComponent(out multiChannelComponent);
         if (audioComponent != null) Clock.ExternalSource = audioComponent;
-        ApplyAudioRoutingToComponent();
+        ApplyAudioSettingsToComponent();
         BasisMediaPlayerRegistry.Add(this);
     }
 
@@ -300,7 +294,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             return;
         }
         var media = BasisMediaSource.FromUrl(url);
-        media.AudioRouting = AudioRouting;
         LoadSource(media);
     }
 
@@ -314,7 +307,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             return;
         }
         var media = BasisMediaSource.FromLocalPath(path);
-        media.AudioRouting = AudioRouting;
         LoadSource(media);
     }
 
@@ -403,8 +395,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         PlaybackRate = media.PlaybackRate;
         Volume = media.Volume;
         Mute = media.Mute;
-        AudioRouting = media.AudioRouting;
-        ApplyAudioRoutingToComponent();
+        ApplyAudioSettingsToComponent();
     }
 
     public void Play()
@@ -601,7 +592,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
     private void OnValidate()
     {
-        ApplyAudioRoutingToComponent();
+        ApplyAudioSettingsToComponent();
         // Live-tune the buffer when changed in the inspector during play.
         if (Application.isPlaying) nativeEngine?.SetBuffer(BufferMode, ResolvedBufferMilliseconds());
     }
@@ -632,10 +623,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         source.OnEndOfStream += HandleEndOfStream;
         source.OnReady += HandleSourceReady;
         source.OnVideoSizeChanged += HandleVideoSizeChanged;
-        if (audioComponent != null)
-        {
-            source.OnAudioFrame += audioComponent.Enqueue;
-        }
         if (seekableSource != null)
         {
             seekableSource.OnPrepared += HandleSourceReady;
@@ -653,10 +640,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         source.OnEndOfStream -= HandleEndOfStream;
         source.OnReady -= HandleSourceReady;
         source.OnVideoSizeChanged -= HandleVideoSizeChanged;
-        if (audioComponent != null)
-        {
-            source.OnAudioFrame -= audioComponent.Enqueue;
-        }
         if (seekableSource != null)
         {
             seekableSource.OnPrepared -= HandleSourceReady;
@@ -712,8 +695,6 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         nativeEngine.OnAudioTrackChanged -= HandleAudioTrackChanged;
         if (audioComponent != null && ReferenceEquals(audioComponent.NativePcmSource, nativeEngine))
             audioComponent.NativePcmSource = null;
-        if (multiChannelComponent != null && ReferenceEquals(multiChannelComponent.NativePcmSource, nativeEngine))
-            multiChannelComponent.NativePcmSource = null;
         try { nativeEngine.Dispose(); }
         catch (Exception ex) { BasisDebug.LogError($"BasisMediaPlayer native engine dispose failed: {ex.Message}", BasisDebug.LogTag.Video); }
         nativeEngine = null;
@@ -755,42 +736,15 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         System.Threading.Interlocked.Exchange(ref lastEnqueuedPtsUs, 0);
     }
 
-    private void ApplyAudioRoutingToComponent()
+    private void ApplyAudioSettingsToComponent()
     {
         if (audioComponent != null) { audioComponent.VolumeGain = Volume; audioComponent.Mute = Mute; }
-        if (multiChannelComponent != null) { multiChannelComponent.VolumeGain = Volume; multiChannelComponent.Mute = Mute; }
-        // AudioRouting may have changed (LoadSource, inspector) since the engine
-        // was routed; re-route so the ring follows the current routing.
         if (nativeEngine != null) RouteNativePcmSource(nativeEngine);
     }
 
-    // Multichannel routing feeds the native PCM ring to the per-channel sink;
-    // every other routing feeds the stereo sink. Only one drains the ring.
-    private bool UseMultiChannelAudio =>
-        AudioRouting == BasisAudioRouting.UnityMultiChannelSources && multiChannelComponent != null;
-
     private void RouteNativePcmSource(IBasisPcmSource pcm)
     {
-        bool multi = UseMultiChannelAudio;
-        if (pcm != null && !multi && AudioRouting == BasisAudioRouting.UnityMultiChannelSources)
-        {
-            // Warn once per misconfiguration episode; this is re-entered from
-            // OnValidate, so an unconditional log would repeat on every
-            // inspector change.
-            if (!warnedMultiChannelFallback)
-            {
-                warnedMultiChannelFallback = true;
-                BasisDebug.LogWarning(
-                    "BasisMediaPlayer: AudioRouting is UnityMultiChannelSources but no BasisMediaPlayerMultiChannelAudio is on this GameObject; falling back to stereo output.",
-                    BasisDebug.LogTag.Video);
-            }
-        }
-        else
-        {
-            warnedMultiChannelFallback = false;
-        }
-        if (audioComponent != null) audioComponent.NativePcmSource = multi ? null : pcm;
-        if (multiChannelComponent != null) multiChannelComponent.NativePcmSource = multi ? pcm : null;
+        if (audioComponent != null) audioComponent.NativePcmSource = pcm;
     }
 
     private void HandleVideoFrame(BasisVideoFrame frame)
@@ -1003,8 +957,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
         if (nativeEngine.TryGetPcmFormat(out int sr, out int ch) && sr > 0 && ch > 0)
         {
-            if (UseMultiChannelAudio) multiChannelComponent.SetExpectedFormat(sr, ch);
-            else audioComponent?.SetExpectedFormat(sr, ch);
+            audioComponent?.SetExpectedFormat(sr, ch);
         }
 
         Texture tex = nativeEngine.OutputTexture;

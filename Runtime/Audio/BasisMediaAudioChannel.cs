@@ -1,9 +1,9 @@
 using UnityEngine;
 
 // Declares which decoded channel(s) one AudioSource plays inside a
-// BasisMediaPlayerMultiChannelAudio output set. Sits on the same GameObject as
-// the AudioSource. Channel selections take a single decoded channel; Stereo
-// plays a stereo downmix of the whole stream as a 2-channel clip.
+// BasisMediaPlayerAudio output set. Sits on the same GameObject as the
+// AudioSource. Channel selections take a single decoded channel; Stereo plays a
+// stereo downmix of the whole stream as a 2-channel clip.
 //
 // What each channel carries depends on the stream's layout — e.g. a 5.1 stream
 // decodes in WAVE order (1 Front Left, 2 Front Right, 3 Front Centre, 4 LFE,
