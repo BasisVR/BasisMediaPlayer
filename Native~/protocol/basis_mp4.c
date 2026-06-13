@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MP4_MAX_FRAGS 4   /* per-moof trun runs (audio + video, with headroom) */
+
 typedef struct {
     int track_id;
     int is_video;
@@ -34,6 +36,21 @@ typedef struct {
     int announced;
 } mp4_track_t;
 
+/* One trun run within a moof: its track, where its samples sit (data-offset,
+ * relative to the moof start), and the per-sample table. A moof carries one of
+ * these per track (audio + video), all slicing the single following mdat. */
+typedef struct {
+    int       track_id;
+    int       data_offset;
+    int64_t   base_dts;
+    int       default_dur;
+    uint32_t* sizes;
+    uint32_t* durs;
+    int32_t*  ctos;
+    int       count;
+    int       cap;
+} mp4_frag_t;
+
 typedef struct {
     basis_media_sink_t* sink;
     basis_read_fn read;
@@ -41,16 +58,9 @@ typedef struct {
     mp4_track_t tracks[2];
     int ntracks;
 
-    /* pending fragment (from the last moof) */
-    int frag_track_id;
-    int64_t frag_base_dts;
-    int frag_default_dur;
-    int frag_default_size;
-    uint32_t* sizes;
-    uint32_t* durs;
-    int32_t*  ctos;
-    int frag_count;
-    int frag_cap;
+    /* runs from the last moof (one per traf/trun), consumed against its mdat */
+    mp4_frag_t frags[MP4_MAX_FRAGS];
+    int nfrags;
 } mp4_t;
 
 static uint32_t rd32(const uint8_t* p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
@@ -221,29 +231,32 @@ static void announce_tracks(mp4_t* m) {
 
 /* ---- moof parsing ------------------------------------------------------- */
 
-static int frag_reserve(mp4_t* m, int n) {
-    if (n <= m->frag_cap) return 1;
-    int nc = m->frag_cap ? m->frag_cap * 2 : 256;
+static int frag_reserve(mp4_frag_t* f, int n) {
+    if (n <= f->cap) return 1;
+    int nc = f->cap ? f->cap * 2 : 256;
     while (nc < n) nc *= 2;
-    uint32_t* s = (uint32_t*)realloc(m->sizes, (size_t)nc * sizeof(uint32_t));
-    uint32_t* d = (uint32_t*)realloc(m->durs, (size_t)nc * sizeof(uint32_t));
-    int32_t*  c = (int32_t*)realloc(m->ctos, (size_t)nc * sizeof(int32_t));
-    if (!s || !d || !c) { free(s); free(d); free(c); return 0; }
-    m->sizes = s; m->durs = d; m->ctos = c; m->frag_cap = nc;
+    uint32_t* s = (uint32_t*)realloc(f->sizes, (size_t)nc * sizeof(uint32_t));
+    if (s) f->sizes = s;
+    uint32_t* d = (uint32_t*)realloc(f->durs, (size_t)nc * sizeof(uint32_t));
+    if (d) f->durs = d;
+    int32_t*  c = (int32_t*)realloc(f->ctos, (size_t)nc * sizeof(int32_t));
+    if (c) f->ctos = c;
+    if (!s || !d || !c) return 0;
+    f->cap = nc;
     return 1;
 }
 
+/* Parse one traf into a fragment run per trun. tfhd/tfdt give the track and base
+ * decode time; each trun gives a data-offset (relative to the moof) and samples. */
 static void parse_traf(mp4_t* m, const uint8_t* p, int len) {
     int off = 0;
     int track_id = 0, default_dur = 0, default_size = 0;
     int64_t base_dts = 0;
-    m->frag_count = 0;
     while (off + 8 <= len) {
         int sz = (int)rd32(p + off);
         uint32_t ty = rd32(p + off + 4);
         if (sz < 8 || off + sz > len) break;
         const uint8_t* b = p + off + 8;
-        int bl = sz - 8;
         if (ty == 0x74666864) { /* tfhd */
             uint32_t flags = rd32(b) & 0xFFFFFF;
             int q = 4;
@@ -255,13 +268,15 @@ static void parse_traf(mp4_t* m, const uint8_t* p, int len) {
         } else if (ty == 0x74666474) { /* tfdt */
             int ver = b[0];
             base_dts = ver == 1 ? (int64_t)rd64(b + 4) : (int64_t)rd32(b + 4);
-        } else if (ty == 0x7472756e) { /* trun */
+        } else if (ty == 0x7472756e && m->nfrags < MP4_MAX_FRAGS) { /* trun */
+            mp4_frag_t* f = &m->frags[m->nfrags];
             uint32_t flags = rd32(b) & 0xFFFFFF;
             int count = (int)rd32(b + 4);
             int q = 8;
-            if (flags & 0x000001) q += 4; /* data-offset */
+            int data_offset = 0;
+            if (flags & 0x000001) { data_offset = (int)rd32(b + q); q += 4; } /* data-offset */
             if (flags & 0x000004) q += 4; /* first-sample-flags */
-            if (!frag_reserve(m, count)) { count = 0; }
+            if (!frag_reserve(f, count)) { off += sz; continue; }
             for (int i = 0; i < count; ++i) {
                 uint32_t dur = (uint32_t)default_dur, size = (uint32_t)default_size;
                 int32_t cto = 0;
@@ -269,19 +284,21 @@ static void parse_traf(mp4_t* m, const uint8_t* p, int len) {
                 if (flags & 0x000200) { size = rd32(b + q); q += 4; }
                 if (flags & 0x000400) { q += 4; }            /* sample flags */
                 if (flags & 0x000800) { cto = (int32_t)rd32(b + q); q += 4; }
-                m->sizes[i] = size; m->durs[i] = dur; m->ctos[i] = cto;
+                f->sizes[i] = size; f->durs[i] = dur; f->ctos[i] = cto;
             }
-            m->frag_count = count;
+            f->track_id = track_id;
+            f->base_dts = base_dts;
+            f->data_offset = data_offset;
+            f->default_dur = default_dur;
+            f->count = count;
+            m->nfrags++;
         }
         off += sz;
     }
-    m->frag_track_id = track_id;
-    m->frag_base_dts = base_dts;
-    m->frag_default_dur = default_dur;
-    m->frag_default_size = default_size;
 }
 
 static void parse_moof(mp4_t* m, const uint8_t* p, int len) {
+    m->nfrags = 0;
     int off = 0;
     while (off + 8 <= len) {
         int sz = (int)rd32(p + off);
@@ -292,19 +309,18 @@ static void parse_moof(mp4_t* m, const uint8_t* p, int len) {
     }
 }
 
-static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
-    mp4_track_t* t = track_by_id(m, m->frag_track_id);
-    if (!t || m->frag_count <= 0) return;
-
-    int64_t dts = m->frag_base_dts;
-    int pos = 0;
+static void consume_frag(mp4_t* m, const mp4_frag_t* f, const uint8_t* data, int len, int base_off) {
+    mp4_track_t* t = track_by_id(m, f->track_id);
+    if (!t) return;
     int ts = t->timescale > 0 ? t->timescale : 90000;
+    int pos = f->data_offset - base_off;
+    if (pos < 0) return;
+    int64_t dts = f->base_dts;
 
-    for (int i = 0; i < m->frag_count; ++i) {
-        int ssize = (int)m->sizes[i];
+    for (int i = 0; i < f->count; ++i) {
+        int ssize = (int)f->sizes[i];
         if (ssize <= 0 || pos + ssize > len) break;
-        int64_t pts_units = dts + m->ctos[i];
-        int64_t pts_us = pts_units * 1000000 / ts;
+        int64_t pts_us = (dts + f->ctos[i]) * 1000000 / ts;
 
         if (t->is_video) {
             uint8_t* out = (uint8_t*)malloc((size_t)ssize + 64);
@@ -321,8 +337,21 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
         }
 
         pos += ssize;
-        dts += m->durs[i] ? m->durs[i] : m->frag_default_dur;
+        dts += f->durs[i] ? f->durs[i] : f->default_dur;
     }
+}
+
+/* A moof's trafs share one mdat. Each trun's data-offset is relative to the moof
+ * start; the smallest maps to the first byte of this mdat's payload, so subtract
+ * it to place each run within the buffer we were handed. */
+static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
+    if (m->nfrags <= 0) return;
+    int base_off = m->frags[0].data_offset;
+    for (int k = 1; k < m->nfrags; ++k)
+        if (m->frags[k].data_offset < base_off) base_off = m->frags[k].data_offset;
+
+    for (int k = 0; k < m->nfrags; ++k)
+        consume_frag(m, &m->frags[k], data, len, base_off);
 }
 
 int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
@@ -350,6 +379,8 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
         free(buf);
     }
 
-    free(m.sizes); free(m.durs); free(m.ctos);
+    for (int k = 0; k < MP4_MAX_FRAGS; ++k) {
+        free(m.frags[k].sizes); free(m.frags[k].durs); free(m.frags[k].ctos);
+    }
     return 0;
 }
