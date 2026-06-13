@@ -16,7 +16,7 @@ presented **zero-copy** into a Unity texture. No transcode server, no VP9, no
 |---|---|---|
 | `rtspt://` | PC/VR low latency (RTP interleaved over TCP) | `rtspt://stream.vrcdn.live/live/vrcdn` |
 | `rtmp://`  | RTMP pull | `rtmp://stream.vrcdn.live/live/vrcdn` |
-| `rist://`  | RIST live ingest (UDP, loss recovery + optional AES) | `rist://host:5000?secret=KEY&aes-type=128` |
+| `rist://`  | RIST live ingest (UDP, loss recovery + optional AES) | `rist://stream.example:5000?secret=KEY&aes-type=128` |
 | `https://…​.mp4` | fragmented MP4 over HTTPS | `https://stream.vrcdn.live/live/vrcdn.live.mp4` |
 | `https://…​.ts`  | MPEG-TS over HTTPS (Quest) | `https://stream.vrcdn.live/live/vrcdn.live.ts` |
 | `https://…​.m3u8` | HLS / Low-Latency HLS (Windows) | `https://stream.example/live/index.m3u8` |
