@@ -83,8 +83,8 @@ int basis_avcc_to_annexb(const uint8_t* in, int in_len, int nls, uint8_t* out, i
         uint32_t nlen = 0;
         for (int k = 0; k < nls; ++k) nlen = (nlen << 8) | in[ip + k];
         ip += nls;
-        if (nlen == 0 || ip + (int)nlen > in_len) break;
-        if (op + 4 + (int)nlen > out_cap) return -1;
+        if (nlen == 0 || nlen > (uint32_t)(in_len - ip)) break;
+        if (op > out_cap - 4 || nlen > (uint32_t)(out_cap - op - 4)) return -1;
         memcpy(out + op, kStartCode, 4);
         op += 4;
         memcpy(out + op, in + ip, nlen);
