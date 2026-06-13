@@ -16,6 +16,7 @@ presented **zero-copy** into a Unity texture. No transcode server, no VP9, no
 |---|---|---|
 | `rtspt://` | PC/VR low latency (RTP interleaved over TCP) | `rtspt://stream.vrcdn.live/live/vrcdn` |
 | `rtmp://`  | RTMP pull | `rtmp://stream.vrcdn.live/live/vrcdn` |
+| `rist://`  | RIST live ingest (UDP, loss recovery + optional AES) | `rist://stream.example:5000?secret=KEY&aes-type=128` |
 | `https://…​.mp4` | fragmented MP4 over HTTPS | `https://stream.vrcdn.live/live/vrcdn.live.mp4` |
 | `https://…​.ts`  | MPEG-TS over HTTPS (Quest) | `https://stream.vrcdn.live/live/vrcdn.live.ts` |
 | `https://…​.m3u8` | HLS / Low-Latency HLS (Windows) | `https://stream.example/live/index.m3u8` |
@@ -37,6 +38,20 @@ a plain HLS origin you get its segment-bound latency, not 5 s.
 Runs on **Windows** (WinHTTP fetch), **clear streams**, **single rendition**.
 Android/Quest support is planned.
 
+### RIST
+
+`rist://` ingests a RIST stream — MPEG-TS over UDP via librist, with
+packet-loss recovery and optional AES encryption. librist reads its connection
+options straight from the URL query: `?secret=<key>&aes-type=128` (or `256`)
+for encryption, and `?buffer=<ms>` to size the recovery buffer. The buffer can
+also be set from C# via `BasisMediaSource.Options["buffer"]`, folded into the
+URL automatically. The recovered transport stream feeds the same MPEG-TS
+demuxer as the HTTP/TS path.
+
+RIST is **opt-in at build time** — the default plugin links only OS frameworks.
+Build with `-DBASIS_WITH_RIST=ON` against prebuilt librist (see *Building the
+native plugin* below).
+
 ## Usage
 
 ```csharp
@@ -53,12 +68,30 @@ Add a `BasisMediaPlayerAudio` (+ `AudioSource`) for sound;
 The CPU `IBasisFrameSource` path (e.g. `BasisSyntheticTestSource`) is still
 available by assigning `player.Source` directly — useful for tests without a feed.
 
+### Audio (stereo and multichannel)
+
+Stereo or mono audio routes through a `BasisMediaPlayerAudio` (+ `AudioSource`)
+on the player GameObject. For surround content, set `BasisMediaSource.AudioRouting`
+to `UnityMultiChannelSources` and add a `BasisMediaPlayerMultiChannelAudio`
+instead: it splits the decoded stream (up to 8 channels) across one `AudioSource`
+per channel — each tagged with a `BasisMediaAudioChannel` — so a 5.1 / 7.1 mix
+can be positioned speaker-by-speaker in the world. The
+`Prefabs/MediaPlayerMultiChannelStreaming` prefab is wired up for this.
+
+Channel ceiling depends on the source: **LPCM over MPEG-TS** carries a full 7.1
+(8 channels); **AAC on Windows** decodes up to 5.1 (the Media Foundation
+decoder's limit).
+
 ## Building the native plugin
 
 Source is under `Native~/`. By default it links **only OS frameworks** (no
-third-party libs). The optional RIST transport (`-DBASIS_WITH_RIST=ON`) statically
-links prebuilt librist + mbedTLS from `Native~/third_party/` — see
-`Native~/third_party/README.md`. You also need Unity's PluginAPI headers — see
+third-party libs). The optional RIST transport (`-DBASIS_WITH_RIST=ON`)
+statically links prebuilt librist (which vendors its own mbedTLS) from
+`Native~/third_party/`. Build that archive with `Native~/build-librist.ps1`
+(Windows) or `build-librist.sh` (Linux/Android), or download it from the
+**media-native (RIST)** CI workflow's artifacts — see
+`Native~/third_party/README.md`. Then add `-DBASIS_WITH_RIST=ON` to the cmake
+configure step below. You also need Unity's PluginAPI headers — see
 `Native~/unity/README.md`.
 
 **Windows → `Plugins/Windows/x86_64/basis_media_native.dll`**
