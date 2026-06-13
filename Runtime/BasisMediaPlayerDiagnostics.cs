@@ -38,7 +38,7 @@ public sealed class BasisMediaPlayerDiagnostics : MonoBehaviour
 
     private void Awake()
     {
-        player = GetComponent<BasisMediaPlayer>();
+        TryGetComponent(out player);
         TryGetComponent(out audioComponent);
         TryGetComponent(out multiChannelComponent);
         lineBuilder = new StringBuilder(512);
