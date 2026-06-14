@@ -68,6 +68,12 @@ static int64_t hls_now_us(void) {
 #define HLS_MAX_EMPTY_RELOADS 8  /* consecutive no-new-media reloads before giving up */
 #define HLS_LIVE_MARGIN_SEGMENTS 3 /* playout buffer kept behind the live edge for plain (non-LL) HLS */
 #define HLS_RING_CAP (4 * 1024 * 1024) /* read-ahead byte buffer (~5 s of 1080p HD) */
+#define HLS_SEG_DESC_MAX 256           /* buffered (bytes,duration) descriptors for pacing */
+
+/* Per-segment (byte length, media duration), recorded by the producer as each segment
+ * completes and consumed in order by basis_hls_read so it can meter at the bitrate of
+ * the segment it is actually draining rather than a whole-stream average. */
+typedef struct { int byte_len; long dur_ms; } hls_seg_desc_t;
 
 /* (msn, part) media position. part == -1 means a whole segment. */
 typedef struct {
@@ -134,16 +140,24 @@ typedef struct basis_hls {
     volatile int stop;
     volatile int producer_done;
 
-    /* Real-time pacing: the decoder presents on a wall-clock and drops frames if
-     * fed faster than real-time (it never back-pressures). So basis_hls_read meters
-     * output to the stream's measured average bitrate via a token bucket. */
-    volatile long target_bps;   /* measured average bytes/sec; 0 until known */
-    long long     acc_bytes;    /* producer: cumulative segment bytes ... */
-    long long     acc_dur_ms;   /* ... and their cumulative media duration */
-    long          cur_seg_dur_ms;   /* duration of the segment the producer is on */
-    long long     cur_seg_bytes;    /* bytes delivered for it so far */
-    double        tb_tokens;    /* consumer token bucket (bytes) */
-    int64_t       tb_last_us;   /* last token refill timestamp (0 = uninit) */
+    /* Real-time pacing: the decoder presents on a wall-clock and drops frames if fed
+     * faster than real-time (it never back-pressures), so basis_hls_read meters output
+     * via a token bucket. The rate is the bitrate of the segment currently being
+     * drained — not a whole-stream average, which mistracks VBR (a busy scene runs
+     * above average and starves playback). The producer records each completed
+     * segment's (bytes, duration) in seg_desc; the consumer adopts them in order. */
+    long          cur_seg_dur_ms;   /* duration of the segment the producer is fetching */
+    long long     cur_seg_bytes;    /* bytes fetched for it so far */
+
+    hls_seg_desc_t seg_desc[HLS_SEG_DESC_MAX]; /* completed-segment descriptors (under lock) */
+    int           desc_head;        /* producer write index */
+    int           desc_tail;        /* consumer read index  */
+    int           desc_count;       /* descriptors buffered  */
+
+    volatile long target_bps;       /* metering rate (bytes/sec) of the adopted segment; 0 = unthrottled */
+    int           cur_desc_left;    /* bytes left in the adopted descriptor (0 = adopt next) */
+    double        tb_tokens;        /* consumer token bucket (bytes) */
+    int64_t       tb_last_us;       /* last token refill timestamp (0 = uninit) */
 } basis_hls_t;
 
 /* ---- small string / URL helpers ----------------------------------------- */
@@ -569,12 +583,19 @@ static void hls_producer(basis_hls_t* h) {
         } else {
             h->http.close(h->seg_ctx);
             h->seg_ctx = NULL;
-            /* fold this segment into the running average bitrate that paces output */
-            if (h->cur_seg_dur_ms > 0) {
-                h->acc_bytes += h->cur_seg_bytes;
-                h->acc_dur_ms += h->cur_seg_dur_ms;
-                if (h->acc_dur_ms > 0)
-                    h->target_bps = (long)(h->acc_bytes * 1000 / h->acc_dur_ms);
+            /* record (bytes, duration) so the consumer meters at this segment's own
+             * bitrate. The init segment (dur 0) carries no media time, so skip it. If
+             * the descriptor ring is somehow full, drop it — that span just serves
+             * unthrottled, which is harmless. */
+            if (h->cur_seg_dur_ms > 0 && h->cur_seg_bytes > 0) {
+                hls_mutex_lock(&h->lock);
+                if (h->desc_count < HLS_SEG_DESC_MAX) {
+                    h->seg_desc[h->desc_head].byte_len = (int)h->cur_seg_bytes;
+                    h->seg_desc[h->desc_head].dur_ms   = h->cur_seg_dur_ms;
+                    h->desc_head = (h->desc_head + 1) % HLS_SEG_DESC_MAX;
+                    h->desc_count++;
+                }
+                hls_mutex_unlock(&h->lock);
             }
             h->cur_seg_bytes = 0; h->cur_seg_dur_ms = 0;
             /* top up the queue in the background so the next segment is ready */
@@ -693,10 +714,28 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
     for (;;) {
         if (h->stop || (h->is_running && !h->is_running(h->user))) return 0;
 
-        /* Real-time pacing: the decoder presents on a wall-clock and drops frames
-         * if fed faster than real-time, so meter output to the measured average
-         * bitrate via a token bucket (≈0.25 s burst). Before the rate is known
-         * (first segment), serve unthrottled. */
+        /* Real-time pacing: the decoder presents on a wall-clock and drops frames if
+         * fed faster than real-time, so meter output via a token bucket. The rate is
+         * the bitrate of the segment currently being drained, adopted in order from
+         * seg_desc, so VBR is tracked per segment instead of mis-metered at a stream
+         * average (a busy scene runs above average and starves playback). With no
+         * descriptor ready yet (startup, or a brief underrun while the producer is
+         * behind) serve unthrottled to refill. */
+        if (h->cur_desc_left <= 0) {
+            hls_mutex_lock(&h->lock);
+            if (h->desc_count > 0) {
+                hls_seg_desc_t d = h->seg_desc[h->desc_tail];
+                h->desc_tail = (h->desc_tail + 1) % HLS_SEG_DESC_MAX;
+                h->desc_count--;
+                hls_mutex_unlock(&h->lock);
+                h->cur_desc_left = d.byte_len;
+                h->target_bps = d.dur_ms > 0 ? (long)((long long)d.byte_len * 1000 / d.dur_ms) : 0;
+            } else {
+                hls_mutex_unlock(&h->lock);
+                h->target_bps = 0; /* unthrottled until a segment completes */
+            }
+        }
+
         int budget = len;
         long rate = h->target_bps;
         if (rate > 0) {
@@ -725,6 +764,7 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
                 h->ring_count -= take;
                 hls_mutex_unlock(&h->lock);
                 if (rate > 0) h->tb_tokens -= take;
+                h->cur_desc_left -= take; /* advance through the adopted segment */
                 return take;
             }
             int done = h->producer_done;
