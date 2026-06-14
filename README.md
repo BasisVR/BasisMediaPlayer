@@ -1,8 +1,8 @@
 # Basis Media Player
 
-Live video for Basis, decoded with the **operating-system hardware codecs** and
-presented **zero-copy** into a Unity texture. No transcode server, no VP9, no
-`UnityEngine.Video.MediaPlayer`.
+Live and on-demand video for Basis, decoded with the **operating-system hardware
+codecs** and presented **zero-copy** into a Unity texture. No transcode server, no
+VP9, no `UnityEngine.Video.MediaPlayer`.
 
 - **Windows (PC / VR)** — Media Foundation H.264/H.265 + AAC on a DXVA D3D11
   device; NV12 → BGRA via the D3D11 video processor into a texture Unity samples.
@@ -51,6 +51,79 @@ demuxer as the HTTP/TS path.
 RIST is **opt-in at build time** — the default plugin links only OS frameworks.
 Build with `-DBASIS_WITH_RIST=ON` against prebuilt librist (see *Building the
 native plugin* below).
+
+## Live vs on-demand
+
+Every source is either **live** (presented at the live edge, lowest latency) or
+**on-demand** (VOD — paced to real time, so a file that arrives faster than it plays
+doesn't fast-forward). `BasisMediaSource.Delivery` selects which:
+
+| `Delivery` | Behaviour |
+|---|---|
+| `Auto` (default) | Decided at open from the source — see below |
+| `Live` | Force the live-edge clock |
+| `OnDemand` | Force real-time pacing |
+
+`Auto` reads the source: a non-HTTP transport (`rtsp`/`rtmp`/`rist`) is live; an HTTP
+response with a known `Content-Length` and byte-range support, or an HLS playlist
+carrying `EXT-X-ENDLIST`, is on-demand; an open-ended HTTP response is live. On-demand
+throttles delivery and presents on a fixed 1× clock, with a compressed read-ahead
+buffer absorbing bursty CDN delivery.
+
+`LoadUrl(url)` uses `Auto`. For explicit control, load a `BasisMediaSource`:
+
+```csharp
+player.LoadSource(new BasisMediaSource { Uri = url, Delivery = BasisMediaDelivery.OnDemand });
+```
+
+The live jitter buffer is tunable via `BasisMediaPlayer.BufferMilliseconds` /
+`BufferMode` (Fixed, or auto-tuning Dynamic — lower = less latency, higher = smoother).
+On-demand currently presents on a fixed internal buffer; `BufferMilliseconds` applies
+to the live path only.
+
+## Split-stream (separate video + audio)
+
+Adaptive sources often serve high-resolution video and audio as **separate** streams
+(H.264 video-only + AAC audio-only). Set `BasisMediaSource.AudioUri` alongside `Uri`
+and the engine runs a second demux thread feeding the same decoder, so both present in
+sync on one clock:
+
+```csharp
+player.LoadSource(new BasisMediaSource {
+    Uri = videoOnlyUrl, AudioUri = audioOnlyUrl, Delivery = BasisMediaDelivery.OnDemand,
+});
+```
+
+A null `AudioUri` (the default) is an ordinary single muxed stream.
+
+## Page URLs (optional resolver package)
+
+The player opens **stream** URLs (the schemes above) directly. It does **not** itself
+turn a **page** URL — a YouTube or Twitch watch page — into a stream. That resolution
+is provided by a **separate, optional package** (a yt-dlp-based resolver) which
+registers itself on `BasisMediaUrlRouter`; the player core has no dependency on it and
+never references it.
+
+**With the resolver package installed**, a URL field such as
+`BasisMediaPlayerStreaming.StreamUrl` steers each URL automatically:
+
+- A **directly-playable** URL — a transport scheme, or an HTTP URL whose path ends in a
+  media extension (`.mp4`/`.m4s`/`.ts`/`.m3u8`/`.mpd`) — loads directly.
+- **Anything else** (an HTTP page URL with no media extension) is handed to the
+  resolver, which turns it into the playable stream endpoint(s) and loads them.
+
+**Without it**, the router is inert: every URL loads directly, so all the stream URLs
+above keep working — but page URLs are no longer resolved, so **YouTube, Twitch and
+similar links won't play** (loading one reports that the resolver package is needed,
+rather than failing silently). Removing the package is a supported choice: you lose
+common-site resolution and nothing else. (This only steers — it never blocks a URL;
+host trust is enforced separately.)
+
+> **Known gap.** The steering keys off the URL's form, so a **direct HTTP stream with
+> no file extension** (e.g. `https://host/live/feed` with no `.ts`/`.mp4`) can't be
+> told apart from a page URL: with the resolver installed it is sent to the resolver
+> and fails, rather than loading directly. Give direct HTTP streams a recognised
+> extension, or use a transport scheme (`rtsp`/`rtmp`), to avoid this.
 
 ## Usage
 
