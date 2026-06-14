@@ -550,6 +550,19 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
             if (urlChanged)
             {
                 currentSyncedUrl = url;
+
+                // A page URL (YouTube/Twitch/…) is resolved per-client: resolved CDN URLs
+                // are per-client and expiring, so they can't be shared. Route it through
+                // LoadUrl so this client resolves the page URL itself. Resolution is async,
+                // so the resolved source auto-plays via the player's default
+                // AutoPlayOnSourceAssigned; fine-grained seek/pause sync isn't applied to
+                // resolved sources (a limitation of cross-client resolution).
+                if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
+                {
+                    mediaPlayer.LoadUrl(url);
+                    return;
+                }
+
                 var media = BasisMediaSource.FromUrl(url);
                 media.StartPosition = positionTicks > 0 ? TimeSpan.FromTicks(positionTicks) : TimeSpan.Zero;
 
@@ -690,10 +703,18 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
             return;
         }
 
-        var media = mediaPlayer.ActiveMediaSource;
-        if (media != null && !string.IsNullOrEmpty(media.Uri))
+        // Only back-fill from the resolved source when nothing was set explicitly (a
+        // direct LoadSource outside SetUrl). When SetUrl provided a URL, keep it — for a
+        // page URL that's the youtube.com/twitch.tv link peers need to resolve themselves;
+        // overwriting it with the resolved CDN URL would broadcast a per-client/expiring
+        // URL that works for no one else.
+        if (string.IsNullOrEmpty(currentSyncedUrl))
         {
-            currentSyncedUrl = media.Uri;
+            var media = mediaPlayer.ActiveMediaSource;
+            if (media != null && !string.IsNullOrEmpty(media.Uri))
+            {
+                currentSyncedUrl = media.Uri;
+            }
         }
 
         BroadcastFullState();
@@ -818,13 +839,17 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
 
     private string GetActiveUrl()
     {
-        var media = mediaPlayer.ActiveMediaSource;
-        if (media != null && !string.IsNullOrEmpty(media.Uri))
+        // Broadcast the URL that was set — the page URL for resolved sources, or the
+        // direct stream URL — never the resolved CDN URL (per-client/expiring), so each
+        // client resolves the page URL itself. currentSyncedUrl is back-filled from the
+        // active source only when nothing was set explicitly (direct LoadSource).
+        if (!string.IsNullOrEmpty(currentSyncedUrl))
         {
-            return media.Uri;
+            return currentSyncedUrl;
         }
 
-        return currentSyncedUrl ?? string.Empty;
+        var media = mediaPlayer.ActiveMediaSource;
+        return media != null && !string.IsNullOrEmpty(media.Uri) ? media.Uri : string.Empty;
     }
 
     private byte[] SerializeFullState()
