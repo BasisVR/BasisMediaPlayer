@@ -13,6 +13,7 @@ typedef struct {
     HINTERNET connect;
     HINTERNET request;
     int response_complete;
+    int seekable;            /* finite Content-Length + Accept-Ranges: bytes (VOD) */
 } win_http_t;
 
 static wchar_t* to_w(const char* s) {
@@ -75,7 +76,27 @@ extern "C" void* basis_win_http_open(const char* url) {
         WinHttpCloseHandle(h->request); WinHttpCloseHandle(h->connect); WinHttpCloseHandle(h->session);
         free(h); return NULL;
     }
+
+    /* Seekability (for live-vs-VOD auto-detection): a known Content-Length plus
+     * Accept-Ranges: bytes means a finite, range-fetchable body — on-demand content.
+     * Live streams are chunked / open-ended, so they report neither. Both required so
+     * an open-ended stream is never mistaken for VOD (which would mis-pace it). */
+    {
+        DWORD64 clen = 0; DWORD clsz = sizeof(clen);
+        BOOL haveLen = WinHttpQueryHeaders(h->request,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+            WINHTTP_HEADER_NAME_BY_INDEX, &clen, &clsz, WINHTTP_NO_HEADER_INDEX);
+        wchar_t ranges[64] = {0}; DWORD rsz = sizeof(ranges);
+        BOOL haveRanges = WinHttpQueryHeaders(h->request, WINHTTP_QUERY_ACCEPT_RANGES,
+            WINHTTP_HEADER_NAME_BY_INDEX, ranges, &rsz, WINHTTP_NO_HEADER_INDEX);
+        h->seekable = (haveLen && clen > 0 && haveRanges && _wcsicmp(ranges, L"bytes") == 0) ? 1 : 0;
+    }
     return h;
+}
+
+extern "C" int basis_win_http_is_seekable(void* ctx) {
+    win_http_t* h = (win_http_t*)ctx;
+    return h ? h->seekable : 0;
 }
 
 extern "C" int basis_win_http_read(void* ctx, uint8_t* buf, int len) {

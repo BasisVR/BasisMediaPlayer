@@ -50,6 +50,10 @@ void* basis_hls_open(const char* url, const basis_http_provider_t* http,
  * Returns bytes read, 0 when the stream ends or the engine stops, <0 on error. */
 int basis_hls_read(void* ctx, uint8_t* buf, int len);
 
+/* 1 if the opened playlist is VOD (EXT-X-ENDLIST seen), 0 if live. Reflects the
+ * playlist parsed at open, so the caller can pick live-vs-on-demand pacing. */
+int basis_hls_is_vod(void* ctx);
+
 void basis_hls_close(void* ctx);
 
 #ifdef __cplusplus

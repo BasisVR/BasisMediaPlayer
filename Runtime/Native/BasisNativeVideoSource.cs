@@ -48,7 +48,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
 
     public string Url { get; }
     public string AudioUrl { get; }
-    public bool Paced { get; }
+    public BasisMediaDelivery Delivery { get; }
     public Texture OutputTexture => unityOwnedRT != null ? (Texture)unityOwnedRT : externalTexture;
     public Vector2Int VideoSize => new Vector2Int(texW, texH);
     public bool IsRunning => handle != IntPtr.Zero && started && !disposed;
@@ -125,12 +125,12 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     private int pumpCount;
     private BasisMediaEngineState lastLoggedState = (BasisMediaEngineState)(-1);
 
-    public BasisNativeVideoSource(string url, string audioUrl = null, bool paced = false)
+    public BasisNativeVideoSource(string url, string audioUrl = null, BasisMediaDelivery delivery = BasisMediaDelivery.Auto)
     {
         if (string.IsNullOrEmpty(url)) throw new ArgumentNullException(nameof(url));
         Url = url;
         AudioUrl = audioUrl;
-        Paced = paced;
+        Delivery = delivery;
     }
 
     public void Start()
@@ -138,7 +138,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
         if (disposed) throw new ObjectDisposedException(nameof(BasisNativeVideoSource));
         if (started) return;
         ResolveRenderEventFunc();
-        handle = BasisNativeMedia.OpenWithAudio(Url, AudioUrl, Paced); // throws with build instructions if the lib is missing; AudioUrl null ⇒ single stream
+        handle = BasisNativeMedia.OpenWithAudio(Url, AudioUrl, Delivery); // throws with build instructions if the lib is missing; AudioUrl null ⇒ single stream
         if (handle == IntPtr.Zero)
             throw new InvalidOperationException($"basis_media_open returned null for '{Url}' (unsupported scheme or out of memory).");
         BasisNativeMedia.Play(handle);

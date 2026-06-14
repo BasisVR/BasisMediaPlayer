@@ -130,8 +130,12 @@ struct basis_media_engine {
 
     /* Paced (VOD) mode: throttle delivery + present on a fixed 1x clock instead of
      * the live edge. The pace anchor (first access unit's wall time + PTS) is shared
-     * across both demux legs so a split source paces against one timeline. */
+     * across both demux legs so a split source paces against one timeline. paced is
+     * the resolved decision; paced_hint is the caller's request (0=auto, 1=live,
+     * 2=on-demand). When the hint is auto, the protocol handler sets paced once it has
+     * inspected the source (HTTP headers / HLS playlist) — see run_http_like/run_hls. */
     int paced;
+    int paced_hint;
     volatile int pace_started;
     int64_t pace_wall0_us;
     int64_t pace_base_pts;
@@ -458,6 +462,11 @@ static void run_hls(demux_ctx_t* c) {
         c->sink->on_error(c->sink->user, "failed to open HLS playlist");
         return;
     }
+    /* Auto delivery (hint 0): a playlist carrying EXT-X-ENDLIST is a finished VOD
+     * playlist (all segments available at once) and must be paced; a live playlist
+     * has no endlist. A forced hint skips this. */
+    if (c->e->paced_hint == 0 && basis_hls_is_vod(hls))
+        c->e->paced = 1;
     c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
     if (is_fmp4)
         basis_mp4_run(c->sink, basis_hls_read, hls);
@@ -517,6 +526,15 @@ static void run_http_like(demux_ctx_t* c) {
         c->sink->on_error(c->sink->user, "failed to open HTTP byte source");
         return;
     }
+
+#if defined(_WIN32)
+    /* Auto delivery (hint 0): a finite, byte-range-seekable HTTP body (known
+     * Content-Length + Accept-Ranges) is on-demand and arrives faster than real time,
+     * so pace it; an open-ended response is live. Set before the read-ahead gate and
+     * the first AU, so pacing is in force from the start. A forced hint skips this. */
+    if (c->e->paced_hint == 0 && basis_win_http_is_seekable(src))
+        c->e->paced = 1;
+#endif
 
     c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
 
@@ -765,13 +783,16 @@ static void audio_thread_join(basis_media_engine_t* e) {
 /* Shared open path. audio_url NULL/empty => single muxed stream (the only path
  * basis_media_open takes); non-empty => split-stream, with url as the video-only
  * primary and audio_url as the audio-only secondary feeding the same decoder. */
-static basis_media_engine_t* open_impl(const char* url, const char* audio_url, int paced) {
+static basis_media_engine_t* open_impl(const char* url, const char* audio_url, int delivery_hint) {
     if (!url) return NULL;
 
     basis_media_engine_t* e = (basis_media_engine_t*)calloc(1, sizeof(*e));
     if (!e) return NULL;
 
-    e->paced = paced ? 1 : 0;
+    /* delivery_hint: 0=auto, 1=force live, 2=force on-demand. Auto starts live and
+     * the protocol handler may flip it to paced once it has inspected the source. */
+    e->paced_hint = delivery_hint;
+    e->paced = (delivery_hint == 2) ? 1 : 0;
     strncpy(e->url, url, sizeof(e->url) - 1);
     if (basis_url_parse(url, &e->parts) != 0) { free(e); return NULL; }
 
@@ -829,10 +850,11 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
 }
 
 /* Split-stream / paced open. audio_url (when set) is the audio-only secondary played
- * in sync on one decoder/clock; paced selects real-time-paced VOD delivery. A
- * NULL/empty audio_url with paced == 0 is exactly basis_media_open(video_url). */
-BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int paced) {
-    return open_impl(video_url, audio_url, paced);
+ * in sync on one decoder/clock; delivery_hint (0=auto, 1=live, 2=on-demand) selects
+ * the clock, auto-detected from the source when 0. A NULL/empty audio_url with
+ * delivery_hint == 0 is exactly basis_media_open(video_url). */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int delivery_hint) {
+    return open_impl(video_url, audio_url, delivery_hint);
 }
 
 BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {

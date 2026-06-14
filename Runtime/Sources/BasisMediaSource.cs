@@ -1,6 +1,18 @@
 using System;
 using System.Collections.Generic;
 
+// Live-vs-on-demand delivery policy. Auto lets the engine decide at open from the
+// scheme and, for HTTP, the response (a finite, seekable body or an HLS playlist
+// with EXT-X-ENDLIST => on-demand; an open-ended stream => live). Live and OnDemand
+// force the choice when the caller already knows (e.g. a resolver that produced a
+// split adaptive pair knows it is on-demand). Values match the native ABI hint.
+public enum BasisMediaDelivery
+{
+    Auto = 0,      // detect at open (default)
+    Live = 1,      // force live-edge clock (real-time broadcast)
+    OnDemand = 2,  // force real-time-paced VOD delivery + presentation
+}
+
 // Declarative description of "what to play" + "how to play it", consumed by
 // BasisMediaPlayer.LoadSource. The player hands every network URL to the OS-codec
 // engine (basis_media_native), which decodes it zero-copy into a GPU texture:
@@ -39,12 +51,11 @@ public sealed class BasisMediaSource
     // Optional headers for the AudioUri transport, mirroring Headers.
     public Dictionary<string, string> AudioHeaders;
 
-    // When true, the engine treats this as on-demand content and paces delivery +
-    // presentation to real time (a fixed 1x clock from the first frame), instead of
-    // the live-edge clock used for broadcasts. Set for VOD sources that arrive faster
-    // than real time (e.g. yt-dlp-resolved YouTube), which would otherwise fast-forward.
-    // Leave false (default) for live streams (RTSP/RTMP/RIST/live HLS).
-    public bool Paced;
+    // Live-vs-on-demand policy. On-demand content (VOD that arrives faster than real
+    // time, e.g. yt-dlp-resolved YouTube) is paced to a fixed 1x clock so it doesn't
+    // fast-forward; live broadcasts (RTSP/RTMP/RIST/live HLS) present at the live edge.
+    // Auto (default) detects this at open; set Live/OnDemand to force it.
+    public BasisMediaDelivery Delivery = BasisMediaDelivery.Auto;
 
     // Per-source loop flag. Overridden by BasisMediaPlayer.Loop when assigned;
     // BasisMediaPlayer.Loop is the runtime-mutable knob.

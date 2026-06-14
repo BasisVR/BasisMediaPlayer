@@ -736,6 +736,11 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
     }
 }
 
+int basis_hls_is_vod(void* ctx) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    return h ? h->endlist_seen : 0;
+}
+
 void basis_hls_close(void* ctx) {
     basis_hls_t* h = (basis_hls_t*)ctx;
     if (!h) return;

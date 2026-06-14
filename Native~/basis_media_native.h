@@ -73,12 +73,18 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url);
 /* Split-stream / paced open. video_url carries video (e.g. an H.264-only fMP4);
  * audio_url, when non-NULL, is a separate audio-only stream fed by a second demux
  * thread into the same decoder so both present against one clock (adaptive YouTube
- * above ~360p). paced != 0 selects real-time-paced on-demand playback: delivery is
- * throttled to ~1x and presentation runs on a fixed 1x-from-first-PTS clock, for
- * VOD sources that arrive faster than real time (which would otherwise fast-forward
- * on the live-edge clock). A NULL/empty audio_url with paced == 0 behaves exactly
- * like basis_media_open(video_url). Same return and async-error contract. */
-BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int paced);
+ * above ~360p).
+ *
+ * delivery_hint selects the live-vs-on-demand clock: 0 = auto-detect at open,
+ * 1 = force live, 2 = force on-demand. On-demand throttles delivery to ~1x and
+ * presents on a fixed 1x-from-first-PTS clock, for VOD that arrives faster than real
+ * time (which would otherwise fast-forward on the live-edge clock). Auto picks
+ * on-demand when the source looks finite — an HTTP body with a known Content-Length
+ * and byte-range support, or an HLS playlist carrying EXT-X-ENDLIST — and live
+ * otherwise (non-HTTP transports and open-ended HTTP responses). A NULL/empty
+ * audio_url with delivery_hint == 0 behaves exactly like basis_media_open(video_url).
+ * Same return and async-error contract. */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int delivery_hint);
 
 /* Stop all threads (joining them) and free everything, including GPU textures.
  * D3D11/D3D12 resources are freed via thread-safe COM Release; the joined decode
