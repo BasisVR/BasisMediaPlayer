@@ -104,6 +104,17 @@ struct basis_media_engine {
 
     basis_media_sink_t sink;
 
+    /* Optional separate audio-only stream (split-stream playback). When url_audio
+     * is set, the primary URL is treated as video-only and this carries audio; a
+     * second demux thread feeds the same decoder, so both share one clock. Empty
+     * url_audio => single muxed stream and the second thread never starts (the
+     * single-stream path is byte-for-byte unchanged). */
+    char  url_audio[2048];
+    basis_url_t parts_audio;
+    basis_media_sink_t audio_sink;
+    basis_thread_t audio_thread;
+    int audio_thread_started;
+
     /* diagnostics (demux thread writes, main thread reads; minor races OK) */
     volatile long video_au_count;
     volatile long audio_frame_count;
@@ -179,6 +190,32 @@ static void install_sink(basis_media_engine_t* e) {
     e->sink.is_running = sink_is_running;
 }
 
+/* The split-stream audio leg feeds only audio into the shared decoder. The video
+ * leg owns the state machine and end-of-stream, so this sink drops video, state
+ * and EOS callbacks; a hard error still surfaces (a dead audio leg breaks
+ * playback), and is_running shares the engine flag so the audio thread stops with
+ * the engine. */
+static void audio_sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
+    (void)user; (void)codec; (void)ed; (void)ed_len; (void)w; (void)h;
+}
+static void audio_sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
+    (void)user; (void)au; (void)len; (void)pts; (void)key;
+}
+static void audio_sink_state(void* user, basis_media_state_t s) { (void)user; (void)s; }
+static void audio_sink_eos(void* user) { (void)user; }
+
+static void install_audio_sink(basis_media_engine_t* e) {
+    e->audio_sink.user = e;
+    e->audio_sink.on_video_format = audio_sink_video_format;
+    e->audio_sink.on_video_au = audio_sink_video_au;
+    e->audio_sink.on_audio_format = sink_audio_format; /* routes to the shared decoder's audio path */
+    e->audio_sink.on_audio_frame = sink_audio_frame;
+    e->audio_sink.on_state = audio_sink_state;
+    e->audio_sink.on_error = sink_error;               /* a failed audio leg is an engine error */
+    e->audio_sink.on_end_of_stream = audio_sink_eos;
+    e->audio_sink.is_running = sink_is_running;
+}
+
 /* ---- demux thread ------------------------------------------------------- */
 
 static int ends_with_ci(const char* s, const char* suffix) {
@@ -194,44 +231,60 @@ static int ends_with_ci(const char* s, const char* suffix) {
     return 1;
 }
 
+/* One demux pipeline: which URL/parts to pull and which sink to push into. The
+ * engine still owns the decoder, state machine, running flag and error; threading
+ * the rest through here lets one engine drive two independent pipelines — a
+ * video-only primary plus an audio-only secondary — without either role being
+ * hardcoded. State and error go through the sink (not the engine directly) so a
+ * subordinate leg can suppress them; a third track would reuse the same shape. */
+typedef struct {
+    basis_media_engine_t* e;
+    const char* url;
+    basis_url_t* parts;
+    basis_media_sink_t* sink;
+    int allow_os_demux; /* Android OS-extractor fast path; primary leg only */
+} demux_ctx_t;
+
 /* HLS / LL-HLS: the URL is a playlist, not a continuous byte stream. The HLS
  * source fetches+parses the M3U8, stitches segments (and LL-HLS parts) into one
  * byte stream, and the existing TS/fMP4 demuxers consume it. Windows fetches via
  * WinHTTP; Android/Quest support is planned. */
-static void run_hls(basis_media_engine_t* e) {
+static void run_hls(demux_ctx_t* c) {
 #if defined(_WIN32)
     basis_http_provider_t provider = {
         basis_win_http_open, basis_win_http_read, basis_win_http_close
     };
     int is_fmp4 = 0;
-    void* hls = basis_hls_open(e->url, &provider, e->sink.is_running, e->sink.user, &is_fmp4);
+    void* hls = basis_hls_open(c->url, &provider, c->sink->is_running, c->sink->user, &is_fmp4);
     if (!hls) {
-        basis_engine_set_error(e, "failed to open HLS playlist");
+        c->sink->on_error(c->sink->user, "failed to open HLS playlist");
         return;
     }
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
     if (is_fmp4)
-        basis_mp4_run(&e->sink, basis_hls_read, hls);
+        basis_mp4_run(c->sink, basis_hls_read, hls);
     else
-        basis_ts_run(&e->sink, basis_hls_read, hls);
+        basis_ts_run(c->sink, basis_hls_read, hls);
     basis_hls_close(hls);
 #else
-    basis_engine_set_error(e, "HLS playback currently requires the Windows backend.");
+    c->sink->on_error(c->sink->user, "HLS playback currently requires the Windows backend.");
 #endif
 }
 
-static void run_http_like(basis_media_engine_t* e) {
-    /* Android: the OS extractor can demux the URL itself (TLS included). */
-    if (basis_decoder_try_open_url(e->decoder, e->url)) {
-        basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-        while (e->running) sleep_ms(20);
+static void run_http_like(demux_ctx_t* c) {
+    /* Android: the OS extractor can demux the URL itself (TLS included). Primary
+     * leg only — an audio-only leg must feed the shared decoder's audio path, not
+     * hand a whole muxed file to the OS extractor. */
+    if (c->allow_os_demux && basis_decoder_try_open_url(c->e->decoder, c->url)) {
+        c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+        while (c->e->running) sleep_ms(20);
         return;
     }
 
     /* HLS playlists are not a single continuous stream — hand off to the HLS
      * source before the plain TS/fMP4 byte-source path. (.m3u8 may carry a query.) */
-    if (strstr(e->parts.path, ".m3u8")) {
-        run_hls(e);
+    if (strstr(c->parts->path, ".m3u8")) {
+        run_hls(c);
         return;
     }
 
@@ -239,7 +292,7 @@ static void run_http_like(basis_media_engine_t* e) {
     basis_read_fn rd = NULL;
 
 #if defined(_WIN32)
-    src = basis_win_http_open(e->url);   /* WinHTTP: handles http + https/TLS */
+    src = basis_win_http_open(c->url);   /* WinHTTP: handles http + https/TLS */
     rd = basis_win_http_read;
 #elif defined(__ANDROID__)
     /* AMediaExtractor either took the URL (already returned above) or rejected
@@ -251,27 +304,27 @@ static void run_http_like(basis_media_engine_t* e) {
      * frame intervals, network jitter, server buffering) that a short timeout
      * would mistake for a dead socket. Connect timeout stays implicitly short
      * (the open call). */
-    src = basis_jni_https_open(e->url, 60000);
+    src = basis_jni_https_open(c->url, 60000);
     rd = basis_jni_https_read;
 #else
-    if (e->parts.tls) {
-        basis_engine_set_error(e, "https requires the platform TLS stack (WinHTTP/AMediaExtractor); not available on this build.");
+    if (c->parts->tls) {
+        c->sink->on_error(c->sink->user, "https requires the platform TLS stack (WinHTTP/AMediaExtractor); not available on this build.");
         return;
     }
-    src = basis_http_open(&e->parts, 15000);
+    src = basis_http_open(c->parts, 15000);
     rd = basis_http_read;
 #endif
 
     if (!src) {
-        basis_engine_set_error(e, "failed to open HTTP byte source");
+        c->sink->on_error(c->sink->user, "failed to open HTTP byte source");
         return;
     }
 
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-    if (ends_with_ci(e->parts.path, ".mp4") || ends_with_ci(e->parts.path, ".m4s"))
-        basis_mp4_run(&e->sink, rd, src);
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+    if (ends_with_ci(c->parts->path, ".mp4") || ends_with_ci(c->parts->path, ".m4s"))
+        basis_mp4_run(c->sink, rd, src);
     else
-        basis_ts_run(&e->sink, rd, src); /* default to MPEG-TS (.ts and friends) */
+        basis_ts_run(c->sink, rd, src); /* default to MPEG-TS (.ts and friends) */
 
 #if defined(_WIN32)
     basis_win_http_close(src);
@@ -287,29 +340,29 @@ static void run_http_like(basis_media_engine_t* e) {
  * basis_rist_read straight into basis_ts_run. The receiver is built only when the
  * plugin is compiled with BASIS_WITH_RIST; otherwise basis_rist_open reports a
  * clear error via the sink and returns NULL. */
-static void run_rist(basis_media_engine_t* e) {
-    void* rist = basis_rist_open(&e->parts, &e->sink);
+static void run_rist(demux_ctx_t* c) {
+    void* rist = basis_rist_open(c->parts, c->sink);
     if (!rist) return;  /* basis_rist_open set the error on the sink */
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-    basis_ts_run(&e->sink, basis_rist_read, rist);
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+    basis_ts_run(c->sink, basis_rist_read, rist);
     basis_rist_close(rist);
 }
 
 /* Dispatch the URL to its protocol handler. Blocks until the stream drops, the
  * engine is stopped, or a hard error is set. */
-static void run_protocol_once(basis_media_engine_t* e) {
-    if (basis_url_is_rtsp(&e->parts)) {
-        basis_rtsp_run(&e->sink, &e->parts);
-    } else if (basis_url_is_rtmp(&e->parts)) {
-        if (e->parts.tls) {
-            basis_engine_set_error(e, "rtmps (RTMP-over-TLS) is not supported; use rtmp:// or an https fMP4/TS URL.");
+static void run_protocol_once(demux_ctx_t* c) {
+    if (basis_url_is_rtsp(c->parts)) {
+        basis_rtsp_run(c->sink, c->parts);
+    } else if (basis_url_is_rtmp(c->parts)) {
+        if (c->parts->tls) {
+            c->sink->on_error(c->sink->user, "rtmps (RTMP-over-TLS) is not supported; use rtmp:// or an https fMP4/TS URL.");
         } else {
-            basis_rtmp_run(&e->sink, &e->parts);
+            basis_rtmp_run(c->sink, c->parts);
         }
-    } else if (basis_url_is_rist(&e->parts)) {
-        run_rist(e);
+    } else if (basis_url_is_rist(c->parts)) {
+        run_rist(c);
     } else { /* http / https */
-        run_http_like(e);
+        run_http_like(c);
     }
 }
 
@@ -342,11 +395,13 @@ static void demux_body(basis_media_engine_t* e) {
     int attempt = 0;
     const int MAX_ATTEMPTS = 6; /* ~500ms..8s capped: several retries before giving up */
 
+    demux_ctx_t c = { e, e->url, &e->parts, &e->sink, 1 };
+
     while (e->running) {
         basis_engine_set_state(e, BASIS_MEDIA_STATE_CONNECTING);
         long au_before = e->video_au_count + e->audio_frame_count;
 
-        run_protocol_once(e);
+        run_protocol_once(&c);
 
         if (!e->running) break;              /* user stop */
         if (engine_state_is_error(e)) break; /* hard failure: retrying won't help */
@@ -371,10 +426,43 @@ static void demux_body(basis_media_engine_t* e) {
     }
 }
 
+/* Audio leg of a split-stream source: pull the audio-only URL into the shared
+ * decoder's audio path. The primary (video) leg owns the state machine and
+ * end-of-stream, so this never writes engine state — it just reconnects on a drop
+ * with the same backoff, and stops when the engine stops or it can't make progress.
+ * A hard error still surfaces through the audio sink's on_error. */
+static void audio_demux_body(basis_media_engine_t* e) {
+    int backoff_ms = 500;
+    int attempt = 0;
+    const int MAX_ATTEMPTS = 6;
+
+    demux_ctx_t c = { e, e->url_audio, &e->parts_audio, &e->audio_sink, 0 };
+
+    while (e->running) {
+        long aus_before = e->audio_frame_count;
+
+        run_protocol_once(&c);
+
+        if (!e->running) break;
+        if (engine_state_is_error(e)) break;
+
+        long delta = e->audio_frame_count - aus_before;
+        if (delta > 10) { attempt = 0; backoff_ms = 500; }
+        else attempt++;
+        if (attempt >= MAX_ATTEMPTS) break; /* give up quietly; the video leg drives ENDED */
+
+        sleep_interruptible(e, backoff_ms);
+        backoff_ms *= 2;
+        if (backoff_ms > 8000) backoff_ms = 8000;
+    }
+}
+
 #if defined(_WIN32)
 static DWORD WINAPI thread_entry(LPVOID arg) { demux_body((basis_media_engine_t*)arg); return 0; }
+static DWORD WINAPI audio_thread_entry(LPVOID arg) { audio_demux_body((basis_media_engine_t*)arg); return 0; }
 #else
 static void* thread_entry(void* arg) { demux_body((basis_media_engine_t*)arg); return NULL; }
+static void* audio_thread_entry(void* arg) { audio_demux_body((basis_media_engine_t*)arg); return NULL; }
 #endif
 
 static int thread_start(basis_media_engine_t* e) {
@@ -396,9 +484,31 @@ static void thread_join(basis_media_engine_t* e) {
     e->thread_started = 0;
 }
 
+static int audio_thread_start(basis_media_engine_t* e) {
+#if defined(_WIN32)
+    e->audio_thread = CreateThread(NULL, 0, audio_thread_entry, e, 0, NULL);
+    return e->audio_thread != NULL;
+#else
+    return pthread_create(&e->audio_thread, NULL, audio_thread_entry, e) == 0;
+#endif
+}
+static void audio_thread_join(basis_media_engine_t* e) {
+    if (!e->audio_thread_started) return;
+#if defined(_WIN32)
+    WaitForSingleObject(e->audio_thread, INFINITE);
+    CloseHandle(e->audio_thread);
+#else
+    pthread_join(e->audio_thread, NULL);
+#endif
+    e->audio_thread_started = 0;
+}
+
 /* ---- public ABI --------------------------------------------------------- */
 
-BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
+/* Shared open path. audio_url NULL/empty => single muxed stream (the only path
+ * basis_media_open takes); non-empty => split-stream, with url as the video-only
+ * primary and audio_url as the audio-only secondary feeding the same decoder. */
+static basis_media_engine_t* open_impl(const char* url, const char* audio_url) {
     if (!url) return NULL;
 
     basis_media_engine_t* e = (basis_media_engine_t*)calloc(1, sizeof(*e));
@@ -406,6 +516,12 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
 
     strncpy(e->url, url, sizeof(e->url) - 1);
     if (basis_url_parse(url, &e->parts) != 0) { free(e); return NULL; }
+
+    int has_audio = (audio_url && audio_url[0]);
+    if (has_audio) {
+        strncpy(e->url_audio, audio_url, sizeof(e->url_audio) - 1);
+        if (basis_url_parse(audio_url, &e->parts_audio) != 0) { free(e); return NULL; }
+    }
 
     mutex_init(&e->lock);
     e->state = BASIS_MEDIA_STATE_IDLE;
@@ -421,6 +537,7 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
     }
 
     install_sink(e);
+    if (has_audio) install_audio_sink(e);
 
     e->running = 1;
     if (!thread_start(e)) {
@@ -432,15 +549,42 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
         return NULL;
     }
     e->thread_started = 1;
+
+    if (has_audio && !audio_thread_start(e)) {
+        /* The caller asked for split-stream; failing to spawn the audio leg means
+         * we can't honour that, so tear down rather than play silent video. */
+        e->running = 0;
+        thread_join(e);
+        basis_decoder_destroy(e->decoder);
+        basis_io_global_shutdown();
+        mutex_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
+    if (has_audio) e->audio_thread_started = 1;
+
     return e;
+}
+
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
+    return open_impl(url, NULL);
+}
+
+/* Split-stream open: video_url is the video-only primary, audio_url the audio-only
+ * secondary, played in sync on one decoder/clock. A NULL/empty audio_url is exactly
+ * basis_media_open(video_url). */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url) {
+    return open_impl(video_url, audio_url);
 }
 
 BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {
     if (!e) return;
 
-    /* Stop the demux thread first so nothing submits while we tear down. */
+    /* Stop the demux threads first so nothing submits while we tear down. Both
+     * legs observe the same running flag; join both before freeing the decoder. */
     e->running = 0;
     thread_join(e);
+    audio_thread_join(e);
 
     /* Free OS decode/audio + GPU resources. basis_decoder_destroy calls
      * render_release internally; with the threads joined nothing is mid-decode,

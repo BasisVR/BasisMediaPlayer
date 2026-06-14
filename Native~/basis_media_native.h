@@ -70,6 +70,15 @@ typedef enum basis_render_op {
  * (the last two are demuxed by extension: .ts = MPEG-TS, .mp4 = fragmented MP4). */
 BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url);
 
+/* Split-stream open: play a video-only stream and a separate audio-only stream in
+ * sync on one decoder/clock. video_url carries video (e.g. an H.264-only fMP4),
+ * audio_url the audio (e.g. an AAC-only fMP4); a second demux thread feeds the
+ * audio into the same decoder so both present against one clock. Used for sources
+ * that deliver A/V as distinct streams (adaptive YouTube above ~360p). A NULL or
+ * empty audio_url behaves exactly like basis_media_open(video_url). Same return
+ * and async-error contract as basis_media_open. */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url);
+
 /* Stop all threads (joining them) and free everything, including GPU textures.
  * D3D11/D3D12 resources are freed via thread-safe COM Release; the joined decode
  * threads guarantee nothing is mid-decode. The caller should drop its external-

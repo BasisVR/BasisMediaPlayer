@@ -351,8 +351,13 @@ public sealed class BasisMediaPlayer : MonoBehaviour
                 throw new ArgumentException("BasisMediaSource.Uri is required.", nameof(media));
             if (!BasisMediaPlayerSecurity.IsUrlAllowed(media.Uri, out string blockReason))
                 throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load '{media.Uri}': {blockReason}");
+            // The separate audio stream is its own network fetch, so it passes the
+            // same trust gate as the video URL.
+            if (!string.IsNullOrEmpty(media.AudioUri) &&
+                !BasisMediaPlayerSecurity.IsUrlAllowed(media.AudioUri, out string audioBlockReason))
+                throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load audio '{media.AudioUri}': {audioBlockReason}");
 
-            SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media)));
+            SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media), ResolveNativeAudioUri(media)));
         }
         catch (Exception ex)
         {
@@ -378,6 +383,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
         return uri;
     }
+
+    // The optional separate audio-only stream (BasisMediaSource.AudioUri), returned
+    // verbatim; null when the source is a single muxed stream. Split audio streams are
+    // HTTP fMP4, so the RIST buffer folding in ResolveNativeUri doesn't apply here.
+    private static string ResolveNativeAudioUri(BasisMediaSource media) => media.AudioUri;
 
     private void HandleProtonDeclined(BasisMediaSource media)
     {

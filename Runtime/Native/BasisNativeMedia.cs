@@ -33,6 +33,11 @@ internal static class BasisNativeMedia
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
     private static extern IntPtr basis_media_open([MarshalAs(UnmanagedType.LPStr)] string url);
 
+    [DllImport(Lib, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
+    private static extern IntPtr basis_media_open_dual(
+        [MarshalAs(UnmanagedType.LPStr)] string videoUrl,
+        [MarshalAs(UnmanagedType.LPStr)] string audioUrl);
+
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
     private static extern void basis_media_close(IntPtr engine);
 
@@ -122,6 +127,33 @@ internal static class BasisNativeMedia
                 "basis_media_native shared library not found. Build it from " +
                 "com.basis.mediaplayer/Native~/ (CMake on desktop, NDK on Android) and place the " +
                 "result under com.basis.mediaplayer/Plugins/<platform>/.", ex);
+        }
+    }
+
+    // Opens a video stream plus an optional separate audio-only stream, synced by
+    // the engine onto one clock. Null/empty audioUrl is exactly Open(videoUrl) (a
+    // single muxed stream), so the load path can always route through here. A native
+    // lib that predates split-stream has no basis_media_open_dual export; surface
+    // that as an actionable rebuild message rather than a hard crash.
+    public static IntPtr OpenWithAudio(string videoUrl, string audioUrl)
+    {
+        if (string.IsNullOrEmpty(audioUrl)) return Open(videoUrl);
+        try
+        {
+            return basis_media_open_dual(videoUrl, audioUrl);
+        }
+        catch (DllNotFoundException ex)
+        {
+            throw new InvalidOperationException(
+                "basis_media_native shared library not found. Build it from " +
+                "com.basis.mediaplayer/Native~/ and place the result under " +
+                "com.basis.mediaplayer/Plugins/<platform>/.", ex);
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            throw new InvalidOperationException(
+                "basis_media_native is present but predates split-stream playback " +
+                "(no basis_media_open_dual). Rebuild it from com.basis.mediaplayer/Native~/.", ex);
         }
     }
 

@@ -29,6 +29,16 @@ public sealed class BasisMediaSource
     // supports them (HTTP(S), WebSocket). Ignored by file/local sources.
     public Dictionary<string, string> Headers;
 
+    // Optional separate audio-only stream, played in sync with the video carried
+    // by Uri. When set, Uri is treated as video-only and AudioUri as audio-only;
+    // null (default) means Uri is a single muxed stream and behaviour is unchanged.
+    // Lets a source deliver video and audio as distinct streams, e.g. adaptive
+    // YouTube above ~360p (H.264 video-only + AAC audio-only).
+    public string AudioUri;
+
+    // Optional headers for the AudioUri transport, mirroring Headers.
+    public Dictionary<string, string> AudioHeaders;
+
     // Per-source loop flag. Overridden by BasisMediaPlayer.Loop when assigned;
     // BasisMediaPlayer.Loop is the runtime-mutable knob.
     public bool Loop;
