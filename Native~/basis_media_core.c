@@ -128,13 +128,18 @@ struct basis_media_engine {
     basis_thread_t audio_thread;
     int audio_thread_started;
 
-    /* Paced (VOD) mode: throttle delivery + present on a fixed 1x clock instead of
-     * the live edge. The pace anchor (first access unit's wall time + PTS) is shared
-     * across both demux legs so a split source paces against one timeline. paced is
-     * the resolved decision; paced_hint is the caller's request (0=auto, 1=live,
-     * 2=on-demand). When the hint is auto, the protocol handler sets paced once it has
-     * inspected the source (HTTP headers / HLS playlist) — see run_http_like/run_hls. */
+    /* Delivery + presentation pacing.
+     *   paced         — present on a fixed 1x clock from the first PTS (VOD); off => live edge.
+     *   pace_delivery — throttle AU delivery to ~1x (pace_gate) so a faster-than-real-time
+     *                   source can't flood the decoder. On for VOD AND for live HLS, which
+     *                   buffers segments and would otherwise burst; live HLS keeps paced=0
+     *                   so it still presents at — and converges to — the live edge.
+     * paced_hint is the caller's request (0=auto, 1=live, 2=on-demand); the protocol handler
+     * resolves paced/pace_delivery once it has inspected the source (run_http_like/run_hls).
+     * The pace anchor (first AU's wall time + PTS) is engine-wide so a split source's two
+     * legs pace against one timeline. */
     int paced;
+    int pace_delivery;
     int paced_hint;
     volatile int pace_started;
     int64_t pace_wall0_us;
@@ -172,17 +177,18 @@ int basis_engine_is_paused(basis_media_engine_t* e) { return e ? e->paused : 0; 
 int basis_engine_is_running(basis_media_engine_t* e) { return e ? e->running : 0; }
 int basis_engine_is_paced(basis_media_engine_t* e) { return e ? e->paced : 0; }
 
-/* Real-time delivery pacing for paced (VOD) sources. Blocks the demux thread so an
- * access unit is handed to the decoder no more than BASIS_PACE_LEAD_US ahead of a
- * fixed 1x clock anchored to the first AU — stalling the socket read (TCP
- * backpressure) so a faster-than-real-time source can't flood the decoder and
- * fast-forward. The anchor is engine-wide so a split source's two legs pace against
- * one timeline. Lead stays under the decode ring's span, so no ring backpressure is
- * needed. No-op when not paced. */
+/* Real-time delivery pacing. Blocks the demux thread so an access unit is handed to the
+ * decoder no more than BASIS_PACE_LEAD_US ahead of a fixed 1x clock anchored to the first
+ * AU — stalling the socket read (TCP backpressure) so a faster-than-real-time source can't
+ * flood the decoder and fast-forward. Metering by PTS tracks VBR exactly, and the
+ * wall-clock anchor lets a post-stall backlog drain immediately to re-converge to the
+ * edge. The anchor is engine-wide so a split source's two legs pace against one timeline.
+ * Lead stays under the decode ring's span, so no ring backpressure is needed. No-op unless
+ * pace_delivery is set (VOD, or live HLS — whose own byte-rate metering is disabled). */
 #define BASIS_PACE_LEAD_US 400000
 
 static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
-    if (!e->paced) return;
+    if (!e->pace_delivery) return;
     if (!e->pace_started) {
         mutex_lock(&e->lock);
         if (!e->pace_started) {
@@ -467,6 +473,11 @@ static void run_hls(demux_ctx_t* c) {
      * has no endlist. A forced hint skips this. */
     if (c->e->paced_hint == 0 && basis_hls_is_vod(hls))
         c->e->paced = 1;
+    /* HLS buffers segments and delivers faster than real time, so always pace delivery —
+     * even for live (paced=0), which still presents at and converges to the live edge.
+     * This replaces basis_hls.c's byte-rate token bucket (disabled there) with PTS-exact
+     * AU pacing that tracks VBR and recovers from stalls. */
+    c->e->pace_delivery = 1;
     c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
     if (is_fmp4)
         basis_mp4_run(c->sink, basis_hls_read, hls);
@@ -534,6 +545,7 @@ static void run_http_like(demux_ctx_t* c) {
      * the first AU, so pacing is in force from the start. A forced hint skips this. */
     if (c->e->paced_hint == 0 && basis_win_http_is_seekable(src))
         c->e->paced = 1;
+    c->e->pace_delivery = c->e->paced; /* VOD over HTTP paces delivery; open-ended live doesn't */
 #endif
 
     c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
@@ -793,6 +805,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
      * the protocol handler may flip it to paced once it has inspected the source. */
     e->paced_hint = delivery_hint;
     e->paced = (delivery_hint == 2) ? 1 : 0;
+    e->pace_delivery = e->paced; /* VOD paces delivery; run_hls also enables it for live HLS */
     strncpy(e->url, url, sizeof(e->url) - 1);
     if (basis_url_parse(url, &e->parts) != 0) { free(e); return NULL; }
 

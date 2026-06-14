@@ -569,13 +569,6 @@ static void hls_producer(basis_hls_t* h) {
         } else {
             h->http.close(h->seg_ctx);
             h->seg_ctx = NULL;
-            /* fold this segment into the running average bitrate that paces output */
-            if (h->cur_seg_dur_ms > 0) {
-                h->acc_bytes += h->cur_seg_bytes;
-                h->acc_dur_ms += h->cur_seg_dur_ms;
-                if (h->acc_dur_ms > 0)
-                    h->target_bps = (long)(h->acc_bytes * 1000 / h->acc_dur_ms);
-            }
             h->cur_seg_bytes = 0; h->cur_seg_dur_ms = 0;
             /* top up the queue in the background so the next segment is ready */
             if (!h->endlist_seen && h->pending_count <= HLS_LIVE_MARGIN_SEGMENTS)
@@ -693,25 +686,11 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
     for (;;) {
         if (h->stop || (h->is_running && !h->is_running(h->user))) return 0;
 
-        /* Real-time pacing: the decoder presents on a wall-clock and drops frames
-         * if fed faster than real-time, so meter output to the measured average
-         * bitrate via a token bucket (≈0.25 s burst). Before the rate is known
-         * (first segment), serve unthrottled. */
+        /* No byte-rate metering here: the engine paces delivery by AU timestamp
+         * (pace_gate, enabled for HLS via pace_delivery), which tracks VBR exactly and
+         * holds the demux thread on submit — so serving the ring as fast as the demuxer
+         * pulls can't flood the decoder. */
         int budget = len;
-        long rate = h->target_bps;
-        if (rate > 0) {
-            int64_t now = hls_now_us();
-            if (h->tb_last_us == 0) h->tb_last_us = now;
-            h->tb_tokens += (double)rate * (double)(now - h->tb_last_us) / 1000000.0;
-            h->tb_last_us = now;
-            /* ~0.5 s burst: enough to deliver a segment-start keyframe (which is several
-             * frames' worth of bytes) promptly so `newest` doesn't stall and the present
-             * buffer doesn't dip — still ≤ the decoder's ~533 ms present ring, so it can't
-             * lap/flood. Steady rate stays at the average bitrate. */
-            double burst = (double)rate * 0.5;
-            if (h->tb_tokens > burst) h->tb_tokens = burst;
-            if (h->tb_tokens < (double)budget) budget = (int)h->tb_tokens;
-        }
 
         if (budget > 0) {
             hls_mutex_lock(&h->lock);
@@ -724,7 +703,6 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
                 h->ring_tail = (h->ring_tail + take) % h->ring_cap;
                 h->ring_count -= take;
                 hls_mutex_unlock(&h->lock);
-                if (rate > 0) h->tb_tokens -= take;
                 return take;
             }
             int done = h->producer_done;
