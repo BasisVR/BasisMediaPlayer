@@ -36,7 +36,8 @@ internal static class BasisNativeMedia
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
     private static extern IntPtr basis_media_open_dual(
         [MarshalAs(UnmanagedType.LPStr)] string videoUrl,
-        [MarshalAs(UnmanagedType.LPStr)] string audioUrl);
+        [MarshalAs(UnmanagedType.LPStr)] string audioUrl,
+        int paced);
 
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
     private static extern void basis_media_close(IntPtr engine);
@@ -131,16 +132,18 @@ internal static class BasisNativeMedia
     }
 
     // Opens a video stream plus an optional separate audio-only stream, synced by
-    // the engine onto one clock. Null/empty audioUrl is exactly Open(videoUrl) (a
-    // single muxed stream), so the load path can always route through here. A native
-    // lib that predates split-stream has no basis_media_open_dual export; surface
-    // that as an actionable rebuild message rather than a hard crash.
-    public static IntPtr OpenWithAudio(string videoUrl, string audioUrl)
+    // the engine onto one clock. paced selects real-time-paced VOD delivery over the
+    // live-edge default. A single live muxed stream (no audio URL, not paced) is
+    // exactly Open(videoUrl); everything else routes through basis_media_open_dual,
+    // so the load path can always call here. A native lib that predates split-stream
+    // has no basis_media_open_dual export; surface that as an actionable rebuild
+    // message rather than a hard crash.
+    public static IntPtr OpenWithAudio(string videoUrl, string audioUrl, bool paced)
     {
-        if (string.IsNullOrEmpty(audioUrl)) return Open(videoUrl);
+        if (string.IsNullOrEmpty(audioUrl) && !paced) return Open(videoUrl);
         try
         {
-            return basis_media_open_dual(videoUrl, audioUrl);
+            return basis_media_open_dual(videoUrl, audioUrl, paced ? 1 : 0);
         }
         catch (DllNotFoundException ex)
         {

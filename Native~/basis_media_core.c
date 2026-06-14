@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -84,6 +85,18 @@ static void sleep_ms(int ms) {
     usleep((useconds_t)ms * 1000);
 #endif
 }
+static int64_t now_us(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (int64_t)(c.QuadPart * 1000000LL / (f.QuadPart ? f.QuadPart : 1));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+#endif
+}
 
 /* ---- engine ------------------------------------------------------------- */
 
@@ -115,6 +128,14 @@ struct basis_media_engine {
     basis_thread_t audio_thread;
     int audio_thread_started;
 
+    /* Paced (VOD) mode: throttle delivery + present on a fixed 1x clock instead of
+     * the live edge. The pace anchor (first access unit's wall time + PTS) is shared
+     * across both demux legs so a split source paces against one timeline. */
+    int paced;
+    volatile int pace_started;
+    int64_t pace_wall0_us;
+    int64_t pace_base_pts;
+
     /* diagnostics (demux thread writes, main thread reads; minor races OK) */
     volatile long video_au_count;
     volatile long audio_frame_count;
@@ -145,6 +166,38 @@ void basis_engine_set_error(basis_media_engine_t* e, const char* msg) {
 basis_decoder_t* basis_engine_get_decoder(basis_media_engine_t* e) { return e ? e->decoder : NULL; }
 int basis_engine_is_paused(basis_media_engine_t* e) { return e ? e->paused : 0; }
 int basis_engine_is_running(basis_media_engine_t* e) { return e ? e->running : 0; }
+int basis_engine_is_paced(basis_media_engine_t* e) { return e ? e->paced : 0; }
+
+/* Real-time delivery pacing for paced (VOD) sources. Blocks the demux thread so an
+ * access unit is handed to the decoder no more than BASIS_PACE_LEAD_US ahead of a
+ * fixed 1x clock anchored to the first AU — stalling the socket read (TCP
+ * backpressure) so a faster-than-real-time source can't flood the decoder and
+ * fast-forward. The anchor is engine-wide so a split source's two legs pace against
+ * one timeline. Lead stays under the decode ring's span, so no ring backpressure is
+ * needed. No-op when not paced. */
+#define BASIS_PACE_LEAD_US 400000
+
+static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
+    if (!e->paced) return;
+    if (!e->pace_started) {
+        mutex_lock(&e->lock);
+        if (!e->pace_started) {
+            e->pace_wall0_us = now_us();
+            e->pace_base_pts = pts_us;
+            e->pace_started = 1;
+        }
+        mutex_unlock(&e->lock);
+    }
+    while (e->running) {
+        int64_t media_now = e->pace_base_pts + (now_us() - e->pace_wall0_us);
+        int64_t ahead = pts_us - (media_now + BASIS_PACE_LEAD_US);
+        if (ahead <= 0) return;
+        int ms = (int)(ahead / 1000);
+        if (ms > 50) ms = 50;   /* cap so a stop is observed promptly */
+        if (ms < 1) ms = 1;
+        sleep_ms(ms);
+    }
+}
 
 /* ---- sink callbacks (run on the demux thread) --------------------------- */
 
@@ -155,6 +208,8 @@ static void sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed
 static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
     if (!e->running) return;
+    pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
+    if (!e->running) return;        /* may have been stopped while pacing */
     e->video_au_count++;
     basis_decoder_submit_video(e->decoder, au, len, pts, key);
     /* CONNECTING/BUFFERING -> PLAYING once the OS decoder is actually producing
@@ -169,6 +224,8 @@ static void sink_audio_format(void* user, basis_codec_t codec, int rate, int ch,
 }
 static void sink_audio_frame(void* user, const uint8_t* data, int len, int64_t pts) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    if (!e->running) return;
+    pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
     if (!e->running) return;
     e->audio_frame_count++;
     basis_decoder_submit_audio(e->decoder, data, len, pts);
@@ -244,6 +301,41 @@ typedef struct {
     basis_media_sink_t* sink;
     int allow_os_demux; /* Android OS-extractor fast path; primary leg only */
 } demux_ctx_t;
+
+/* Prefix-replay byte source: serves a small sniffed prefix first, then delegates to
+ * the real read — lets run_http_like peek the leading bytes to detect the container
+ * without consuming them from the demuxer. */
+typedef struct {
+    const uint8_t* prefix;
+    int prefix_len;
+    int prefix_pos;
+    basis_read_fn inner_read;
+    void* inner_ctx;
+} prefix_src_t;
+
+static int prefix_read(void* ctx, uint8_t* buf, int len) {
+    prefix_src_t* p = (prefix_src_t*)ctx;
+    if (p->prefix_pos < p->prefix_len) {
+        int n = p->prefix_len - p->prefix_pos;
+        if (n > len) n = len;
+        memcpy(buf, p->prefix + p->prefix_pos, (size_t)n);
+        p->prefix_pos += n;
+        return n;
+    }
+    return p->inner_read(p->inner_ctx, buf, len);
+}
+
+/* True if the leading bytes are an ISO-BMFF/fragmented-MP4 box (type in bytes 4..8).
+ * Lets us pick the demuxer by content, since CDN URLs like googlevideo's
+ * .../videoplayback carry fMP4 with no .mp4 extension to switch on. */
+static int looks_like_mp4(const uint8_t* b, int n) {
+    if (n < 8) return 0;
+    const char* t = (const char*)(b + 4);
+    return memcmp(t, "ftyp", 4) == 0 || memcmp(t, "styp", 4) == 0 ||
+           memcmp(t, "moof", 4) == 0 || memcmp(t, "sidx", 4) == 0 ||
+           memcmp(t, "moov", 4) == 0 || memcmp(t, "free", 4) == 0 ||
+           memcmp(t, "skip", 4) == 0 || memcmp(t, "mdat", 4) == 0;
+}
 
 /* HLS / LL-HLS: the URL is a playlist, not a continuous byte stream. The HLS
  * source fetches+parses the M3U8, stitches segments (and LL-HLS parts) into one
@@ -321,10 +413,30 @@ static void run_http_like(demux_ctx_t* c) {
     }
 
     c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
-    if (ends_with_ci(c->parts->path, ".mp4") || ends_with_ci(c->parts->path, ".m4s"))
-        basis_mp4_run(c->sink, rd, src);
+
+    /* Pick the demuxer by sniffing the leading bytes, not the URL extension: CDN
+     * URLs (e.g. googlevideo .../videoplayback) deliver fMP4 with no .mp4 in the
+     * path, which would otherwise fall through to the MPEG-TS demuxer and stall.
+     * The peeked bytes are replayed to the demuxer via prefix_read. Extension is the
+     * fallback when the content sniff is inconclusive. */
+    uint8_t head[16];
+    int head_len = 0;
+    while (head_len < (int)sizeof(head)) {
+        int n = rd(src, head + head_len, (int)sizeof(head) - head_len);
+        if (n <= 0) break;
+        head_len += n;
+    }
+    prefix_src_t ps = { head, head_len, 0, rd, src };
+
+    int is_mp4 = looks_like_mp4(head, head_len);
+    int is_ts  = (head_len >= 1 && head[0] == 0x47);
+    if (!is_mp4 && !is_ts)
+        is_mp4 = ends_with_ci(c->parts->path, ".mp4") || ends_with_ci(c->parts->path, ".m4s");
+
+    if (is_mp4)
+        basis_mp4_run(c->sink, prefix_read, &ps);
     else
-        basis_ts_run(c->sink, rd, src); /* default to MPEG-TS (.ts and friends) */
+        basis_ts_run(c->sink, prefix_read, &ps); /* default to MPEG-TS */
 
 #if defined(_WIN32)
     basis_win_http_close(src);
@@ -405,6 +517,11 @@ static void demux_body(basis_media_engine_t* e) {
 
         if (!e->running) break;              /* user stop */
         if (engine_state_is_error(e)) break; /* hard failure: retrying won't help */
+        /* Paced (VOD) sources are finite and play once: a clean run end is EOF, not
+         * a live drop to reconnect through. Looping would replay from PTS 0 while the
+         * paced clock is at the old edge — every frame would read "behind" the clock
+         * and flood in ungated (fast-forward). Stop instead. */
+        if (e->paced) { basis_engine_set_state(e, BASIS_MEDIA_STATE_ENDED); break; }
 
         long au_after = e->video_au_count + e->audio_frame_count;
         long delta = au_after - au_before;
@@ -445,6 +562,7 @@ static void audio_demux_body(basis_media_engine_t* e) {
 
         if (!e->running) break;
         if (engine_state_is_error(e)) break;
+        if (e->paced) break;   /* VOD: play once; the video leg drives ENDED */
 
         long delta = e->audio_frame_count - aus_before;
         if (delta > 10) { attempt = 0; backoff_ms = 500; }
@@ -508,12 +626,13 @@ static void audio_thread_join(basis_media_engine_t* e) {
 /* Shared open path. audio_url NULL/empty => single muxed stream (the only path
  * basis_media_open takes); non-empty => split-stream, with url as the video-only
  * primary and audio_url as the audio-only secondary feeding the same decoder. */
-static basis_media_engine_t* open_impl(const char* url, const char* audio_url) {
+static basis_media_engine_t* open_impl(const char* url, const char* audio_url, int paced) {
     if (!url) return NULL;
 
     basis_media_engine_t* e = (basis_media_engine_t*)calloc(1, sizeof(*e));
     if (!e) return NULL;
 
+    e->paced = paced ? 1 : 0;
     strncpy(e->url, url, sizeof(e->url) - 1);
     if (basis_url_parse(url, &e->parts) != 0) { free(e); return NULL; }
 
@@ -567,14 +686,14 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url) {
 }
 
 BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
-    return open_impl(url, NULL);
+    return open_impl(url, NULL, 0);
 }
 
-/* Split-stream open: video_url is the video-only primary, audio_url the audio-only
- * secondary, played in sync on one decoder/clock. A NULL/empty audio_url is exactly
- * basis_media_open(video_url). */
-BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url) {
-    return open_impl(video_url, audio_url);
+/* Split-stream / paced open. audio_url (when set) is the audio-only secondary played
+ * in sync on one decoder/clock; paced selects real-time-paced VOD delivery. A
+ * NULL/empty audio_url with paced == 0 is exactly basis_media_open(video_url). */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int paced) {
+    return open_impl(video_url, audio_url, paced);
 }
 
 BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {

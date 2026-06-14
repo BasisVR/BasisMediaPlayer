@@ -39,6 +39,13 @@ public sealed class BasisMediaSource
     // Optional headers for the AudioUri transport, mirroring Headers.
     public Dictionary<string, string> AudioHeaders;
 
+    // When true, the engine treats this as on-demand content and paces delivery +
+    // presentation to real time (a fixed 1x clock from the first frame), instead of
+    // the live-edge clock used for broadcasts. Set for VOD sources that arrive faster
+    // than real time (e.g. yt-dlp-resolved YouTube), which would otherwise fast-forward.
+    // Leave false (default) for live streams (RTSP/RTMP/RIST/live HLS).
+    public bool Paced;
+
     // Per-source loop flag. Overridden by BasisMediaPlayer.Loop when assigned;
     // BasisMediaPlayer.Loop is the runtime-mutable knob.
     public bool Loop;
