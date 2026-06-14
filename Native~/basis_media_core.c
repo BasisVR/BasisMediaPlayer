@@ -337,6 +337,112 @@ static int looks_like_mp4(const uint8_t* b, int n) {
            memcmp(t, "skip", 4) == 0 || memcmp(t, "mdat", 4) == 0;
 }
 
+/* ---- read-ahead buffer (paced / VOD sources) ----------------------------
+ * Decouples the network read from the paced decode. A reader thread drains the
+ * socket into this compressed byte ring as fast as the CDN delivers — banking
+ * seconds ahead — while the demuxer consumes from the ring at the paced 1x rate.
+ * Bursty CDN delivery (e.g. googlevideo's ~big-chunk-then-gap pattern) is absorbed
+ * by the ring instead of starving the decoder. Compressed bytes are cheap (a few MB
+ * holds many seconds), unlike decoded frames (the VRAM-bound decode ring). Used only
+ * in paced mode; live sources read directly (no added latency). */
+#define BASIS_READAHEAD_CAP (16 * 1024 * 1024)
+
+typedef struct {
+    uint8_t* buf;
+    int cap, head, tail, count;   /* count/head/tail guarded by lock */
+    int eof;                      /* producer done (reader hit EOF/error) */
+    int closing;                  /* consumer done (tells the reader to stop) */
+    volatile int* running;        /* engine running flag, for prompt stop */
+    basis_mutex_t lock;
+} byte_ring_t;
+
+static int ring_init(byte_ring_t* r, int cap) {
+    memset(r, 0, sizeof(*r));
+    r->buf = (uint8_t*)malloc((size_t)cap);
+    if (!r->buf) return 0;
+    r->cap = cap;
+    mutex_init(&r->lock);
+    return 1;
+}
+static void ring_free(byte_ring_t* r) {
+    if (r->buf) { free(r->buf); r->buf = NULL; }
+    mutex_destroy(&r->lock);
+}
+
+/* Producer: copy n bytes in, blocking while the ring is full. Bails if the engine
+ * stops or the consumer is closing. */
+static void ring_write(byte_ring_t* r, const uint8_t* data, int n, volatile int* running) {
+    int off = 0;
+    while (off < n) {
+        mutex_lock(&r->lock);
+        int space = r->cap - r->count;
+        int chunk = n - off; if (chunk > space) chunk = space;
+        if (chunk > 0) {
+            int first = r->cap - r->head; if (first > chunk) first = chunk;
+            memcpy(r->buf + r->head, data + off, (size_t)first);
+            if (chunk > first) memcpy(r->buf, data + off + first, (size_t)(chunk - first));
+            r->head = (r->head + chunk) % r->cap;
+            r->count += chunk;
+            off += chunk;
+        }
+        int closing = r->closing;
+        mutex_unlock(&r->lock);
+        if (off < n) {
+            if (!*running || closing) return;
+            sleep_ms(2);   /* full: wait for the demuxer to drain */
+        }
+    }
+}
+
+/* Consumer (basis_read_fn): copy out up to len bytes, blocking while empty until the
+ * producer signals EOF or the engine stops. Returns 0 only when fully drained. */
+static int ring_read_fn(void* ctx, uint8_t* buf, int len) {
+    byte_ring_t* r = (byte_ring_t*)ctx;
+    for (;;) {
+        mutex_lock(&r->lock);
+        if (r->count > 0) {
+            int chunk = r->count < len ? r->count : len;
+            int first = r->cap - r->tail; if (first > chunk) first = chunk;
+            memcpy(buf, r->buf + r->tail, (size_t)first);
+            if (chunk > first) memcpy(buf + first, r->buf, (size_t)(chunk - first));
+            r->tail = (r->tail + chunk) % r->cap;
+            r->count -= chunk;
+            mutex_unlock(&r->lock);
+            return chunk;
+        }
+        int eof = r->eof;
+        mutex_unlock(&r->lock);
+        if (eof) return 0;
+        if (r->running && !*r->running) return 0;   /* engine stopping */
+        sleep_ms(2);   /* empty: wait for the reader */
+    }
+}
+
+typedef struct {
+    byte_ring_t* ring;
+    basis_read_fn net_read;
+    void* net_ctx;
+    volatile int* running;
+} reader_args_t;
+
+static void reader_body(reader_args_t* a) {
+    uint8_t tmp[65536];
+    while (*a->running && !a->ring->closing) {
+        int n = a->net_read(a->net_ctx, tmp, (int)sizeof(tmp));
+        if (n <= 0) break;   /* EOF or error */
+        ring_write(a->ring, tmp, n, a->running);
+    }
+    mutex_lock(&a->ring->lock);
+    a->ring->eof = 1;
+    mutex_unlock(&a->ring->lock);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI reader_entry(LPVOID p) { reader_body((reader_args_t*)p); return 0; }
+#else
+static void* reader_entry(void* p) { reader_body((reader_args_t*)p); return NULL; }
+#endif
+
 /* HLS / LL-HLS: the URL is a playlist, not a continuous byte stream. The HLS
  * source fetches+parses the M3U8, stitches segments (and LL-HLS parts) into one
  * byte stream, and the existing TS/fMP4 demuxers consume it. Windows fetches via
@@ -433,10 +539,43 @@ static void run_http_like(demux_ctx_t* c) {
     if (!is_mp4 && !is_ts)
         is_mp4 = ends_with_ci(c->parts->path, ".mp4") || ends_with_ci(c->parts->path, ".m4s");
 
+    /* Paced (VOD): drain the network into a read-ahead ring on a reader thread and
+     * demux from the ring at the paced rate, so bursty CDN delivery doesn't starve
+     * playback. Live: demux straight off the network read (no added latency). */
+    byte_ring_t ring;
+    int use_readahead = c->e->paced && ring_init(&ring, BASIS_READAHEAD_CAP);
+    basis_read_fn demux_read = prefix_read;
+    void* demux_ctx = &ps;
+    basis_thread_t reader;
+    int reader_started = 0;
+    reader_args_t ra;
+    if (use_readahead) {
+        ring.running = &c->e->running;
+        ra.ring = &ring; ra.net_read = prefix_read; ra.net_ctx = &ps; ra.running = &c->e->running;
+#if defined(_WIN32)
+        reader = CreateThread(NULL, 0, reader_entry, &ra, 0, NULL);
+        reader_started = (reader != NULL);
+#else
+        reader_started = (pthread_create(&reader, NULL, reader_entry, &ra) == 0);
+#endif
+        if (reader_started) { demux_read = ring_read_fn; demux_ctx = &ring; }
+        else { ring_free(&ring); use_readahead = 0; }
+    }
+
     if (is_mp4)
-        basis_mp4_run(c->sink, prefix_read, &ps);
+        basis_mp4_run(c->sink, demux_read, demux_ctx);
     else
-        basis_ts_run(c->sink, prefix_read, &ps); /* default to MPEG-TS */
+        basis_ts_run(c->sink, demux_read, demux_ctx); /* default to MPEG-TS */
+
+    if (use_readahead) {
+        mutex_lock(&ring.lock); ring.closing = 1; mutex_unlock(&ring.lock); /* tell the reader to stop */
+#if defined(_WIN32)
+        WaitForSingleObject(reader, INFINITE); CloseHandle(reader);
+#else
+        pthread_join(reader, NULL);
+#endif
+        ring_free(&ring);
+    }
 
 #if defined(_WIN32)
     basis_win_http_close(src);
