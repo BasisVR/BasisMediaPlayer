@@ -286,11 +286,26 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     }
 
     // Convenience wrapper: builds a BasisMediaSource and calls LoadSource.
+    // Page URLs (YouTube/Twitch/…) are steered through an installed resolver (the
+    // optional yt-dlp integration) here, so every entry point — networking, the in-game
+    // UI, the streaming example — resolves them; a directly-playable URL loads straight
+    // through, and with no resolver installed a page URL reports that rather than
+    // silently failing to demux an HTML page. LoadSource is NOT routed (it receives
+    // already-resolved or direct sources, e.g. the resolver's own output).
     public void LoadUrl(string url)
     {
         if (string.IsNullOrEmpty(url))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
+            return;
+        }
+        if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
+        if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
+        {
+            BasisDebug.LogError(
+                $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
+                "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
+                BasisDebug.LogTag.Video);
             return;
         }
         var media = BasisMediaSource.FromUrl(url);

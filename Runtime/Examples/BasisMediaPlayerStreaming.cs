@@ -55,21 +55,8 @@ public sealed class BasisMediaPlayerStreaming : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayerStreaming has no URL to load.", BasisDebug.LogTag.Video);
             return;
         }
-        // A page URL (YouTube/Twitch/…) is steered through an installed resolver (the
-        // yt-dlp integration) which loads its resolved stream(s); a direct stream URL
-        // falls through to a plain load.
-        if (BasisMediaUrlRouter.TryResolveAndLoad(player, url)) return;
-
-        // No resolver took it. A page URL can't be played directly, so say why rather
-        // than attempt a load that will only end with no frames.
-        if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
-        {
-            BasisDebug.LogError(
-                $"BasisMediaPlayerStreaming: '{url}' looks like a page URL (e.g. YouTube/Twitch), " +
-                "which needs the optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
-                BasisDebug.LogTag.Video);
-            return;
-        }
+        // LoadUrl steers page URLs (YouTube/Twitch/…) through the resolver and loads
+        // direct streams straight through, so this just hands the URL over.
         player.LoadUrl(url);
     }
 
