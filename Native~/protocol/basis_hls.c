@@ -616,10 +616,15 @@ void* basis_hls_open(const char* url, const basis_http_provider_t* http,
     h->endlist_seen = pl.has_endlist;
     if (pl.map_uri[0]) snprintf(h->map_uri, sizeof(h->map_uri), "%s", pl.map_uri);
 
-    /* Start at the live edge. LL: the in-progress segment's first part (lowest
-     * latency; first part of a segment is normally an independent keyframe).
-     * Non-LL: the last complete segment (guaranteed keyframe). */
-    if (h->can_block_reload) {
+    /* VOD (EXT-X-ENDLIST): start at the first segment so the whole recording
+     * plays start-to-finish. Live: start at (or just behind) the live edge.
+     * LL live: the in-progress segment's first part (lowest latency; first part
+     * of a segment is normally an independent keyframe). Non-LL live: the last
+     * complete segment (guaranteed keyframe). */
+    if (h->endlist_seen) {
+        h->want_msn = pl.media_seq_base;
+        h->want_part = 0;
+    } else if (h->can_block_reload) {
         h->want_msn = pl.media_seq_base + pl.nfull;
         h->want_part = 0;
     } else {
