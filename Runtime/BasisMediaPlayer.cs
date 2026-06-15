@@ -274,6 +274,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private BasisAudioTrack pendingAudioTrack;
     private Exception pendingError;
     private bool firstFrameEmittedThisPlay;
+    private bool audioRateMismatchReported;
 
     public long HeadFramePtsUs => videoQueue.TryPeek(out var head) ? head.PresentationTimeUs : -1;
     public long TailFramePtsUs => System.Threading.Interlocked.Read(ref lastEnqueuedPtsUs);
@@ -756,6 +757,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         pendingBitrateTrack = null;
         pendingError = null;
         pendingVideoSize = 0;
+        audioRateMismatchReported = false;
     }
 
     private void ResetCounters()
@@ -989,7 +991,25 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
         if (nativeEngine.TryGetPcmFormat(out int sr, out int ch) && sr > 0 && ch > 0)
         {
-            audioComponent?.SetExpectedFormat(sr, ch);
+            // The streaming AudioClip is consumed at the output device rate
+            // regardless of its declared frequency, so a source whose rate differs
+            // plays sharp/flat and over-drains its buffer. Guard it: on a mismatch
+            // leave the audio path unbuilt (silent) and surface why, so the stream
+            // is muted cleanly rather than played wrong. Video is unaffected.
+            int outputRate = AudioSettings.outputSampleRate;
+            if (sr != outputRate)
+            {
+                if (!audioRateMismatchReported)
+                {
+                    audioRateMismatchReported = true;
+                    HandleError(new Exception(
+                        $"Audio muted: source sample rate {sr} Hz does not match the audio output rate {outputRate} Hz. Re-encode the audio to {outputRate} Hz."));
+                }
+            }
+            else
+            {
+                audioComponent?.SetExpectedFormat(sr, ch);
+            }
         }
 
         Texture tex = nativeEngine.OutputTexture;
