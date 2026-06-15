@@ -40,6 +40,9 @@ typedef struct {
     basis_codec_t video_codec;
     int audio_announced;
     int audio_sr, audio_ch, audio_obj;
+    uint32_t window_ack_size; /* server's Window Ack Size (type 5); 0 = unset */
+    uint32_t bytes_in;        /* bytes received, reported in our Acknowledgement (type 3) */
+    uint32_t bytes_acked;     /* bytes_in at the last Acknowledgement we sent */
 } rtmp_t;
 
 /* ---- byte writers ------------------------------------------------------- */
@@ -146,6 +149,7 @@ static int rtmp_read_message(rtmp_t* r) {
     if (n > 0) {
         if (basis_io_read_full(r->io, c->buf + c->have, n) != n) return -1;
         c->have += n;
+        r->bytes_in += (uint32_t)n;
     }
     return csid;
 }
@@ -287,6 +291,13 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
     while (sink->is_running(sink->user)) {
         int csid = rtmp_read_message(&r);
         if (csid < 0) break;
+        /* Acknowledge received bytes once we cross the server's window, else a
+         * spec-compliant server stops sending when the unacked window fills. */
+        if (r.window_ack_size && (r.bytes_in - r.bytes_acked) >= r.window_ack_size) {
+            uint8_t ack[4]; be32(ack, r.bytes_in);
+            rtmp_send_msg(&r, 2, 3, 0, ack, 4);
+            r.bytes_acked = r.bytes_in;
+        }
         chunk_state_t* c = &r.cs[csid];
         if (c->have < (int)c->len) continue; /* message not complete yet */
 
@@ -294,7 +305,9 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
             case 1: /* Set Chunk Size */
                 if (c->have >= 4) r.in_chunk_size = ((c->buf[0]&0x7F)<<24)|(c->buf[1]<<16)|(c->buf[2]<<8)|c->buf[3];
                 break;
-            case 5: /* Window Ack Size — reply with ack later if needed */
+            case 5: /* Window Ack Size — remember it; we Acknowledge once we cross it */
+                if (c->have >= 4)
+                    r.window_ack_size = ((uint32_t)c->buf[0]<<24)|((uint32_t)c->buf[1]<<16)|((uint32_t)c->buf[2]<<8)|c->buf[3];
                 break;
             case 6: /* Set Peer Bandwidth */
                 break;
