@@ -108,6 +108,18 @@ extern "C" int basis_win_http_read(void* ctx, uint8_t* buf, int len) {
     return (int)read;
 }
 
+extern "C" void basis_win_http_abort(void* ctx) {
+    win_http_t* h = (win_http_t*)ctx;
+    if (!h) return;
+    /* Closing the request handle makes a pending WinHttpReadData on another thread fail and
+     * return at once (the documented way to cancel a synchronous WinHTTP read). Null it so
+     * a racing read sees NULL (-> -1) and the later basis_win_http_close skips it. */
+    HINTERNET req = h->request;
+    h->request = NULL;
+    h->response_complete = 1;
+    if (req) WinHttpCloseHandle(req);
+}
+
 extern "C" void basis_win_http_close(void* ctx) {
     win_http_t* h = (win_http_t*)ctx;
     if (!h) return;

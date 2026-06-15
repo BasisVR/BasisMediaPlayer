@@ -790,6 +790,12 @@ static IMFSample* make_input_sample(const uint8_t* data, int len, int64_t pts_us
     return s;
 }
 
+/* Split-stream thread-safety: submit_video (video demux thread) and submit_audio (audio
+ * demux thread) can run concurrently. They are safe by separation — distinct MFTs (vdec vs
+ * adec) feeding distinct outputs (the video frame path vs the PCM ring), with no shared
+ * mutable state between them and atomic (Interlocked) debug counters. The render thread reads
+ * each output under its own lock. Keep video-path and audio-path state disjoint to preserve
+ * this; if that ever changes, serialise submission through a decoder mutex. */
 extern "C" int basis_decoder_submit_video(basis_decoder_t* d, const uint8_t* annexb, int len, int64_t pts_us, int key) {
     (void)key;
     if (!d || !d->vdec || !annexb || len <= 0) return -1;

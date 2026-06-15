@@ -87,10 +87,14 @@ static void sleep_ms(int ms) {
 }
 static int64_t now_us(void) {
 #if defined(_WIN32)
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
+    /* Frequency is fixed for the session; cache it (the first-call write is idempotent
+     * across threads). Split the conversion so c.QuadPart * 1000000 can't overflow int64
+     * at long uptime (a plain multiply wraps after ~10 days at a 10 MHz QPC). */
+    static int64_t freq;
+    LARGE_INTEGER c;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
     QueryPerformanceCounter(&c);
-    return (int64_t)(c.QuadPart * 1000000LL / (f.QuadPart ? f.QuadPart : 1));
+    return (c.QuadPart / freq) * 1000000LL + (c.QuadPart % freq) * 1000000LL / freq;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -112,6 +116,11 @@ struct basis_media_engine {
     volatile int paused;
 
     basis_mutex_t lock;
+    /* Serialises decoder submit/format from the two demux threads (video + audio leg) so
+     * the "two demux threads -> one decoder" model is safe by construction on every backend,
+     * not just where the decoder happens to be internally concurrent-safe. Held only around
+     * the submit/format calls, never around pace_gate (which sleeps). */
+    basis_mutex_t submit_lock;
     basis_media_state_t state;
     char error[512];
 
@@ -137,11 +146,16 @@ struct basis_media_engine {
      * paced_hint is the caller's request (0=auto, 1=live, 2=on-demand); the protocol handler
      * resolves paced/pace_delivery once it has inspected the source (run_http_like/run_hls).
      * The pace anchor (first AU's wall time + PTS) is engine-wide so a split source's two
-     * legs pace against one timeline. */
+     * legs pace against one timeline.
+     * Thread-safety: paced/pace_delivery/paced_hint are set during run setup (run_http_like/
+     * run_hls) before the demux and audio threads start, then only read — effectively
+     * immutable while pacing (thread creation publishes them to the new threads). The anchor
+     * (pace_started/wall0/base_pts) is initialised and read under e->lock in pace_gate, so a
+     * split source's two demux threads share one timeline correctly on any memory model. */
     int paced;
     int pace_delivery;
     int paced_hint;
-    volatile int pace_started;
+    int pace_started;
     int64_t pace_wall0_us;
     int64_t pace_base_pts;
 
@@ -189,17 +203,21 @@ int basis_engine_is_paced(basis_media_engine_t* e) { return e ? e->paced : 0; }
 
 static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
     if (!e->pace_delivery) return;
+    /* Init-or-read the anchor under the lock, once, into locals — the anchor is immutable
+     * after the first AU, so the wait loop runs lock-free on the locals. Reading under the
+     * lock makes the two demux threads agree on one timeline regardless of memory model. */
+    int64_t wall0, base;
+    mutex_lock(&e->lock);
     if (!e->pace_started) {
-        mutex_lock(&e->lock);
-        if (!e->pace_started) {
-            e->pace_wall0_us = now_us();
-            e->pace_base_pts = pts_us;
-            e->pace_started = 1;
-        }
-        mutex_unlock(&e->lock);
+        e->pace_wall0_us = now_us();
+        e->pace_base_pts = pts_us;
+        e->pace_started = 1;
     }
+    wall0 = e->pace_wall0_us;
+    base = e->pace_base_pts;
+    mutex_unlock(&e->lock);
     while (e->running) {
-        int64_t media_now = e->pace_base_pts + (now_us() - e->pace_wall0_us);
+        int64_t media_now = base + (now_us() - wall0);
         int64_t ahead = pts_us - (media_now + BASIS_PACE_LEAD_US);
         if (ahead <= 0) return;
         int ms = (int)(ahead / 1000);
@@ -211,9 +229,15 @@ static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
 
 /* ---- sink callbacks (run on the demux thread) --------------------------- */
 
+/* Decoder submit/format calls go through e->submit_lock: the video and audio legs run on
+ * separate demux threads but feed one decoder, so serialise their decoder access here (and
+ * only here — not pace_gate, which sleeps) rather than relying on each backend being
+ * internally concurrent-safe. */
 static void sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    mutex_lock(&e->submit_lock);
     basis_decoder_set_video_format(e->decoder, codec, ed, ed_len, w, h);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
@@ -221,7 +245,9 @@ static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, i
     pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
     if (!e->running) return;        /* may have been stopped while pacing */
     e->video_au_count++;
+    mutex_lock(&e->submit_lock);
     basis_decoder_submit_video(e->decoder, au, len, pts, key);
+    mutex_unlock(&e->submit_lock);
     /* CONNECTING/BUFFERING -> PLAYING once the OS decoder is actually producing
      * frames (a few buffered), so the state doesn't sit at Buffering forever. */
     if ((e->state == BASIS_MEDIA_STATE_CONNECTING || e->state == BASIS_MEDIA_STATE_BUFFERING) &&
@@ -230,7 +256,9 @@ static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, i
 }
 static void sink_audio_format(void* user, basis_codec_t codec, int rate, int ch, const uint8_t* asc, int asc_len) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    mutex_lock(&e->submit_lock);
     basis_decoder_set_audio_format(e->decoder, codec, rate, ch, asc, asc_len);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_audio_frame(void* user, const uint8_t* data, int len, int64_t pts) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
@@ -238,7 +266,9 @@ static void sink_audio_frame(void* user, const uint8_t* data, int len, int64_t p
     pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
     if (!e->running) return;
     e->audio_frame_count++;
+    mutex_lock(&e->submit_lock);
     basis_decoder_submit_audio(e->decoder, data, len, pts);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_state(void* user, basis_media_state_t s) { basis_engine_set_state((basis_media_engine_t*)user, s); }
 static void sink_error(void* user, const char* m) { basis_engine_set_error((basis_media_engine_t*)user, m); }
@@ -600,6 +630,9 @@ static void run_http_like(demux_ctx_t* c) {
     if (use_readahead) {
         mutex_lock(&ring.lock); ring.closing = 1; mutex_unlock(&ring.lock); /* tell the reader to stop */
 #if defined(_WIN32)
+        /* The reader may be parked in WinHttpReadData; abort the request so the read returns
+         * at once and the join can't stall on a stalled socket (src is the WinHTTP handle). */
+        basis_win_http_abort(src);
         WaitForSingleObject(reader, INFINITE); CloseHandle(reader);
 #else
         pthread_join(reader, NULL);
@@ -816,6 +849,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
     }
 
     mutex_init(&e->lock);
+    mutex_init(&e->submit_lock);
     e->state = BASIS_MEDIA_STATE_IDLE;
 
     basis_io_global_init();
@@ -823,6 +857,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
     e->decoder = basis_decoder_create(e);
     if (!e->decoder) {
         basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
         return NULL;
@@ -836,6 +871,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
         e->running = 0;
         basis_decoder_destroy(e->decoder);
         basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
         return NULL;
@@ -849,6 +885,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
         thread_join(e);
         basis_decoder_destroy(e->decoder);
         basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
         return NULL;
@@ -888,6 +925,7 @@ BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {
     }
 
     basis_io_global_shutdown();
+    mutex_destroy(&e->submit_lock);
     mutex_destroy(&e->lock);
     free(e);
 }
