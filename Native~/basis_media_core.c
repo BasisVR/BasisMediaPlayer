@@ -747,9 +747,11 @@ static void demux_body(basis_media_engine_t* e) {
 
 /* Audio leg of a split-stream source: pull the audio-only URL into the shared
  * decoder's audio path. The primary (video) leg owns the state machine and
- * end-of-stream, so this never writes engine state — it just reconnects on a drop
- * with the same backoff, and stops when the engine stops or it can't make progress.
- * A hard error still surfaces through the audio sink's on_error. */
+ * end-of-stream; this reconnects on a drop with backoff and stops when the engine
+ * stops or it can't make progress. A hard error surfaces through the audio sink's
+ * on_error; and because the audio leg is required for a split source, if it gives up
+ * having never produced a single frame we set an engine error rather than let the
+ * video leg play on silently. */
 static void audio_demux_body(basis_media_engine_t* e) {
     int backoff_ms = 500;
     int attempt = 0;
@@ -769,12 +771,19 @@ static void audio_demux_body(basis_media_engine_t* e) {
         long delta = e->audio_frame_count - aus_before;
         if (delta > 10) { attempt = 0; backoff_ms = 500; }
         else attempt++;
-        if (attempt >= MAX_ATTEMPTS) break; /* give up quietly; the video leg drives ENDED */
+        if (attempt >= MAX_ATTEMPTS) break; /* give up; the post-loop check errors if no audio ever arrived */
 
         sleep_interruptible(e, backoff_ms);
         backoff_ms *= 2;
         if (backoff_ms > 8000) backoff_ms = 8000;
     }
+
+    /* The audio leg is required for a split source. If we stopped trying without it ever
+     * producing a frame (a paced one-shot with no audio, or retries exhausted), surface a hard
+     * error instead of silent video. Skip on a normal stop (e->running cleared) or an error
+     * already raised via the audio sink's on_error. */
+    if (e->running && !engine_state_is_error(e) && e->audio_frame_count == 0)
+        basis_engine_set_error(e, "split-stream audio produced no frames");
 }
 
 #if defined(_WIN32)

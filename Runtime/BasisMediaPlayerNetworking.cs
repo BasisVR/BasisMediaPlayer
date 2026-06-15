@@ -83,6 +83,7 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
     private bool eventsHooked;
     private ushort loadNonce;
     private ushort lastAppliedLoadNonce;
+    private bool syncedUrlFromSetUrl;
 
     // Main-thread scratch — Unity callbacks are serial so these don't need locking.
     private readonly ushort[] singleRecipient = new ushort[1];
@@ -230,6 +231,7 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
 
         currentSyncedUrl = url;
         loadNonce++;
+        syncedUrlFromSetUrl = true;
 
         // A page URL costs each client seconds of yt-dlp resolution. Broadcasting it up front
         // lets peers resolve in parallel with us instead of starting only after our OnReady,
@@ -730,19 +732,17 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
             return;
         }
 
-        // Only back-fill from the resolved source when nothing was set explicitly (a
-        // direct LoadSource outside SetUrl). When SetUrl provided a URL, keep it — for a
-        // page URL that's the youtube.com/twitch.tv link peers need to resolve themselves;
-        // overwriting it with the resolved CDN URL would broadcast a per-client/expiring
-        // URL that works for no one else.
-        if (string.IsNullOrEmpty(currentSyncedUrl))
+        // currentSyncedUrl is the URL we share. When SetUrl drove this load it's the input/page
+        // URL peers must resolve themselves — keep it (overwriting with the resolved CDN URL
+        // would broadcast a per-client/expiring URL that works for no one else). When the load
+        // bypassed SetUrl (a direct LoadSource), adopt the active source's URL so we don't keep
+        // broadcasting a stale one from an earlier SetUrl.
+        if (!syncedUrlFromSetUrl)
         {
             var media = mediaPlayer.ActiveMediaSource;
-            if (media != null && !string.IsNullOrEmpty(media.Uri))
-            {
-                currentSyncedUrl = media.Uri;
-            }
+            currentSyncedUrl = media != null && !string.IsNullOrEmpty(media.Uri) ? media.Uri : string.Empty;
         }
+        syncedUrlFromSetUrl = false;
 
         BroadcastFullState();
     }

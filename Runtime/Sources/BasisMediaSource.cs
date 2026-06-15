@@ -48,9 +48,6 @@ public sealed class BasisMediaSource
     // YouTube above ~360p (H.264 video-only + AAC audio-only).
     public string AudioUri;
 
-    // Optional headers for the AudioUri transport, mirroring Headers.
-    public Dictionary<string, string> AudioHeaders;
-
     // Live-vs-on-demand policy. On-demand content (VOD that arrives faster than real
     // time, e.g. yt-dlp-resolved YouTube) is paced to a fixed 1x clock so it doesn't
     // fast-forward; live broadcasts (RTSP/RTMP/RIST/live HLS) present at the live edge.
