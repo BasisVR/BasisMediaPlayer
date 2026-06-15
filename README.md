@@ -160,20 +160,20 @@ decoder's limit).
 
 `BasisMediaPlayerNetworking` keeps playback aligned across the room. It syncs the
 **input URL** — the page URL you entered, not the resolved stream — plus play / pause /
-stop and playback position. A page URL resolves to a per-client, expiring CDN URL that
-can't be shared, so each client resolves the shared page URL itself; direct stream URLs
-travel verbatim.
+stop. A page URL resolves to a per-client, expiring CDN URL that can't be shared, so each
+client resolves the shared page URL itself; direct stream URLs travel verbatim. To keep a
+shared load tight, the owner broadcasts a page URL up front so peers resolve it in parallel
+rather than only after the owner is playing, and re-loading a URL (even the same one)
+restarts every client together.
 
-To keep a resolved source's startup tight, the owner broadcasts a page URL up front so
-peers resolve it in parallel rather than only after the owner is playing. A lightweight
-position heartbeat then keeps everyone converged through playback — nudging any client
-that drifts past `DriftSeekThresholdSeconds` back onto the owner's clock — and pulls in
-late joiners the same way.
-
-> **Note.** A remote client can begin a resolved on-demand source slightly behind the
-> owner — resolution is per-client and async — and is then pulled into sync, so a brief
-> catch-up may be visible just after it starts. Live streams converge to the live edge.
-> Direct stream URLs apply position and pause state on load as normal.
+> **On-demand position sync is start-together, not catch-up.** Clients stay aligned by
+> beginning the same source at the same time; there is no continuous re-syncing of an
+> on-demand playhead. A client that joins late, or whose load lands later, starts from the
+> beginning and will not match an already-running playhead until the next shared (re)load.
+> This is a current limitation of the native decode backend, which exposes no absolute or
+> forward seek (only relative rewind), so a behind client cannot be advanced to catch up.
+> Live streams are unaffected — they converge to the live edge. Direct, seekable sources do
+> apply position/pause on load.
 
 ## Building the native plugin
 
