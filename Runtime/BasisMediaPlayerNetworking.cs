@@ -73,6 +73,9 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
 
     private BasisMediaPlayer mediaPlayer;
     private string currentSyncedUrl = string.Empty;
+
+    /// <summary>The URL shared with peers for the current source — the input/page URL, not the per-client resolved stream.</summary>
+    public string SyncedUrl => currentSyncedUrl;
     private bool sendOnNetworkReady;
     private bool applyingRemoteCommand;
     private bool eventsHooked;
