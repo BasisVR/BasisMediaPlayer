@@ -28,6 +28,7 @@ typedef struct {
     int      have;       /* bytes accumulated */
     int      cap;
     uint32_t last_ts_delta;
+    int      ext_ts;     /* last Type 0/1/2 header on this stream used a 0xFFFFFF (extended) timestamp */
 } chunk_state_t;
 
 typedef struct {
@@ -40,6 +41,9 @@ typedef struct {
     basis_codec_t video_codec;
     int audio_announced;
     int audio_sr, audio_ch, audio_obj;
+    uint32_t window_ack_size; /* server's Window Ack Size (type 5); 0 = unset */
+    uint32_t bytes_in;        /* bytes received, reported in our Acknowledgement (type 3) */
+    uint32_t bytes_acked;     /* bytes_in at the last Acknowledgement we sent */
 } rtmp_t;
 
 /* ---- byte writers ------------------------------------------------------- */
@@ -125,11 +129,24 @@ static int rtmp_read_message(rtmp_t* r) {
     if (fmt == 0) {
         uint8_t sid[4]; if (basis_io_read_full(r->io, sid, 4) != 4) return -1;
         c->stream_id = sid[0] | (sid[1]<<8) | (sid[2]<<16) | (sid[3]<<24);
-        c->ts = ts_field;
-    } else if (fmt <= 2) {
-        c->ts += ts_field;
     }
-    if (ts_field == 0xFFFFFF) { uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1; uint32_t e=(ext[0]<<24)|(ext[1]<<16)|(ext[2]<<8)|ext[3]; if (fmt==0) c->ts=e; else c->ts += e; }
+    /* Timestamp: a 24-bit field of 0xFFFFFF means the real value (absolute for Type 0,
+     * delta for Type 1/2) follows in a 4-byte extended field — present on this chunk,
+     * and on every Type 3 chunk continuing a stream whose last header indicated it.
+     * Resolve the effective value first, then apply it once, so the 0xFFFFFF marker is
+     * never folded into the timestamp. Track the flag per chunk stream so Type 3 reads
+     * those bytes too (else they are mis-read as payload and the chunk stream desyncs). */
+    if (fmt <= 2) {
+        c->ext_ts = (ts_field == 0xFFFFFF);
+        uint32_t ts = ts_field;
+        if (c->ext_ts) {
+            uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1;
+            ts = ((uint32_t)ext[0]<<24)|((uint32_t)ext[1]<<16)|((uint32_t)ext[2]<<8)|ext[3];
+        }
+        if (fmt == 0) c->ts = ts; else c->ts += ts;
+    } else if (c->ext_ts) { /* Type 3 continuation carries the extended timestamp; consume it */
+        uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1;
+    }
 
     /* (re)start accumulation if this is the first chunk of a message */
     if (c->have >= (int)c->len) c->have = 0;
@@ -146,6 +163,7 @@ static int rtmp_read_message(rtmp_t* r) {
     if (n > 0) {
         if (basis_io_read_full(r->io, c->buf + c->have, n) != n) return -1;
         c->have += n;
+        r->bytes_in += (uint32_t)n;
     }
     return csid;
 }
@@ -287,6 +305,13 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
     while (sink->is_running(sink->user)) {
         int csid = rtmp_read_message(&r);
         if (csid < 0) break;
+        /* Acknowledge received bytes once we cross the server's window, else a
+         * spec-compliant server stops sending when the unacked window fills. */
+        if (r.window_ack_size && (r.bytes_in - r.bytes_acked) >= r.window_ack_size) {
+            uint8_t ack[4]; be32(ack, r.bytes_in);
+            rtmp_send_msg(&r, 2, 3, 0, ack, 4);
+            r.bytes_acked = r.bytes_in;
+        }
         chunk_state_t* c = &r.cs[csid];
         if (c->have < (int)c->len) continue; /* message not complete yet */
 
@@ -294,7 +319,17 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
             case 1: /* Set Chunk Size */
                 if (c->have >= 4) r.in_chunk_size = ((c->buf[0]&0x7F)<<24)|(c->buf[1]<<16)|(c->buf[2]<<8)|c->buf[3];
                 break;
-            case 5: /* Window Ack Size — reply with ack later if needed */
+            case 4: /* User Control — answer PingRequest(6) with PingResponse(7) so the
+                     * server's keepalive doesn't time out and drop the connection. */
+                if (c->have >= 6 && (((uint32_t)c->buf[0]<<8)|c->buf[1]) == 6) {
+                    uint8_t pong[6]; pong[0]=0; pong[1]=7;
+                    memcpy(pong+2, c->buf+2, 4); /* echo the server's timestamp */
+                    rtmp_send_msg(&r, 2, 4, 0, pong, 6);
+                }
+                break;
+            case 5: /* Window Ack Size — remember it; we Acknowledge once we cross it */
+                if (c->have >= 4)
+                    r.window_ack_size = ((uint32_t)c->buf[0]<<24)|((uint32_t)c->buf[1]<<16)|((uint32_t)c->buf[2]<<8)|c->buf[3];
                 break;
             case 6: /* Set Peer Bandwidth */
                 break;
@@ -303,7 +338,10 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
                 if (c->have > off + 1 && p[off] == 0x02) {
                     int nlen = (p[off+1]<<8)|p[off+2];
                     const char* name = (const char*)(p + off + 3);
-                    if (!created && nlen == 7 && strncmp(name, "_result", 7) == 0) {
+                    /* The first _result is connect's (created==0) and carries no stream id; it
+                     * falls through below to send createStream (created=-1). Only the createStream
+                     * _result (created==-1) carries the stream id, so extract + play on that one. */
+                    if (created == -1 && nlen == 7 && strncmp(name, "_result", 7) == 0) {
                         stream_id = (int)amf_find_stream_id(p + off, c->have - off);
                         created = 1;
                     }
