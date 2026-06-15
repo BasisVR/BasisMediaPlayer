@@ -308,7 +308,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
         if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
         {
-            BasisDebug.LogError(
+            // A missing optional resolver is expected graceful degradation, not a fault — warn.
+            BasisDebug.LogWarning(
                 $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
                 "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
                 BasisDebug.LogTag.Video);
