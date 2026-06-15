@@ -305,6 +305,14 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
             case 1: /* Set Chunk Size */
                 if (c->have >= 4) r.in_chunk_size = ((c->buf[0]&0x7F)<<24)|(c->buf[1]<<16)|(c->buf[2]<<8)|c->buf[3];
                 break;
+            case 4: /* User Control — answer PingRequest(6) with PingResponse(7) so the
+                     * server's keepalive doesn't time out and drop the connection. */
+                if (c->have >= 6 && (((uint32_t)c->buf[0]<<8)|c->buf[1]) == 6) {
+                    uint8_t pong[6]; pong[0]=0; pong[1]=7;
+                    memcpy(pong+2, c->buf+2, 4); /* echo the server's timestamp */
+                    rtmp_send_msg(&r, 2, 4, 0, pong, 6);
+                }
+                break;
             case 5: /* Window Ack Size — remember it; we Acknowledge once we cross it */
                 if (c->have >= 4)
                     r.window_ack_size = ((uint32_t)c->buf[0]<<24)|((uint32_t)c->buf[1]<<16)|((uint32_t)c->buf[2]<<8)|c->buf[3];
