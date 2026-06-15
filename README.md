@@ -162,14 +162,18 @@ decoder's limit).
 **input URL** — the page URL you entered, not the resolved stream — plus play / pause /
 stop and playback position. A page URL resolves to a per-client, expiring CDN URL that
 can't be shared, so each client resolves the shared page URL itself; direct stream URLs
-travel verbatim. Position drift is corrected during playback against the owner's clock.
+travel verbatim.
 
-> **Limitation — resolved sources start from the live edge.** When a remote client first
-> applies a *resolved* (page-URL) source, resolution is async, so it auto-plays the
-> resolved stream rather than applying the owner's exact position or initial pause/stop
-> state. Live streams are unaffected (no meaningful position); for on-demand, a late
-> joiner starts from the beginning and the position converges once drift correction runs
-> during playback. Direct stream URLs apply position and pause state on load as normal.
+To keep a resolved source's startup tight, the owner broadcasts a page URL up front so
+peers resolve it in parallel rather than only after the owner is playing. A lightweight
+position heartbeat then keeps everyone converged through playback — nudging any client
+that drifts past `DriftSeekThresholdSeconds` back onto the owner's clock — and pulls in
+late joiners the same way.
+
+> **Note.** A remote client can begin a resolved on-demand source slightly behind the
+> owner — resolution is per-client and async — and is then pulled into sync, so a brief
+> catch-up may be visible just after it starts. Live streams converge to the live edge.
+> Direct stream URLs apply position and pause state on load as normal.
 
 ## Building the native plugin
 

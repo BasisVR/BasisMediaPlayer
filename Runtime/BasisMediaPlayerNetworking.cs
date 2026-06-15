@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Text;
 using System.Threading.Tasks;
 using Basis;
@@ -27,6 +28,7 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
         Seek = 5,
         RequestState = 6,
         Settings = 7,
+        PositionSync = 8,
     }
 
     [Flags]
@@ -62,6 +64,7 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
     private const int FullStateHeaderSize = 1 + 1 + 8 + SettingsBlockSize + 2;
     private const int SettingsPayloadSize = 1 + SettingsBlockSize;
     private const int SeekPayloadSize = 1 + 8;
+    private const int PositionSyncPayloadSize = 1 + 8;
     private const int FullStateSettingsOffset = 1 + 1 + 8;
     private const int FullStateUrlLenOffset = FullStateSettingsOffset + SettingsBlockSize;
 
@@ -71,6 +74,11 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
     private static readonly byte[] StopBytes = { (byte)MessageId.Stop };
     private static readonly byte[] RequestStateBytes = { (byte)MessageId.RequestState };
 
+    // Owner re-broadcasts its playing position on this cadence so passive viewers keep
+    // converging (peers otherwise only learn position on state-change broadcasts).
+    private const float PositionHeartbeatSeconds = 3f;
+    private static readonly WaitForSeconds PositionHeartbeatWait = new WaitForSeconds(PositionHeartbeatSeconds);
+
     private BasisMediaPlayer mediaPlayer;
     private string currentSyncedUrl = string.Empty;
 
@@ -79,10 +87,12 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
     private bool sendOnNetworkReady;
     private bool applyingRemoteCommand;
     private bool eventsHooked;
+    private Coroutine positionHeartbeat;
 
     // Main-thread scratch — Unity callbacks are serial so these don't need locking.
     private readonly ushort[] singleRecipient = new ushort[1];
     private readonly byte[] seekScratch = new byte[SeekPayloadSize];
+    private readonly byte[] positionSyncScratch = new byte[PositionSyncPayloadSize];
     private readonly byte[] settingsScratch = new byte[SettingsPayloadSize];
     private byte[] fullStateScratch = Array.Empty<byte>();
     private byte[] cachedUrlBytes = Array.Empty<byte>();
@@ -137,11 +147,22 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
         }
 
         HookPlayerEvents();
+
+        if (positionHeartbeat == null)
+        {
+            positionHeartbeat = StartCoroutine(PositionHeartbeat());
+        }
     }
 
     private void OnDisable()
     {
         UnhookPlayerEvents();
+
+        if (positionHeartbeat != null)
+        {
+            StopCoroutine(positionHeartbeat);
+            positionHeartbeat = null;
+        }
     }
 
     public override void OnNetworkReady()
@@ -225,8 +246,21 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
         }
 
         currentSyncedUrl = url;
+
+        // A page URL costs each client seconds of yt-dlp resolution. Broadcasting it up front
+        // lets peers resolve in parallel with us instead of starting only after our OnReady,
+        // which is what otherwise leaves them seconds behind. Peers auto-play their resolved
+        // source (AutoPlayOnSourceAssigned), the later OnReady broadcast settles state, and the
+        // position heartbeat keeps everyone converged. Directly-playable URLs keep the
+        // OnReady-gated path: no resolution latency to hide, and it avoids announcing a load we
+        // haven't confirmed we can open.
+        if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
+        {
+            BroadcastFullState();
+        }
+
         mediaPlayer.LoadUrl(url);
-        // OnReady will fire BroadcastFullState once the source resolves; no manual send here.
+        // OnReady fires BroadcastFullState once the source resolves, settling state/position.
     }
 
     public async Task Play()
@@ -463,6 +497,20 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
 
                 ApplyRemoteSettings(buffer, 1);
                 return;
+
+            case MessageId.PositionSync:
+                if (IsOwnedLocallyOnClient)
+                {
+                    return;
+                }
+
+                if (buffer.Length < PositionSyncPayloadSize)
+                {
+                    return;
+                }
+
+                ApplyRemotePositionSync(ReadLong(buffer, 1));
+                return;
         }
     }
 
@@ -558,8 +606,9 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
                 // are per-client and expiring, so they can't be shared. Route it through
                 // LoadUrl so this client resolves the page URL itself. Resolution is async,
                 // so the resolved source auto-plays via the player's default
-                // AutoPlayOnSourceAssigned; fine-grained seek/pause sync isn't applied to
-                // resolved sources (a limitation of cross-client resolution).
+                // AutoPlayOnSourceAssigned; the exact position/pause state isn't applied at
+                // this instant (the source isn't ready yet) — the owner's position heartbeat
+                // converges it once playback begins.
                 if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
                 {
                     mediaPlayer.LoadUrl(url);
@@ -661,6 +710,51 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
         catch (NotSupportedException)
         {
             // Live / non-seekable sources can't drift-correct; that's fine.
+        }
+    }
+
+    private void ApplyRemotePositionSync(long positionTicks)
+    {
+        // Drift-only: never touches play/pause/stop, so a stale or out-of-order ping (the sync
+        // is Sequenced/unreliable) can't resurrect a stopped or paused state — it just skips a
+        // correction cycle. Only nudge position while we're actively playing.
+        if (!mediaPlayer.IsPlaying || mediaPlayer.IsPaused)
+        {
+            return;
+        }
+
+        applyingRemoteCommand = true;
+        try
+        {
+            MaybeCorrectDrift(positionTicks);
+        }
+        finally
+        {
+            applyingRemoteCommand = false;
+        }
+    }
+
+    private IEnumerator PositionHeartbeat()
+    {
+        while (true)
+        {
+            yield return PositionHeartbeatWait;
+
+            if (applyingRemoteCommand || mediaPlayer == null || !IsOwnedLocallyOnClient)
+            {
+                continue;
+            }
+
+            // VOD only: a live source reports position 0 (no seekable timeline) and converges
+            // to the live edge on its own, so a ping there is pure traffic. The Sequenced ping
+            // feeds receivers' MaybeCorrectDrift, pulling laggards forward without resending the
+            // full state (cheap to fan out to a large instance).
+            if (!mediaPlayer.IsPlaying || mediaPlayer.IsPaused || mediaPlayer.Duration <= TimeSpan.Zero)
+            {
+                continue;
+            }
+
+            BroadcastPositionSync();
         }
     }
 
@@ -788,6 +882,21 @@ public sealed class BasisMediaPlayerNetworking : BasisNetworkBehaviour
         seekScratch[0] = (byte)MessageId.Seek;
         WriteLong(seekScratch, 1, position.Ticks);
         SendCustomNetworkEvent(seekScratch, DeliveryMethod.ReliableOrdered);
+    }
+
+    private void BroadcastPositionSync()
+    {
+        if (!HasNetworkID)
+        {
+            return;
+        }
+
+        // Sequenced (unreliable, latest-wins): a dropped or stale ping just skips a correction
+        // cycle, and the tiny payload keeps fan-out cheap when an instance is large. No
+        // sendOnNetworkReady fallback — the next ping is only seconds away.
+        positionSyncScratch[0] = (byte)MessageId.PositionSync;
+        WriteLong(positionSyncScratch, 1, mediaPlayer.Position.Ticks);
+        SendCustomNetworkEvent(positionSyncScratch, DeliveryMethod.Sequenced);
     }
 
     private void SendOwnerSimple(MessageId id)
