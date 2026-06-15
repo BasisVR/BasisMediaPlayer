@@ -108,7 +108,7 @@ never references it.
 `BasisMediaPlayerStreaming.StreamUrl` steers each URL automatically:
 
 - A **directly-playable** URL — a transport scheme, or an HTTP URL whose path ends in a
-  media extension (`.mp4`/`.m4s`/`.ts`/`.m3u8`) — loads directly.
+  media extension (`.mp4`/`.m4s`/`.ts`/`.m2ts`/`.mts`/`.m3u8`) — loads directly.
 - **Anything else** (an HTTP page URL with no media extension) is handed to the
   resolver, which turns it into the playable stream endpoint(s) and loads them.
 
