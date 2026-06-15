@@ -48,20 +48,6 @@ static void hls_mutex_lock(hls_mutex_t* m)    { pthread_mutex_lock(m); }
 static void hls_mutex_unlock(hls_mutex_t* m)  { pthread_mutex_unlock(m); }
 #endif
 
-static int64_t hls_now_us(void) {
-#if defined(_WIN32)
-    static LARGE_INTEGER freq; static int inited = 0;
-    if (!inited) { QueryPerformanceFrequency(&freq); inited = 1; }
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    int64_t f = freq.QuadPart ? freq.QuadPart : 1;
-    /* split to avoid int64 overflow of counter*1e6 at large uptime (~256h @10MHz) */
-    return (c.QuadPart / f) * 1000000LL + (c.QuadPart % f) * 1000000LL / f;
-#else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-#endif
-}
-
 #define HLS_MAX_URI       1024
 #define HLS_MAX_ITEMS      512   /* fetchable items collected per playlist parse  */
 #define HLS_MAX_PLAYLIST   (1 << 20) /* 1 MiB playlist cap                         */
@@ -134,16 +120,7 @@ typedef struct basis_hls {
     volatile int stop;
     volatile int producer_done;
 
-    /* Real-time pacing: the decoder presents on a wall-clock and drops frames if
-     * fed faster than real-time (it never back-pressures). So basis_hls_read meters
-     * output to the stream's measured average bitrate via a token bucket. */
-    volatile long target_bps;   /* measured average bytes/sec; 0 until known */
-    long long     acc_bytes;    /* producer: cumulative segment bytes ... */
-    long long     acc_dur_ms;   /* ... and their cumulative media duration */
-    long          cur_seg_dur_ms;   /* duration of the segment the producer is on */
-    long long     cur_seg_bytes;    /* bytes delivered for it so far */
-    double        tb_tokens;    /* consumer token bucket (bytes) */
-    int64_t       tb_last_us;   /* last token refill timestamp (0 = uninit) */
+    /* Delivery is paced by the engine (pace_gate, by AU timestamp), not here. */
 } basis_hls_t;
 
 /* ---- small string / URL helpers ----------------------------------------- */
@@ -533,12 +510,10 @@ static void hls_producer(basis_hls_t* h) {
             if (h->is_fmp4 && !h->map_served && h->map_uri[0]) {
                 h->seg_ctx = h->http.open(h->map_uri); /* fMP4 init segment first */
                 h->map_served = 1;
-                h->cur_seg_dur_ms = 0; h->cur_seg_bytes = 0; /* init segment: not counted */
                 if (!h->seg_ctx) continue;
             } else {
-                const char* next = queue_pop(h, &h->cur_seg_dur_ms);
+                const char* next = queue_pop(h, NULL);
                 if (next) {
-                    h->cur_seg_bytes = 0;
                     h->seg_ctx = h->http.open(next);
                     if (!h->seg_ctx) continue; /* skip a transient open failure */
                     h->empty_reloads = 0;
@@ -564,12 +539,10 @@ static void hls_producer(basis_hls_t* h) {
 
         int n = h->http.read(h->seg_ctx, tmp, (int)sizeof(tmp));
         if (n > 0) {
-            h->cur_seg_bytes += n;
             ring_write(h, tmp, n);
         } else {
             h->http.close(h->seg_ctx);
             h->seg_ctx = NULL;
-            h->cur_seg_bytes = 0; h->cur_seg_dur_ms = 0;
             /* top up the queue in the background so the next segment is ready */
             if (!h->endlist_seen && h->pending_count <= HLS_LIVE_MARGIN_SEGMENTS)
                 reload_and_enqueue(h);
@@ -686,31 +659,26 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
     for (;;) {
         if (h->stop || (h->is_running && !h->is_running(h->user))) return 0;
 
-        /* No byte-rate metering here: the engine paces delivery by AU timestamp
-         * (pace_gate, enabled for HLS via pace_delivery), which tracks VBR exactly and
-         * holds the demux thread on submit — so serving the ring as fast as the demuxer
-         * pulls can't flood the decoder. */
-        int budget = len;
-
-        if (budget > 0) {
-            hls_mutex_lock(&h->lock);
-            if (h->ring_count > 0) {
-                int take = h->ring_count < budget ? h->ring_count : budget;
-                int first = h->ring_cap - h->ring_tail;
-                if (first > take) first = take;
-                memcpy(buf, h->ring + h->ring_tail, (size_t)first);
-                if (take > first) memcpy(buf + first, h->ring, (size_t)(take - first));
-                h->ring_tail = (h->ring_tail + take) % h->ring_cap;
-                h->ring_count -= take;
-                hls_mutex_unlock(&h->lock);
-                return take;
-            }
-            int done = h->producer_done;
+        /* No metering here: the engine paces delivery by AU timestamp (pace_gate),
+         * holding the demux thread on submit, so serving the ring as fast as the
+         * demuxer pulls can't flood the decoder. */
+        hls_mutex_lock(&h->lock);
+        if (h->ring_count > 0) {
+            int take = h->ring_count < len ? h->ring_count : len;
+            int first = h->ring_cap - h->ring_tail;
+            if (first > take) first = take;
+            memcpy(buf, h->ring + h->ring_tail, (size_t)first);
+            if (take > first) memcpy(buf + first, h->ring, (size_t)(take - first));
+            h->ring_tail = (h->ring_tail + take) % h->ring_cap;
+            h->ring_count -= take;
             hls_mutex_unlock(&h->lock);
-            if (done) return 0;  /* producer finished and ring drained -> end of stream */
+            return take;
         }
+        int done = h->producer_done;
+        hls_mutex_unlock(&h->lock);
+        if (done) return 0;  /* producer finished and ring drained -> end of stream */
 
-        hls_sleep_ms(2); /* rate-limited, or waiting for the producer to buffer */
+        hls_sleep_ms(2); /* ring empty: wait for the producer to buffer more */
     }
 }
 
