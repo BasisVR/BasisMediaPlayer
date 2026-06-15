@@ -303,7 +303,10 @@ int basis_rtmp_run(basis_media_sink_t* sink, const basis_url_t* url) {
                 if (c->have > off + 1 && p[off] == 0x02) {
                     int nlen = (p[off+1]<<8)|p[off+2];
                     const char* name = (const char*)(p + off + 3);
-                    if (!created && nlen == 7 && strncmp(name, "_result", 7) == 0) {
+                    /* The first _result is connect's (created==0) and carries no stream id; it
+                     * falls through below to send createStream (created=-1). Only the createStream
+                     * _result (created==-1) carries the stream id, so extract + play on that one. */
+                    if (created == -1 && nlen == 7 && strncmp(name, "_result", 7) == 0) {
                         stream_id = (int)amf_find_stream_id(p + off, c->have - off);
                         created = 1;
                     }
