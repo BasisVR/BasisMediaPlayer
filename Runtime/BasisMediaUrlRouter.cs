@@ -40,7 +40,7 @@ public static class BasisMediaUrlRouter
     /// True if the player can open <paramref name="url"/> directly, without a resolver:
     /// any non-HTTP scheme (transport like rtsp/rtmp/rist, or a local file), or an
     /// http(s) URL whose path ends in a media-container extension
-    /// (.mp4/.m4s/.ts/.m3u8/.mpd). An http(s) URL with no media extension is a page URL
+    /// (.mp4/.m4s/.ts/.m3u8). An http(s) URL with no media extension is a page URL
     /// (e.g. a YouTube/Twitch watch page) and needs a resolver. This is the single
     /// source of truth for the live-vs-resolve steering; resolvers and callers both
     /// consult it. It classifies only — it never blocks (host trust is separate).
@@ -58,10 +58,11 @@ public static class BasisMediaUrlRouter
         int cut = path.IndexOfAny(PathEnd);
         if (cut >= 0) path = path.Substring(0, cut);
 
+        // No .mpd — there is no DASH demuxer in the native engine, so a raw MPD must go
+        // through a resolver (yt-dlp) rather than being treated as directly playable.
         return path.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
             || path.EndsWith(".m4s", StringComparison.OrdinalIgnoreCase)
             || path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase);
+            || path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -193,6 +193,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public BasisMediaPlayerAudio AudioComponent => audioComponent;
     public BasisMediaSource ActiveMediaSource => activeMediaSource;
 
+    // Bumped on every LoadUrl. An async resolver (the yt-dlp integration) captures this
+    // before resolving and skips its LoadSource if it changed meanwhile, so a slow resolve
+    // of an earlier URL can't overwrite a newer load. Read-only to callers.
+    public int LoadGeneration { get; private set; }
+
     public System.Collections.Generic.IReadOnlyList<BasisBitrateTrack> BitrateTracks =>
         nativeEngine != null ? nativeEngine.BitrateTracks : System.Array.Empty<BasisBitrateTrack>();
     public int SelectedBitrateIndex => nativeEngine != null ? nativeEngine.SelectedBitrateIndex : -1;
@@ -299,6 +304,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
             return;
         }
+        LoadGeneration++;
         if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
         if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
         {
