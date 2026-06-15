@@ -790,6 +790,12 @@ static IMFSample* make_input_sample(const uint8_t* data, int len, int64_t pts_us
     return s;
 }
 
+/* Split-stream thread-safety: submit_video (video demux thread) and submit_audio (audio
+ * demux thread) can run concurrently. They are safe by separation — distinct MFTs (vdec vs
+ * adec) feeding distinct outputs (the video frame path vs the PCM ring), with no shared
+ * mutable state between them and atomic (Interlocked) debug counters. The render thread reads
+ * each output under its own lock. Keep video-path and audio-path state disjoint to preserve
+ * this; if that ever changes, serialise submission through a decoder mutex. */
 extern "C" int basis_decoder_submit_video(basis_decoder_t* d, const uint8_t* annexb, int len, int64_t pts_us, int key) {
     (void)key;
     if (!d || !d->vdec || !annexb || len <= 0) return -1;
@@ -905,6 +911,52 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
      * buffer below absorbs those). Large gaps (startup, rebuffer, discontinuity)
      * hard-resync. */
     int64_t freq = d->qpcFreq.QuadPart ? d->qpcFreq.QuadPart : 1;
+    bool paced = basis_engine_is_paced(d->engine) != 0;
+    int64_t nowMedia;
+
+    if (paced) {
+        /* Paced (VOD) clock: a SMOOTH wall clock, gently low-passed toward the decode
+         * edge, presenting a fixed buffer behind it. The wall base gives steady,
+         * monotonic advance so the present point crosses one frame per frame-interval
+         * and every frame is shown (slaving nowMedia directly to `newest` instead makes
+         * it jump in the decoder's output bursts, and "present newest due" then skips
+         * the frames in between — full 1x position but a low visible framerate). The
+         * low-pass also absorbs the startup pipeline-fill offset so the clock settles
+         * ~buffer behind the edge rather than a whole ring behind it.
+         *
+         * This reuses the live clock's wall+low-pass smoothing but tuned for VOD: a
+         * fixed small buffer (no 460ms floor / dynamic sizing) and the audio gate
+         * published directly (no 2s EMA). Delivery is throttled to ~1x upstream, so the
+         * edge never leaps and the hard-resync below only fires on a real discontinuity
+         * (loop/seek/long stall), never the per-segment wobble that destabilises live. */
+        const int64_t PACED_BUFFER_US = 250000;
+        if (!d->clockStarted) {
+            d->clockStarted = true;
+            d->wallStartQpc = nowq.QuadPart;
+            d->lastRenderQpc = nowq.QuadPart;
+            d->mediaStartUs = newest;
+            d->lastPresentedPts = INT64_MIN;
+        }
+        int64_t dtUs = (nowq.QuadPart - d->lastRenderQpc) * 1000000LL / freq;
+        d->lastRenderQpc = nowq.QuadPart;
+        if (dtUs < 0) dtUs = 0; else if (dtUs > 1000000) dtUs = 1000000;
+        int64_t clk = d->mediaStartUs + (nowq.QuadPart - d->wallStartQpc) * 1000000LL / freq;
+        int64_t err = newest - clk;
+        if (err > 1000000 || err < -1000000) {        /* discontinuity / long stall: resync */
+            d->wallStartQpc = nowq.QuadPart;
+            d->mediaStartUs = newest;
+            d->lastPresentedPts = INT64_MIN;
+            clk = newest;
+        } else {
+            int64_t corr = err * dtUs / 250000;        /* ~0.25s lock toward the edge */
+            d->mediaStartUs += corr;
+            clk += corr;
+        }
+        nowMedia = clk - PACED_BUFFER_US;
+        d->dbg_lagms = (LONG)((newest - nowMedia) / 1000);
+        int64_t qpcUs = (nowq.QuadPart - d->createQpc.QuadPart) * 1000000LL / freq;
+        InterlockedExchange64(&d->audClockOffsetUs, nowMedia - qpcUs);
+    } else {
     if (!d->clockStarted) {
         d->clockStarted = true;
         d->wallStartQpc = nowq.QuadPart;
@@ -959,7 +1011,7 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
      * buffer. wallElapsed resets on a hard resync, so a rebuffer re-primes too. */
     int64_t wallElapsed = (int64_t)((nowq.QuadPart - d->wallStartQpc) * 1000000LL / freq);
     int64_t effBuf = (wallElapsed < 1200000) ? (buf * wallElapsed / 1200000) : buf;
-    int64_t nowMedia = liveClock - effBuf;
+    nowMedia = liveClock - effBuf;
     d->dbg_lagms = (LONG)((newest - nowMedia) / 1000);
 
     /* Publish the audio-gate clock as a low-passed offset from QPC (~2s EMA);
@@ -974,6 +1026,7 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
         } else {
             InterlockedExchange64(&d->audClockOffsetUs, prev + (off - prev) * dtUs / 2000000);
         }
+    }
     }
 
     /* recover from non-monotonic/bogus PTS (lastPresentedPts stuck above the ring) */

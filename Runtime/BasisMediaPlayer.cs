@@ -193,6 +193,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public BasisMediaPlayerAudio AudioComponent => audioComponent;
     public BasisMediaSource ActiveMediaSource => activeMediaSource;
 
+    // Bumped on every LoadUrl. An async resolver (the yt-dlp integration) captures this
+    // before resolving and skips its LoadSource if it changed meanwhile, so a slow resolve
+    // of an earlier URL can't overwrite a newer load. Read-only to callers.
+    public int LoadGeneration { get; private set; }
+
     public System.Collections.Generic.IReadOnlyList<BasisBitrateTrack> BitrateTracks =>
         nativeEngine != null ? nativeEngine.BitrateTracks : System.Array.Empty<BasisBitrateTrack>();
     public int SelectedBitrateIndex => nativeEngine != null ? nativeEngine.SelectedBitrateIndex : -1;
@@ -286,11 +291,28 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     }
 
     // Convenience wrapper: builds a BasisMediaSource and calls LoadSource.
+    // Page URLs (YouTube/Twitch/…) are steered through an installed resolver (the
+    // optional yt-dlp integration) here, so every entry point — networking, the in-game
+    // UI, the streaming example — resolves them; a directly-playable URL loads straight
+    // through, and with no resolver installed a page URL reports that rather than
+    // silently failing to demux an HTML page. LoadSource is NOT routed (it receives
+    // already-resolved or direct sources, e.g. the resolver's own output).
     public void LoadUrl(string url)
     {
         if (string.IsNullOrEmpty(url))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
+            return;
+        }
+        LoadGeneration++;
+        if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
+        if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
+        {
+            // A missing optional resolver is expected graceful degradation, not a fault — warn.
+            BasisDebug.LogWarning(
+                $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
+                "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
+                BasisDebug.LogTag.Video);
             return;
         }
         var media = BasisMediaSource.FromUrl(url);
@@ -351,8 +373,13 @@ public sealed class BasisMediaPlayer : MonoBehaviour
                 throw new ArgumentException("BasisMediaSource.Uri is required.", nameof(media));
             if (!BasisMediaPlayerSecurity.IsUrlAllowed(media.Uri, out string blockReason))
                 throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load '{media.Uri}': {blockReason}");
+            // The separate audio stream is its own network fetch, so it passes the
+            // same trust gate as the video URL.
+            if (!string.IsNullOrEmpty(media.AudioUri) &&
+                !BasisMediaPlayerSecurity.IsUrlAllowed(media.AudioUri, out string audioBlockReason))
+                throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load audio '{media.AudioUri}': {audioBlockReason}");
 
-            SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media)));
+            SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media), ResolveNativeAudioUri(media), media.Delivery));
         }
         catch (Exception ex)
         {
@@ -378,6 +405,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
         return uri;
     }
+
+    // The optional separate audio-only stream (BasisMediaSource.AudioUri), returned
+    // verbatim; null when the source is a single muxed stream. Split audio streams are
+    // HTTP fMP4, so the RIST buffer folding in ResolveNativeUri doesn't apply here.
+    private static string ResolveNativeAudioUri(BasisMediaSource media) => media.AudioUri;
 
     private void HandleProtonDeclined(BasisMediaSource media)
     {

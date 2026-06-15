@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -84,6 +85,22 @@ static void sleep_ms(int ms) {
     usleep((useconds_t)ms * 1000);
 #endif
 }
+static int64_t now_us(void) {
+#if defined(_WIN32)
+    /* Frequency is fixed for the session; cache it (the first-call write is idempotent
+     * across threads). Split the conversion so c.QuadPart * 1000000 can't overflow int64
+     * at long uptime (a plain multiply wraps after ~10 days at a 10 MHz QPC). */
+    static int64_t freq;
+    LARGE_INTEGER c;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart / freq) * 1000000LL + (c.QuadPart % freq) * 1000000LL / freq;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+#endif
+}
 
 /* ---- engine ------------------------------------------------------------- */
 
@@ -99,10 +116,48 @@ struct basis_media_engine {
     volatile int paused;
 
     basis_mutex_t lock;
+    /* Serialises decoder submit/format from the two demux threads (video + audio leg) so
+     * the "two demux threads -> one decoder" model is safe by construction on every backend,
+     * not just where the decoder happens to be internally concurrent-safe. Held only around
+     * the submit/format calls, never around pace_gate (which sleeps). */
+    basis_mutex_t submit_lock;
     basis_media_state_t state;
     char error[512];
 
     basis_media_sink_t sink;
+
+    /* Optional separate audio-only stream (split-stream playback). When url_audio
+     * is set, the primary URL is treated as video-only and this carries audio; a
+     * second demux thread feeds the same decoder, so both share one clock. Empty
+     * url_audio => single muxed stream and the second thread never starts (the
+     * single-stream path is byte-for-byte unchanged). */
+    char  url_audio[2048];
+    basis_url_t parts_audio;
+    basis_media_sink_t audio_sink;
+    basis_thread_t audio_thread;
+    int audio_thread_started;
+
+    /* Delivery + presentation pacing.
+     *   paced         — present on a fixed 1x clock from the first PTS (VOD); off => live edge.
+     *   pace_delivery — throttle AU delivery to ~1x (pace_gate) so a faster-than-real-time
+     *                   source can't flood the decoder. On for VOD AND for live HLS, which
+     *                   buffers segments and would otherwise burst; live HLS keeps paced=0
+     *                   so it still presents at — and converges to — the live edge.
+     * paced_hint is the caller's request (0=auto, 1=live, 2=on-demand); the protocol handler
+     * resolves paced/pace_delivery once it has inspected the source (run_http_like/run_hls).
+     * The pace anchor (first AU's wall time + PTS) is engine-wide so a split source's two
+     * legs pace against one timeline.
+     * Thread-safety: paced/pace_delivery/paced_hint are set during run setup (run_http_like/
+     * run_hls) before the demux and audio threads start, then only read — effectively
+     * immutable while pacing (thread creation publishes them to the new threads). The anchor
+     * (pace_started/wall0/base_pts) is initialised and read under e->lock in pace_gate, so a
+     * split source's two demux threads share one timeline correctly on any memory model. */
+    int paced;
+    int pace_delivery;
+    int paced_hint;
+    int pace_started;
+    int64_t pace_wall0_us;
+    int64_t pace_base_pts;
 
     /* diagnostics (demux thread writes, main thread reads; minor races OK) */
     volatile long video_au_count;
@@ -134,18 +189,65 @@ void basis_engine_set_error(basis_media_engine_t* e, const char* msg) {
 basis_decoder_t* basis_engine_get_decoder(basis_media_engine_t* e) { return e ? e->decoder : NULL; }
 int basis_engine_is_paused(basis_media_engine_t* e) { return e ? e->paused : 0; }
 int basis_engine_is_running(basis_media_engine_t* e) { return e ? e->running : 0; }
+int basis_engine_is_paced(basis_media_engine_t* e) { return e ? e->paced : 0; }
+
+/* Real-time delivery pacing. Blocks the demux thread so an access unit is handed to the
+ * decoder no more than BASIS_PACE_LEAD_US ahead of a fixed 1x clock anchored to the first
+ * AU — stalling the socket read (TCP backpressure) so a faster-than-real-time source can't
+ * flood the decoder and fast-forward. Metering by PTS tracks VBR exactly, and the
+ * wall-clock anchor lets a post-stall backlog drain immediately to re-converge to the
+ * edge. The anchor is engine-wide so a split source's two legs pace against one timeline.
+ * Lead stays under the decode ring's span, so no ring backpressure is needed. No-op unless
+ * pace_delivery is set (VOD, or live HLS — whose own byte-rate metering is disabled). */
+#define BASIS_PACE_LEAD_US 400000
+
+static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
+    if (!e->pace_delivery) return;
+    /* Init-or-read the anchor under the lock, once, into locals — the anchor is immutable
+     * after the first AU, so the wait loop runs lock-free on the locals. Reading under the
+     * lock makes the two demux threads agree on one timeline regardless of memory model. */
+    int64_t wall0, base;
+    mutex_lock(&e->lock);
+    if (!e->pace_started) {
+        e->pace_wall0_us = now_us();
+        e->pace_base_pts = pts_us;
+        e->pace_started = 1;
+    }
+    wall0 = e->pace_wall0_us;
+    base = e->pace_base_pts;
+    mutex_unlock(&e->lock);
+    while (e->running) {
+        int64_t media_now = base + (now_us() - wall0);
+        int64_t ahead = pts_us - (media_now + BASIS_PACE_LEAD_US);
+        if (ahead <= 0) return;
+        int ms = (int)(ahead / 1000);
+        if (ms > 50) ms = 50;   /* cap so a stop is observed promptly */
+        if (ms < 1) ms = 1;
+        sleep_ms(ms);
+    }
+}
 
 /* ---- sink callbacks (run on the demux thread) --------------------------- */
 
+/* Decoder submit/format calls go through e->submit_lock: the video and audio legs run on
+ * separate demux threads but feed one decoder, so serialise their decoder access here (and
+ * only here — not pace_gate, which sleeps) rather than relying on each backend being
+ * internally concurrent-safe. */
 static void sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    mutex_lock(&e->submit_lock);
     basis_decoder_set_video_format(e->decoder, codec, ed, ed_len, w, h);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
     if (!e->running) return;
+    pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
+    if (!e->running) return;        /* may have been stopped while pacing */
     e->video_au_count++;
+    mutex_lock(&e->submit_lock);
     basis_decoder_submit_video(e->decoder, au, len, pts, key);
+    mutex_unlock(&e->submit_lock);
     /* CONNECTING/BUFFERING -> PLAYING once the OS decoder is actually producing
      * frames (a few buffered), so the state doesn't sit at Buffering forever. */
     if ((e->state == BASIS_MEDIA_STATE_CONNECTING || e->state == BASIS_MEDIA_STATE_BUFFERING) &&
@@ -154,13 +256,19 @@ static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, i
 }
 static void sink_audio_format(void* user, basis_codec_t codec, int rate, int ch, const uint8_t* asc, int asc_len) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    mutex_lock(&e->submit_lock);
     basis_decoder_set_audio_format(e->decoder, codec, rate, ch, asc, asc_len);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_audio_frame(void* user, const uint8_t* data, int len, int64_t pts) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
     if (!e->running) return;
+    pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
+    if (!e->running) return;
     e->audio_frame_count++;
+    mutex_lock(&e->submit_lock);
     basis_decoder_submit_audio(e->decoder, data, len, pts);
+    mutex_unlock(&e->submit_lock);
 }
 static void sink_state(void* user, basis_media_state_t s) { basis_engine_set_state((basis_media_engine_t*)user, s); }
 static void sink_error(void* user, const char* m) { basis_engine_set_error((basis_media_engine_t*)user, m); }
@@ -179,6 +287,32 @@ static void install_sink(basis_media_engine_t* e) {
     e->sink.is_running = sink_is_running;
 }
 
+/* The split-stream audio leg feeds only audio into the shared decoder. The video
+ * leg owns the state machine and end-of-stream, so this sink drops video, state
+ * and EOS callbacks; a hard error still surfaces (a dead audio leg breaks
+ * playback), and is_running shares the engine flag so the audio thread stops with
+ * the engine. */
+static void audio_sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
+    (void)user; (void)codec; (void)ed; (void)ed_len; (void)w; (void)h;
+}
+static void audio_sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
+    (void)user; (void)au; (void)len; (void)pts; (void)key;
+}
+static void audio_sink_state(void* user, basis_media_state_t s) { (void)user; (void)s; }
+static void audio_sink_eos(void* user) { (void)user; }
+
+static void install_audio_sink(basis_media_engine_t* e) {
+    e->audio_sink.user = e;
+    e->audio_sink.on_video_format = audio_sink_video_format;
+    e->audio_sink.on_video_au = audio_sink_video_au;
+    e->audio_sink.on_audio_format = sink_audio_format; /* routes to the shared decoder's audio path */
+    e->audio_sink.on_audio_frame = sink_audio_frame;
+    e->audio_sink.on_state = audio_sink_state;
+    e->audio_sink.on_error = sink_error;               /* a failed audio leg is an engine error */
+    e->audio_sink.on_end_of_stream = audio_sink_eos;
+    e->audio_sink.is_running = sink_is_running;
+}
+
 /* ---- demux thread ------------------------------------------------------- */
 
 static int ends_with_ci(const char* s, const char* suffix) {
@@ -194,44 +328,211 @@ static int ends_with_ci(const char* s, const char* suffix) {
     return 1;
 }
 
+/* One demux pipeline: which URL/parts to pull and which sink to push into. The
+ * engine still owns the decoder, state machine, running flag and error; threading
+ * the rest through here lets one engine drive two independent pipelines — a
+ * video-only primary plus an audio-only secondary — without either role being
+ * hardcoded. State and error go through the sink (not the engine directly) so a
+ * subordinate leg can suppress them; a third track would reuse the same shape. */
+typedef struct {
+    basis_media_engine_t* e;
+    const char* url;
+    basis_url_t* parts;
+    basis_media_sink_t* sink;
+    int allow_os_demux; /* Android OS-extractor fast path; primary leg only */
+} demux_ctx_t;
+
+/* Prefix-replay byte source: serves a small sniffed prefix first, then delegates to
+ * the real read — lets run_http_like peek the leading bytes to detect the container
+ * without consuming them from the demuxer. */
+typedef struct {
+    const uint8_t* prefix;
+    int prefix_len;
+    int prefix_pos;
+    basis_read_fn inner_read;
+    void* inner_ctx;
+} prefix_src_t;
+
+static int prefix_read(void* ctx, uint8_t* buf, int len) {
+    prefix_src_t* p = (prefix_src_t*)ctx;
+    if (p->prefix_pos < p->prefix_len) {
+        int n = p->prefix_len - p->prefix_pos;
+        if (n > len) n = len;
+        memcpy(buf, p->prefix + p->prefix_pos, (size_t)n);
+        p->prefix_pos += n;
+        return n;
+    }
+    return p->inner_read(p->inner_ctx, buf, len);
+}
+
+/* True if the leading bytes are an ISO-BMFF/fragmented-MP4 box (type in bytes 4..8).
+ * Lets us pick the demuxer by content, since CDN URLs like googlevideo's
+ * .../videoplayback carry fMP4 with no .mp4 extension to switch on. */
+static int looks_like_mp4(const uint8_t* b, int n) {
+    if (n < 8) return 0;
+    const char* t = (const char*)(b + 4);
+    return memcmp(t, "ftyp", 4) == 0 || memcmp(t, "styp", 4) == 0 ||
+           memcmp(t, "moof", 4) == 0 || memcmp(t, "sidx", 4) == 0 ||
+           memcmp(t, "moov", 4) == 0 || memcmp(t, "free", 4) == 0 ||
+           memcmp(t, "skip", 4) == 0 || memcmp(t, "mdat", 4) == 0;
+}
+
+/* ---- read-ahead buffer (paced / VOD sources) ----------------------------
+ * Decouples the network read from the paced decode. A reader thread drains the
+ * socket into this compressed byte ring as fast as the CDN delivers — banking
+ * seconds ahead — while the demuxer consumes from the ring at the paced 1x rate.
+ * Bursty CDN delivery (e.g. googlevideo's ~big-chunk-then-gap pattern) is absorbed
+ * by the ring instead of starving the decoder. Compressed bytes are cheap (a few MB
+ * holds many seconds), unlike decoded frames (the VRAM-bound decode ring). Used only
+ * in paced mode; live sources read directly (no added latency). */
+#define BASIS_READAHEAD_CAP (16 * 1024 * 1024)
+
+typedef struct {
+    uint8_t* buf;
+    int cap, head, tail, count;   /* count/head/tail guarded by lock */
+    int eof;                      /* producer done (reader hit EOF/error) */
+    int closing;                  /* consumer done (tells the reader to stop) */
+    volatile int* running;        /* engine running flag, for prompt stop */
+    basis_mutex_t lock;
+} byte_ring_t;
+
+static int ring_init(byte_ring_t* r, int cap) {
+    memset(r, 0, sizeof(*r));
+    r->buf = (uint8_t*)malloc((size_t)cap);
+    if (!r->buf) return 0;
+    r->cap = cap;
+    mutex_init(&r->lock);
+    return 1;
+}
+static void ring_free(byte_ring_t* r) {
+    if (r->buf) { free(r->buf); r->buf = NULL; }
+    mutex_destroy(&r->lock);
+}
+
+/* Producer: copy n bytes in, blocking while the ring is full. Bails if the engine
+ * stops or the consumer is closing. */
+static void ring_write(byte_ring_t* r, const uint8_t* data, int n, volatile int* running) {
+    int off = 0;
+    while (off < n) {
+        mutex_lock(&r->lock);
+        int space = r->cap - r->count;
+        int chunk = n - off; if (chunk > space) chunk = space;
+        if (chunk > 0) {
+            int first = r->cap - r->head; if (first > chunk) first = chunk;
+            memcpy(r->buf + r->head, data + off, (size_t)first);
+            if (chunk > first) memcpy(r->buf, data + off + first, (size_t)(chunk - first));
+            r->head = (r->head + chunk) % r->cap;
+            r->count += chunk;
+            off += chunk;
+        }
+        int closing = r->closing;
+        mutex_unlock(&r->lock);
+        if (off < n) {
+            if (!*running || closing) return;
+            sleep_ms(2);   /* full: wait for the demuxer to drain */
+        }
+    }
+}
+
+/* Consumer (basis_read_fn): copy out up to len bytes, blocking while empty until the
+ * producer signals EOF or the engine stops. Returns 0 only when fully drained. */
+static int ring_read_fn(void* ctx, uint8_t* buf, int len) {
+    byte_ring_t* r = (byte_ring_t*)ctx;
+    for (;;) {
+        mutex_lock(&r->lock);
+        if (r->count > 0) {
+            int chunk = r->count < len ? r->count : len;
+            int first = r->cap - r->tail; if (first > chunk) first = chunk;
+            memcpy(buf, r->buf + r->tail, (size_t)first);
+            if (chunk > first) memcpy(buf + first, r->buf, (size_t)(chunk - first));
+            r->tail = (r->tail + chunk) % r->cap;
+            r->count -= chunk;
+            mutex_unlock(&r->lock);
+            return chunk;
+        }
+        int eof = r->eof;
+        mutex_unlock(&r->lock);
+        if (eof) return 0;
+        if (r->running && !*r->running) return 0;   /* engine stopping */
+        sleep_ms(2);   /* empty: wait for the reader */
+    }
+}
+
+typedef struct {
+    byte_ring_t* ring;
+    basis_read_fn net_read;
+    void* net_ctx;
+    volatile int* running;
+} reader_args_t;
+
+static void reader_body(reader_args_t* a) {
+    uint8_t tmp[65536];
+    while (*a->running && !a->ring->closing) {
+        int n = a->net_read(a->net_ctx, tmp, (int)sizeof(tmp));
+        if (n <= 0) break;   /* EOF or error */
+        ring_write(a->ring, tmp, n, a->running);
+    }
+    mutex_lock(&a->ring->lock);
+    a->ring->eof = 1;
+    mutex_unlock(&a->ring->lock);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI reader_entry(LPVOID p) { reader_body((reader_args_t*)p); return 0; }
+#else
+static void* reader_entry(void* p) { reader_body((reader_args_t*)p); return NULL; }
+#endif
+
 /* HLS / LL-HLS: the URL is a playlist, not a continuous byte stream. The HLS
  * source fetches+parses the M3U8, stitches segments (and LL-HLS parts) into one
  * byte stream, and the existing TS/fMP4 demuxers consume it. Windows fetches via
  * WinHTTP; Android/Quest support is planned. */
-static void run_hls(basis_media_engine_t* e) {
+static void run_hls(demux_ctx_t* c) {
 #if defined(_WIN32)
     basis_http_provider_t provider = {
         basis_win_http_open, basis_win_http_read, basis_win_http_close
     };
     int is_fmp4 = 0;
-    void* hls = basis_hls_open(e->url, &provider, e->sink.is_running, e->sink.user, &is_fmp4);
+    void* hls = basis_hls_open(c->url, &provider, c->sink->is_running, c->sink->user, &is_fmp4);
     if (!hls) {
-        basis_engine_set_error(e, "failed to open HLS playlist");
+        c->sink->on_error(c->sink->user, "failed to open HLS playlist");
         return;
     }
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
+    /* Auto delivery (hint 0): a playlist carrying EXT-X-ENDLIST is a finished VOD
+     * playlist (all segments available at once) and must be paced; a live playlist
+     * has no endlist. A forced hint skips this. */
+    if (c->e->paced_hint == 0 && basis_hls_is_vod(hls))
+        c->e->paced = 1;
+    /* HLS buffers segments and delivers faster than real time, so always pace delivery —
+     * even for live (paced=0), which still presents at and converges to the live edge.
+     * This replaces basis_hls.c's byte-rate token bucket (disabled there) with PTS-exact
+     * AU pacing that tracks VBR and recovers from stalls. */
+    c->e->pace_delivery = 1;
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
     if (is_fmp4)
-        basis_mp4_run(&e->sink, basis_hls_read, hls);
+        basis_mp4_run(c->sink, basis_hls_read, hls);
     else
-        basis_ts_run(&e->sink, basis_hls_read, hls);
+        basis_ts_run(c->sink, basis_hls_read, hls);
     basis_hls_close(hls);
 #else
-    basis_engine_set_error(e, "HLS playback currently requires the Windows backend.");
+    c->sink->on_error(c->sink->user, "HLS playback currently requires the Windows backend.");
 #endif
 }
 
-static void run_http_like(basis_media_engine_t* e) {
-    /* Android: the OS extractor can demux the URL itself (TLS included). */
-    if (basis_decoder_try_open_url(e->decoder, e->url)) {
-        basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-        while (e->running) sleep_ms(20);
+static void run_http_like(demux_ctx_t* c) {
+    /* Android: the OS extractor can demux the URL itself (TLS included). Primary
+     * leg only — an audio-only leg must feed the shared decoder's audio path, not
+     * hand a whole muxed file to the OS extractor. */
+    if (c->allow_os_demux && basis_decoder_try_open_url(c->e->decoder, c->url)) {
+        c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+        while (c->e->running) sleep_ms(20);
         return;
     }
 
     /* HLS playlists are not a single continuous stream — hand off to the HLS
      * source before the plain TS/fMP4 byte-source path. (.m3u8 may carry a query.) */
-    if (strstr(e->parts.path, ".m3u8")) {
-        run_hls(e);
+    if (strstr(c->parts->path, ".m3u8")) {
+        run_hls(c);
         return;
     }
 
@@ -239,7 +540,7 @@ static void run_http_like(basis_media_engine_t* e) {
     basis_read_fn rd = NULL;
 
 #if defined(_WIN32)
-    src = basis_win_http_open(e->url);   /* WinHTTP: handles http + https/TLS */
+    src = basis_win_http_open(c->url);   /* WinHTTP: handles http + https/TLS */
     rd = basis_win_http_read;
 #elif defined(__ANDROID__)
     /* AMediaExtractor either took the URL (already returned above) or rejected
@@ -251,27 +552,93 @@ static void run_http_like(basis_media_engine_t* e) {
      * frame intervals, network jitter, server buffering) that a short timeout
      * would mistake for a dead socket. Connect timeout stays implicitly short
      * (the open call). */
-    src = basis_jni_https_open(e->url, 60000);
+    src = basis_jni_https_open(c->url, 60000);
     rd = basis_jni_https_read;
 #else
-    if (e->parts.tls) {
-        basis_engine_set_error(e, "https requires the platform TLS stack (WinHTTP/AMediaExtractor); not available on this build.");
+    if (c->parts->tls) {
+        c->sink->on_error(c->sink->user, "https requires the platform TLS stack (WinHTTP/AMediaExtractor); not available on this build.");
         return;
     }
-    src = basis_http_open(&e->parts, 15000);
+    src = basis_http_open(c->parts, 15000);
     rd = basis_http_read;
 #endif
 
     if (!src) {
-        basis_engine_set_error(e, "failed to open HTTP byte source");
+        c->sink->on_error(c->sink->user, "failed to open HTTP byte source");
         return;
     }
 
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-    if (ends_with_ci(e->parts.path, ".mp4") || ends_with_ci(e->parts.path, ".m4s"))
-        basis_mp4_run(&e->sink, rd, src);
+#if defined(_WIN32)
+    /* Auto delivery (hint 0): a finite, byte-range-seekable HTTP body (known
+     * Content-Length + Accept-Ranges) is on-demand and arrives faster than real time,
+     * so pace it; an open-ended response is live. Set before the read-ahead gate and
+     * the first AU, so pacing is in force from the start. A forced hint skips this. */
+    if (c->e->paced_hint == 0 && basis_win_http_is_seekable(src))
+        c->e->paced = 1;
+    c->e->pace_delivery = c->e->paced; /* VOD over HTTP paces delivery; open-ended live doesn't */
+#endif
+
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+
+    /* Pick the demuxer by sniffing the leading bytes, not the URL extension: CDN
+     * URLs (e.g. googlevideo .../videoplayback) deliver fMP4 with no .mp4 in the
+     * path, which would otherwise fall through to the MPEG-TS demuxer and stall.
+     * The peeked bytes are replayed to the demuxer via prefix_read. Extension is the
+     * fallback when the content sniff is inconclusive. */
+    uint8_t head[16];
+    int head_len = 0;
+    while (head_len < (int)sizeof(head)) {
+        int n = rd(src, head + head_len, (int)sizeof(head) - head_len);
+        if (n <= 0) break;
+        head_len += n;
+    }
+    prefix_src_t ps = { head, head_len, 0, rd, src };
+
+    int is_mp4 = looks_like_mp4(head, head_len);
+    int is_ts  = (head_len >= 1 && head[0] == 0x47);
+    if (!is_mp4 && !is_ts)
+        is_mp4 = ends_with_ci(c->parts->path, ".mp4") || ends_with_ci(c->parts->path, ".m4s");
+
+    /* Paced (VOD): drain the network into a read-ahead ring on a reader thread and
+     * demux from the ring at the paced rate, so bursty CDN delivery doesn't starve
+     * playback. Live: demux straight off the network read (no added latency). */
+    byte_ring_t ring;
+    int use_readahead = c->e->paced && ring_init(&ring, BASIS_READAHEAD_CAP);
+    basis_read_fn demux_read = prefix_read;
+    void* demux_ctx = &ps;
+    basis_thread_t reader;
+    int reader_started = 0;
+    reader_args_t ra;
+    if (use_readahead) {
+        ring.running = &c->e->running;
+        ra.ring = &ring; ra.net_read = prefix_read; ra.net_ctx = &ps; ra.running = &c->e->running;
+#if defined(_WIN32)
+        reader = CreateThread(NULL, 0, reader_entry, &ra, 0, NULL);
+        reader_started = (reader != NULL);
+#else
+        reader_started = (pthread_create(&reader, NULL, reader_entry, &ra) == 0);
+#endif
+        if (reader_started) { demux_read = ring_read_fn; demux_ctx = &ring; }
+        else { ring_free(&ring); use_readahead = 0; }
+    }
+
+    if (is_mp4)
+        basis_mp4_run(c->sink, demux_read, demux_ctx);
     else
-        basis_ts_run(&e->sink, rd, src); /* default to MPEG-TS (.ts and friends) */
+        basis_ts_run(c->sink, demux_read, demux_ctx); /* default to MPEG-TS */
+
+    if (use_readahead) {
+        mutex_lock(&ring.lock); ring.closing = 1; mutex_unlock(&ring.lock); /* tell the reader to stop */
+#if defined(_WIN32)
+        /* The reader may be parked in WinHttpReadData; abort the request so the read returns
+         * at once and the join can't stall on a stalled socket (src is the WinHTTP handle). */
+        basis_win_http_abort(src);
+        WaitForSingleObject(reader, INFINITE); CloseHandle(reader);
+#else
+        pthread_join(reader, NULL);
+#endif
+        ring_free(&ring);
+    }
 
 #if defined(_WIN32)
     basis_win_http_close(src);
@@ -287,29 +654,29 @@ static void run_http_like(basis_media_engine_t* e) {
  * basis_rist_read straight into basis_ts_run. The receiver is built only when the
  * plugin is compiled with BASIS_WITH_RIST; otherwise basis_rist_open reports a
  * clear error via the sink and returns NULL. */
-static void run_rist(basis_media_engine_t* e) {
-    void* rist = basis_rist_open(&e->parts, &e->sink);
+static void run_rist(demux_ctx_t* c) {
+    void* rist = basis_rist_open(c->parts, c->sink);
     if (!rist) return;  /* basis_rist_open set the error on the sink */
-    basis_engine_set_state(e, BASIS_MEDIA_STATE_BUFFERING);
-    basis_ts_run(&e->sink, basis_rist_read, rist);
+    c->sink->on_state(c->sink->user, BASIS_MEDIA_STATE_BUFFERING);
+    basis_ts_run(c->sink, basis_rist_read, rist);
     basis_rist_close(rist);
 }
 
 /* Dispatch the URL to its protocol handler. Blocks until the stream drops, the
  * engine is stopped, or a hard error is set. */
-static void run_protocol_once(basis_media_engine_t* e) {
-    if (basis_url_is_rtsp(&e->parts)) {
-        basis_rtsp_run(&e->sink, &e->parts);
-    } else if (basis_url_is_rtmp(&e->parts)) {
-        if (e->parts.tls) {
-            basis_engine_set_error(e, "rtmps (RTMP-over-TLS) is not supported; use rtmp:// or an https fMP4/TS URL.");
+static void run_protocol_once(demux_ctx_t* c) {
+    if (basis_url_is_rtsp(c->parts)) {
+        basis_rtsp_run(c->sink, c->parts);
+    } else if (basis_url_is_rtmp(c->parts)) {
+        if (c->parts->tls) {
+            c->sink->on_error(c->sink->user, "rtmps (RTMP-over-TLS) is not supported; use rtmp:// or an https fMP4/TS URL.");
         } else {
-            basis_rtmp_run(&e->sink, &e->parts);
+            basis_rtmp_run(c->sink, c->parts);
         }
-    } else if (basis_url_is_rist(&e->parts)) {
-        run_rist(e);
+    } else if (basis_url_is_rist(c->parts)) {
+        run_rist(c);
     } else { /* http / https */
-        run_http_like(e);
+        run_http_like(c);
     }
 }
 
@@ -342,14 +709,21 @@ static void demux_body(basis_media_engine_t* e) {
     int attempt = 0;
     const int MAX_ATTEMPTS = 6; /* ~500ms..8s capped: several retries before giving up */
 
+    demux_ctx_t c = { e, e->url, &e->parts, &e->sink, 1 };
+
     while (e->running) {
         basis_engine_set_state(e, BASIS_MEDIA_STATE_CONNECTING);
         long au_before = e->video_au_count + e->audio_frame_count;
 
-        run_protocol_once(e);
+        run_protocol_once(&c);
 
         if (!e->running) break;              /* user stop */
         if (engine_state_is_error(e)) break; /* hard failure: retrying won't help */
+        /* Paced (VOD) sources are finite and play once: a clean run end is EOF, not
+         * a live drop to reconnect through. Looping would replay from PTS 0 while the
+         * paced clock is at the old edge — every frame would read "behind" the clock
+         * and flood in ungated (fast-forward). Stop instead. */
+        if (e->paced) { basis_engine_set_state(e, BASIS_MEDIA_STATE_ENDED); break; }
 
         long au_after = e->video_au_count + e->audio_frame_count;
         long delta = au_after - au_before;
@@ -371,10 +745,53 @@ static void demux_body(basis_media_engine_t* e) {
     }
 }
 
+/* Audio leg of a split-stream source: pull the audio-only URL into the shared
+ * decoder's audio path. The primary (video) leg owns the state machine and
+ * end-of-stream; this reconnects on a drop with backoff and stops when the engine
+ * stops or it can't make progress. A hard error surfaces through the audio sink's
+ * on_error; and because the audio leg is required for a split source, if it gives up
+ * having never produced a single frame we set an engine error rather than let the
+ * video leg play on silently. */
+static void audio_demux_body(basis_media_engine_t* e) {
+    int backoff_ms = 500;
+    int attempt = 0;
+    const int MAX_ATTEMPTS = 6;
+
+    demux_ctx_t c = { e, e->url_audio, &e->parts_audio, &e->audio_sink, 0 };
+
+    while (e->running) {
+        long aus_before = e->audio_frame_count;
+
+        run_protocol_once(&c);
+
+        if (!e->running) break;
+        if (engine_state_is_error(e)) break;
+        if (e->paced) break;   /* VOD: play once; the video leg drives ENDED */
+
+        long delta = e->audio_frame_count - aus_before;
+        if (delta > 10) { attempt = 0; backoff_ms = 500; }
+        else attempt++;
+        if (attempt >= MAX_ATTEMPTS) break; /* give up; the post-loop check errors if no audio ever arrived */
+
+        sleep_interruptible(e, backoff_ms);
+        backoff_ms *= 2;
+        if (backoff_ms > 8000) backoff_ms = 8000;
+    }
+
+    /* The audio leg is required for a split source. If we stopped trying without it ever
+     * producing a frame (a paced one-shot with no audio, or retries exhausted), surface a hard
+     * error instead of silent video. Skip on a normal stop (e->running cleared) or an error
+     * already raised via the audio sink's on_error. */
+    if (e->running && !engine_state_is_error(e) && e->audio_frame_count == 0)
+        basis_engine_set_error(e, "split-stream audio produced no frames");
+}
+
 #if defined(_WIN32)
 static DWORD WINAPI thread_entry(LPVOID arg) { demux_body((basis_media_engine_t*)arg); return 0; }
+static DWORD WINAPI audio_thread_entry(LPVOID arg) { audio_demux_body((basis_media_engine_t*)arg); return 0; }
 #else
 static void* thread_entry(void* arg) { demux_body((basis_media_engine_t*)arg); return NULL; }
+static void* audio_thread_entry(void* arg) { audio_demux_body((basis_media_engine_t*)arg); return NULL; }
 #endif
 
 static int thread_start(basis_media_engine_t* e) {
@@ -396,18 +813,52 @@ static void thread_join(basis_media_engine_t* e) {
     e->thread_started = 0;
 }
 
+static int audio_thread_start(basis_media_engine_t* e) {
+#if defined(_WIN32)
+    e->audio_thread = CreateThread(NULL, 0, audio_thread_entry, e, 0, NULL);
+    return e->audio_thread != NULL;
+#else
+    return pthread_create(&e->audio_thread, NULL, audio_thread_entry, e) == 0;
+#endif
+}
+static void audio_thread_join(basis_media_engine_t* e) {
+    if (!e->audio_thread_started) return;
+#if defined(_WIN32)
+    WaitForSingleObject(e->audio_thread, INFINITE);
+    CloseHandle(e->audio_thread);
+#else
+    pthread_join(e->audio_thread, NULL);
+#endif
+    e->audio_thread_started = 0;
+}
+
 /* ---- public ABI --------------------------------------------------------- */
 
-BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
+/* Shared open path. audio_url NULL/empty => single muxed stream (the only path
+ * basis_media_open takes); non-empty => split-stream, with url as the video-only
+ * primary and audio_url as the audio-only secondary feeding the same decoder. */
+static basis_media_engine_t* open_impl(const char* url, const char* audio_url, int delivery_hint) {
     if (!url) return NULL;
 
     basis_media_engine_t* e = (basis_media_engine_t*)calloc(1, sizeof(*e));
     if (!e) return NULL;
 
+    /* delivery_hint: 0=auto, 1=force live, 2=force on-demand. Auto starts live and
+     * the protocol handler may flip it to paced once it has inspected the source. */
+    e->paced_hint = delivery_hint;
+    e->paced = (delivery_hint == 2) ? 1 : 0;
+    e->pace_delivery = e->paced; /* VOD paces delivery; run_hls also enables it for live HLS */
     strncpy(e->url, url, sizeof(e->url) - 1);
     if (basis_url_parse(url, &e->parts) != 0) { free(e); return NULL; }
 
+    int has_audio = (audio_url && audio_url[0]);
+    if (has_audio) {
+        strncpy(e->url_audio, audio_url, sizeof(e->url_audio) - 1);
+        if (basis_url_parse(audio_url, &e->parts_audio) != 0) { free(e); return NULL; }
+    }
+
     mutex_init(&e->lock);
+    mutex_init(&e->submit_lock);
     e->state = BASIS_MEDIA_STATE_IDLE;
 
     basis_io_global_init();
@@ -415,32 +866,64 @@ BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
     e->decoder = basis_decoder_create(e);
     if (!e->decoder) {
         basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
         return NULL;
     }
 
     install_sink(e);
+    if (has_audio) install_audio_sink(e);
 
     e->running = 1;
     if (!thread_start(e)) {
         e->running = 0;
         basis_decoder_destroy(e->decoder);
         basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
         return NULL;
     }
     e->thread_started = 1;
+
+    if (has_audio && !audio_thread_start(e)) {
+        /* The caller asked for split-stream; failing to spawn the audio leg means
+         * we can't honour that, so tear down rather than play silent video. */
+        e->running = 0;
+        thread_join(e);
+        basis_decoder_destroy(e->decoder);
+        basis_io_global_shutdown();
+        mutex_destroy(&e->submit_lock);
+        mutex_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
+    if (has_audio) e->audio_thread_started = 1;
+
     return e;
+}
+
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open(const char* url) {
+    return open_impl(url, NULL, 0);
+}
+
+/* Split-stream / paced open. audio_url (when set) is the audio-only secondary played
+ * in sync on one decoder/clock; delivery_hint (0=auto, 1=live, 2=on-demand) selects
+ * the clock, auto-detected from the source when 0. A NULL/empty audio_url with
+ * delivery_hint == 0 is exactly basis_media_open(video_url). */
+BASIS_API basis_media_engine_t* BASIS_CALL basis_media_open_dual(const char* video_url, const char* audio_url, int delivery_hint) {
+    return open_impl(video_url, audio_url, delivery_hint);
 }
 
 BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {
     if (!e) return;
 
-    /* Stop the demux thread first so nothing submits while we tear down. */
+    /* Stop the demux threads first so nothing submits while we tear down. Both
+     * legs observe the same running flag; join both before freeing the decoder. */
     e->running = 0;
     thread_join(e);
+    audio_thread_join(e);
 
     /* Free OS decode/audio + GPU resources. basis_decoder_destroy calls
      * render_release internally; with the threads joined nothing is mid-decode,
@@ -451,6 +934,7 @@ BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {
     }
 
     basis_io_global_shutdown();
+    mutex_destroy(&e->submit_lock);
     mutex_destroy(&e->lock);
     free(e);
 }

@@ -48,32 +48,12 @@ static void hls_mutex_lock(hls_mutex_t* m)    { pthread_mutex_lock(m); }
 static void hls_mutex_unlock(hls_mutex_t* m)  { pthread_mutex_unlock(m); }
 #endif
 
-static int64_t hls_now_us(void) {
-#if defined(_WIN32)
-    static LARGE_INTEGER freq; static int inited = 0;
-    if (!inited) { QueryPerformanceFrequency(&freq); inited = 1; }
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    int64_t f = freq.QuadPart ? freq.QuadPart : 1;
-    /* split to avoid int64 overflow of counter*1e6 at large uptime (~256h @10MHz) */
-    return (c.QuadPart / f) * 1000000LL + (c.QuadPart % f) * 1000000LL / f;
-#else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-#endif
-}
-
 #define HLS_MAX_URI       1024
 #define HLS_MAX_ITEMS      512   /* fetchable items collected per playlist parse  */
 #define HLS_MAX_PLAYLIST   (1 << 20) /* 1 MiB playlist cap                         */
 #define HLS_MAX_EMPTY_RELOADS 8  /* consecutive no-new-media reloads before giving up */
 #define HLS_LIVE_MARGIN_SEGMENTS 3 /* playout buffer kept behind the live edge for plain (non-LL) HLS */
 #define HLS_RING_CAP (4 * 1024 * 1024) /* read-ahead byte buffer (~5 s of 1080p HD) */
-#define HLS_SEG_DESC_MAX 256           /* buffered (bytes,duration) descriptors for pacing */
-
-/* Per-segment (byte length, media duration), recorded by the producer as each segment
- * completes and consumed in order by basis_hls_read so it can meter at the bitrate of
- * the segment it is actually draining rather than a whole-stream average. */
-typedef struct { int byte_len; long dur_ms; } hls_seg_desc_t;
 
 /* (msn, part) media position. part == -1 means a whole segment. */
 typedef struct {
@@ -140,24 +120,7 @@ typedef struct basis_hls {
     volatile int stop;
     volatile int producer_done;
 
-    /* Real-time pacing: the decoder presents on a wall-clock and drops frames if fed
-     * faster than real-time (it never back-pressures), so basis_hls_read meters output
-     * via a token bucket. The rate is the bitrate of the segment currently being
-     * drained — not a whole-stream average, which mistracks VBR (a busy scene runs
-     * above average and starves playback). The producer records each completed
-     * segment's (bytes, duration) in seg_desc; the consumer adopts them in order. */
-    long          cur_seg_dur_ms;   /* duration of the segment the producer is fetching */
-    long long     cur_seg_bytes;    /* bytes fetched for it so far */
-
-    hls_seg_desc_t seg_desc[HLS_SEG_DESC_MAX]; /* completed-segment descriptors (under lock) */
-    int           desc_head;        /* producer write index */
-    int           desc_tail;        /* consumer read index  */
-    int           desc_count;       /* descriptors buffered  */
-
-    volatile long target_bps;       /* metering rate (bytes/sec) of the adopted segment; 0 = unthrottled */
-    int           cur_desc_left;    /* bytes left in the adopted descriptor (0 = adopt next) */
-    double        tb_tokens;        /* consumer token bucket (bytes) */
-    int64_t       tb_last_us;       /* last token refill timestamp (0 = uninit) */
+    /* Delivery is paced by the engine (pace_gate, by AU timestamp), not here. */
 } basis_hls_t;
 
 /* ---- small string / URL helpers ----------------------------------------- */
@@ -547,12 +510,10 @@ static void hls_producer(basis_hls_t* h) {
             if (h->is_fmp4 && !h->map_served && h->map_uri[0]) {
                 h->seg_ctx = h->http.open(h->map_uri); /* fMP4 init segment first */
                 h->map_served = 1;
-                h->cur_seg_dur_ms = 0; h->cur_seg_bytes = 0; /* init segment: not counted */
                 if (!h->seg_ctx) continue;
             } else {
-                const char* next = queue_pop(h, &h->cur_seg_dur_ms);
+                const char* next = queue_pop(h, NULL);
                 if (next) {
-                    h->cur_seg_bytes = 0;
                     h->seg_ctx = h->http.open(next);
                     if (!h->seg_ctx) continue; /* skip a transient open failure */
                     h->empty_reloads = 0;
@@ -578,26 +539,10 @@ static void hls_producer(basis_hls_t* h) {
 
         int n = h->http.read(h->seg_ctx, tmp, (int)sizeof(tmp));
         if (n > 0) {
-            h->cur_seg_bytes += n;
             ring_write(h, tmp, n);
         } else {
             h->http.close(h->seg_ctx);
             h->seg_ctx = NULL;
-            /* record (bytes, duration) so the consumer meters at this segment's own
-             * bitrate. The init segment (dur 0) carries no media time, so skip it. If
-             * the descriptor ring is somehow full, drop it — that span just serves
-             * unthrottled, which is harmless. */
-            if (h->cur_seg_dur_ms > 0 && h->cur_seg_bytes > 0) {
-                hls_mutex_lock(&h->lock);
-                if (h->desc_count < HLS_SEG_DESC_MAX) {
-                    h->seg_desc[h->desc_head].byte_len = (int)h->cur_seg_bytes;
-                    h->seg_desc[h->desc_head].dur_ms   = h->cur_seg_dur_ms;
-                    h->desc_head = (h->desc_head + 1) % HLS_SEG_DESC_MAX;
-                    h->desc_count++;
-                }
-                hls_mutex_unlock(&h->lock);
-            }
-            h->cur_seg_bytes = 0; h->cur_seg_dur_ms = 0;
             /* top up the queue in the background so the next segment is ready */
             if (!h->endlist_seen && h->pending_count <= HLS_LIVE_MARGIN_SEGMENTS)
                 reload_and_enqueue(h);
@@ -671,10 +616,15 @@ void* basis_hls_open(const char* url, const basis_http_provider_t* http,
     h->endlist_seen = pl.has_endlist;
     if (pl.map_uri[0]) snprintf(h->map_uri, sizeof(h->map_uri), "%s", pl.map_uri);
 
-    /* Start at the live edge. LL: the in-progress segment's first part (lowest
-     * latency; first part of a segment is normally an independent keyframe).
-     * Non-LL: the last complete segment (guaranteed keyframe). */
-    if (h->can_block_reload) {
+    /* VOD (EXT-X-ENDLIST): start at the first segment so the whole recording
+     * plays start-to-finish. Live: start at (or just behind) the live edge.
+     * LL live: the in-progress segment's first part (lowest latency; first part
+     * of a segment is normally an independent keyframe). Non-LL live: the last
+     * complete segment (guaranteed keyframe). */
+    if (h->endlist_seen) {
+        h->want_msn = pl.media_seq_base;
+        h->want_part = 0;
+    } else if (h->can_block_reload) {
         h->want_msn = pl.media_seq_base + pl.nfull;
         h->want_part = 0;
     } else {
@@ -714,66 +664,32 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
     for (;;) {
         if (h->stop || (h->is_running && !h->is_running(h->user))) return 0;
 
-        /* Real-time pacing: the decoder presents on a wall-clock and drops frames if
-         * fed faster than real-time, so meter output via a token bucket. The rate is
-         * the bitrate of the segment currently being drained, adopted in order from
-         * seg_desc, so VBR is tracked per segment instead of mis-metered at a stream
-         * average (a busy scene runs above average and starves playback). With no
-         * descriptor ready yet (startup, or a brief underrun while the producer is
-         * behind) serve unthrottled to refill. */
-        if (h->cur_desc_left <= 0) {
-            hls_mutex_lock(&h->lock);
-            if (h->desc_count > 0) {
-                hls_seg_desc_t d = h->seg_desc[h->desc_tail];
-                h->desc_tail = (h->desc_tail + 1) % HLS_SEG_DESC_MAX;
-                h->desc_count--;
-                hls_mutex_unlock(&h->lock);
-                h->cur_desc_left = d.byte_len;
-                h->target_bps = d.dur_ms > 0 ? (long)((long long)d.byte_len * 1000 / d.dur_ms) : 0;
-            } else {
-                hls_mutex_unlock(&h->lock);
-                h->target_bps = 0; /* unthrottled until a segment completes */
-            }
-        }
-
-        int budget = len;
-        long rate = h->target_bps;
-        if (rate > 0) {
-            int64_t now = hls_now_us();
-            if (h->tb_last_us == 0) h->tb_last_us = now;
-            h->tb_tokens += (double)rate * (double)(now - h->tb_last_us) / 1000000.0;
-            h->tb_last_us = now;
-            /* ~0.5 s burst: enough to deliver a segment-start keyframe (which is several
-             * frames' worth of bytes) promptly so `newest` doesn't stall and the present
-             * buffer doesn't dip — still ≤ the decoder's ~533 ms present ring, so it can't
-             * lap/flood. Steady rate stays at the average bitrate. */
-            double burst = (double)rate * 0.5;
-            if (h->tb_tokens > burst) h->tb_tokens = burst;
-            if (h->tb_tokens < (double)budget) budget = (int)h->tb_tokens;
-        }
-
-        if (budget > 0) {
-            hls_mutex_lock(&h->lock);
-            if (h->ring_count > 0) {
-                int take = h->ring_count < budget ? h->ring_count : budget;
-                int first = h->ring_cap - h->ring_tail;
-                if (first > take) first = take;
-                memcpy(buf, h->ring + h->ring_tail, (size_t)first);
-                if (take > first) memcpy(buf + first, h->ring, (size_t)(take - first));
-                h->ring_tail = (h->ring_tail + take) % h->ring_cap;
-                h->ring_count -= take;
-                hls_mutex_unlock(&h->lock);
-                if (rate > 0) h->tb_tokens -= take;
-                h->cur_desc_left -= take; /* advance through the adopted segment */
-                return take;
-            }
-            int done = h->producer_done;
+        /* No metering here: the engine paces delivery by AU timestamp (pace_gate),
+         * holding the demux thread on submit, so serving the ring as fast as the
+         * demuxer pulls can't flood the decoder. */
+        hls_mutex_lock(&h->lock);
+        if (h->ring_count > 0) {
+            int take = h->ring_count < len ? h->ring_count : len;
+            int first = h->ring_cap - h->ring_tail;
+            if (first > take) first = take;
+            memcpy(buf, h->ring + h->ring_tail, (size_t)first);
+            if (take > first) memcpy(buf + first, h->ring, (size_t)(take - first));
+            h->ring_tail = (h->ring_tail + take) % h->ring_cap;
+            h->ring_count -= take;
             hls_mutex_unlock(&h->lock);
-            if (done) return 0;  /* producer finished and ring drained -> end of stream */
+            return take;
         }
+        int done = h->producer_done;
+        hls_mutex_unlock(&h->lock);
+        if (done) return 0;  /* producer finished and ring drained -> end of stream */
 
-        hls_sleep_ms(2); /* rate-limited, or waiting for the producer to buffer */
+        hls_sleep_ms(2); /* ring empty: wait for the producer to buffer more */
     }
+}
+
+int basis_hls_is_vod(void* ctx) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    return h ? h->endlist_seen : 0;
 }
 
 void basis_hls_close(void* ctx) {

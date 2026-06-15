@@ -55,6 +55,8 @@ public sealed class BasisMediaPlayerStreaming : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayerStreaming has no URL to load.", BasisDebug.LogTag.Video);
             return;
         }
+        // LoadUrl steers page URLs (YouTube/Twitch/…) through the resolver and loads
+        // direct streams straight through, so this just hands the URL over.
         player.LoadUrl(url);
     }
 

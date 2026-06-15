@@ -345,9 +345,9 @@ namespace Basis.BasisUI.MediaPlayer
 
             if (canControl && _urlField != null)
             {
-                string current = _activePlayer.ActiveMediaSource != null
-                    ? _activePlayer.ActiveMediaSource.Uri
-                    : string.Empty;
+                string current = _activeNetworking != null
+                    ? _activeNetworking.SyncedUrl
+                    : (_activePlayer.ActiveMediaSource != null ? _activePlayer.ActiveMediaSource.Uri : string.Empty);
                 _urlField.SetValueWithoutNotify(current ?? string.Empty);
             }
 
