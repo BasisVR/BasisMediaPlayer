@@ -28,6 +28,7 @@ typedef struct {
     int      have;       /* bytes accumulated */
     int      cap;
     uint32_t last_ts_delta;
+    int      ext_ts;     /* last Type 0/1/2 header on this stream used a 0xFFFFFF (extended) timestamp */
 } chunk_state_t;
 
 typedef struct {
@@ -132,7 +133,20 @@ static int rtmp_read_message(rtmp_t* r) {
     } else if (fmt <= 2) {
         c->ts += ts_field;
     }
-    if (ts_field == 0xFFFFFF) { uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1; uint32_t e=(ext[0]<<24)|(ext[1]<<16)|(ext[2]<<8)|ext[3]; if (fmt==0) c->ts=e; else c->ts += e; }
+    /* Extended timestamp: present on a Type 0/1/2 chunk whose 24-bit ts field reads
+     * 0xFFFFFF, AND on every Type 3 chunk continuing a stream whose last header
+     * indicated it. Track it per chunk stream so Type 3 reads the 4 bytes too —
+     * otherwise they are mis-read as payload and the chunk stream desyncs. */
+    if (fmt <= 2) {
+        c->ext_ts = (ts_field == 0xFFFFFF);
+        if (c->ext_ts) {
+            uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1;
+            uint32_t e=(ext[0]<<24)|(ext[1]<<16)|(ext[2]<<8)|ext[3];
+            if (fmt==0) c->ts=e; else c->ts += e;
+        }
+    } else if (c->ext_ts) { /* Type 3 continuation carries the extended timestamp; consume it */
+        uint8_t ext[4]; if (basis_io_read_full(r->io, ext, 4) != 4) return -1;
+    }
 
     /* (re)start accumulation if this is the first chunk of a message */
     if (c->have >= (int)c->len) c->have = 0;
