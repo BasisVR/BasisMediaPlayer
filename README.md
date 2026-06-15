@@ -121,8 +121,9 @@ host trust is enforced separately.)
 
 > **Known gap.** The steering keys off the URL's form, so a **direct HTTP stream with
 > no file extension** (e.g. `https://host/live/feed` with no `.ts`/`.mp4`) can't be
-> told apart from a page URL: with the resolver installed it is sent to the resolver
-> and fails, rather than loading directly. Give direct HTTP streams a recognised
+> told apart from a page URL: with the resolver installed it is sent to the resolver,
+> which finds no extractable stream and reports an error — so playback fails rather
+> than loading directly. Give direct HTTP streams a recognised
 > extension, or use a transport scheme (`rtsp`/`rtmp`), to avoid this.
 
 ## Usage
@@ -154,6 +155,21 @@ channels) can be positioned speaker-by-speaker in the world (the
 Channel ceiling depends on the source: **LPCM over MPEG-TS** carries a full 7.1
 (8 channels); **AAC on Windows** decodes up to 5.1 (the Media Foundation
 decoder's limit).
+
+## Networked sync
+
+`BasisMediaPlayerNetworking` keeps playback aligned across the room. It syncs the
+**input URL** — the page URL you entered, not the resolved stream — plus play / pause /
+stop and playback position. A page URL resolves to a per-client, expiring CDN URL that
+can't be shared, so each client resolves the shared page URL itself; direct stream URLs
+travel verbatim. Position drift is corrected during playback against the owner's clock.
+
+> **Limitation — resolved sources start from the live edge.** When a remote client first
+> applies a *resolved* (page-URL) source, resolution is async, so it auto-plays the
+> resolved stream rather than applying the owner's exact position or initial pause/stop
+> state. Live streams are unaffected (no meaningful position); for on-demand, a late
+> joiner starts from the beginning and the position converges once drift correction runs
+> during playback. Direct stream URLs apply position and pause state on load as normal.
 
 ## Building the native plugin
 
