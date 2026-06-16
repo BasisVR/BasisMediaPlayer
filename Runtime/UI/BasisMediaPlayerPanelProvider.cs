@@ -30,6 +30,9 @@ namespace Basis.BasisUI.MediaPlayer
         private PanelToggle _debugToggle;
         private PanelTextField _urlField;
         private PanelSlider _volumeSlider;
+        private PanelToggle _captionsToggle;
+        private PanelSlider _captionTextOpacitySlider;
+        private PanelSlider _captionBgOpacitySlider;
         private PanelDropdown _bitrateDropdown;
         private PanelDropdown _audioTrackDropdown;
         private PanelToggle _advancedToggle;
@@ -123,6 +126,9 @@ namespace Basis.BasisUI.MediaPlayer
             _debugToggle = null;
             _urlField = null;
             _volumeSlider = null;
+            _captionsToggle = null;
+            _captionTextOpacitySlider = null;
+            _captionBgOpacitySlider = null;
             _bitrateDropdown = null;
             _audioTrackDropdown = null;
             _advancedToggle = null;
@@ -225,6 +231,29 @@ namespace Basis.BasisUI.MediaPlayer
                     _activePlayer.AudioComponent.VolumeGain = volume;
                     _activePlayer.AudioComponent.Mute = volume <= 0f;
                 }
+            };
+
+            _captionsToggle = PanelToggle.CreateNewEntry(content);
+            _captionsToggle.Descriptor.SetTitle("Captions (CC)");
+            _captionsToggle.Descriptor.SetDescription("Show in-band closed captions when the stream carries them.");
+            _captionsToggle.OnValueChanged = v =>
+            {
+                if (_activePlayer != null) _activePlayer.CaptionsEnabled = v;
+                ApplyCaptionOptionsVisibility(v);
+            };
+
+            _captionTextOpacitySlider = PanelSlider.CreateNew(content);
+            _captionTextOpacitySlider.SetSliderSettings(PanelSlider.SliderSettings.Percentage("Text Opacity"));
+            _captionTextOpacitySlider.OnValueChanged = v =>
+            {
+                if (_activePlayer != null) _activePlayer.CaptionTextOpacity = Mathf.Clamp01(v / 100f);
+            };
+
+            _captionBgOpacitySlider = PanelSlider.CreateNew(content);
+            _captionBgOpacitySlider.SetSliderSettings(PanelSlider.SliderSettings.Percentage("Background Opacity"));
+            _captionBgOpacitySlider.OnValueChanged = v =>
+            {
+                if (_activePlayer != null) _activePlayer.CaptionBackgroundOpacity = Mathf.Clamp01(v / 100f);
             };
 
             RectTransform actions = BuildActionRow(content);
@@ -352,6 +381,10 @@ namespace Basis.BasisUI.MediaPlayer
             }
 
             _volumeSlider?.SetValueWithoutNotify(_activePlayer.Mute ? 0f : Mathf.Clamp01(_activePlayer.Volume) * 100f);
+            _captionsToggle?.SetValueWithoutNotify(_activePlayer.CaptionsEnabled);
+            _captionTextOpacitySlider?.SetValueWithoutNotify(Mathf.Clamp01(_activePlayer.CaptionTextOpacity) * 100f);
+            _captionBgOpacitySlider?.SetValueWithoutNotify(Mathf.Clamp01(_activePlayer.CaptionBackgroundOpacity) * 100f);
+            ApplyCaptionOptionsVisibility(_activePlayer.CaptionsEnabled);
 
             RebuildBitrateDropdown();
             RebuildAudioTrackDropdown();
@@ -501,6 +534,13 @@ namespace Basis.BasisUI.MediaPlayer
                 _debugGroup.ForceRebuild();
             }
             _controlGroup?.ForceRebuild();
+        }
+
+        private void ApplyCaptionOptionsVisibility(bool visible)
+        {
+            _captionTextOpacitySlider?.gameObject.SetActive(visible);
+            _captionBgOpacitySlider?.gameObject.SetActive(visible);
+            _userGroup?.ForceRebuild();
         }
 
         private void ApplyVerboseLoggingToActivePlayer(bool enabled)

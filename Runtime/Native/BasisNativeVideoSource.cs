@@ -45,6 +45,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     public event Action<Exception> OnError;
     public event Action<BasisBitrateTrack> OnBitrateTrackChanged;
     public event Action<BasisAudioTrack> OnAudioTrackChanged;
+    public event Action<BasisCaptionCue> OnCaptionCueChanged;
 
     public string Url { get; }
     public string AudioUrl { get; }
@@ -100,6 +101,13 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     private int lastReportedBitrateIndex = -2;
     private int lastReportedAudioTrackIndex = -2;
 
+    // Caption poll state. The scratch buffer is reused each frame; a string is only
+    // built (and the event fired) when the active cue's bytes actually change.
+    private readonly byte[] captionScratch = new byte[512];
+    private byte[] lastCaptionBytes = Array.Empty<byte>();
+    private int lastCaptionLen;          // 0 = "no caption" (matches an empty poll)
+    private bool captionsSupported = true;
+
     public IReadOnlyList<BasisBitrateTrack> BitrateTracks => bitrateTracks;
     public IReadOnlyList<BasisAudioTrack> AudioTracks => audioTracks;
     public int SelectedBitrateIndex => BasisNativeMedia.GetSelectedBitrate(handle);
@@ -147,6 +155,7 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
         readyFired = eosRaised = errorRaised = false;
         lastFrameCounter = 0;
         lastTexturePtr = IntPtr.Zero;
+        lastCaptionLen = 0; // re-arm so the first cue of the new stream fires
     }
 
     // Selects the jitter buffer length and mode. Applied live if running, and
@@ -280,6 +289,8 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
                 break;
         }
 
+        PollCaptions();
+
         // Heartbeat: log on every state change and ~every 120 pumps so the Editor
         // log shows whether frames keep flowing (frames climbing), the stream
         // ended (state=Ended), or the texture froze (frames stuck but no error).
@@ -294,6 +305,32 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
                 $"[NativeMedia] state={hb} frames={fc} posUs={PositionUs} tex={texDesc} [{BasisNativeMedia.GetDebug(handle)}]",
                 BasisDebug.LogTag.Video);
         }
+    }
+
+    // Polls the active caption cue and fires OnCaptionCueChanged only when the text
+    // actually changes (including clearing to null). Timing authority is native — the
+    // engine selects the cue active at the current presentation position.
+    private void PollCaptions()
+    {
+        if (!captionsSupported || handle == IntPtr.Zero) return;
+
+        int n = BasisNativeMedia.PollCaption(handle, captionScratch, out long startUs, out long endUs);
+        if (n < 0) { captionsSupported = false; return; } // native lib predates captions: stop polling
+        if (n > captionScratch.Length) n = captionScratch.Length;
+        if (n == lastCaptionLen && BytesEqual(captionScratch, lastCaptionBytes, n)) return;
+
+        lastCaptionLen = n;
+        if (lastCaptionBytes.Length < n) lastCaptionBytes = new byte[n];
+        Array.Copy(captionScratch, lastCaptionBytes, n);
+
+        string text = n > 0 ? System.Text.Encoding.UTF8.GetString(captionScratch, 0, n) : null;
+        OnCaptionCueChanged?.Invoke(new BasisCaptionCue(text, startUs, endUs));
+    }
+
+    private static bool BytesEqual(byte[] a, byte[] b, int n)
+    {
+        for (int i = 0; i < n; i++) if (a[i] != b[i]) return false;
+        return true;
     }
 
     private void RebindTexture(IntPtr nativeTex, int w, int h)
