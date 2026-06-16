@@ -20,6 +20,23 @@ using UnityEngine.Rendering;
 //   var player = gameObject.AddComponent<BasisMediaPlayer>();
 //   gameObject.AddComponent<BasisVideoMaterialOutput>().TargetRenderer = quadRenderer;
 //   player.LoadUrl("https://example.com/clip.mp4");
+
+// High-level, display-friendly playback status, folded from the OS-codec engine
+// state (BasisMediaEngineState) or the CPU source flags into one value the in-game
+// Media Players panel shows. See BasisMediaPlayer.Status.
+public enum BasisMediaPlayerStatus
+{
+    NoMedia = 0,    // nothing loaded
+    Connecting,     // opening / connecting to the stream
+    Buffering,      // connected, filling the buffer (no frame on screen yet)
+    Ready,          // prepared, first frame available, not actively playing
+    Playing,
+    Paused,
+    Stopped,        // had media, stopped by the user (or never started)
+    Ended,          // reached end of stream
+    Error,          // load/playback failed — see LastErrorMessage
+}
+
 [DisallowMultipleComponent]
 public sealed class BasisMediaPlayer : MonoBehaviour
 {
@@ -164,6 +181,48 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public bool IsPrepared => runtimeIsPrepared;
     public Vector2Int VideoSize => runtimeVideoSize;
 
+    // Last error surfaced through OnError (native engine failure, blocked URL,
+    // audio-rate mismatch, …) or a pre-flight load failure. Null when none.
+    // Cleared when a fresh source is loaded. Read by the Media Players panel so a
+    // failed/selected player can show what went wrong.
+    public string LastErrorMessage { get; private set; }
+
+    // Display-friendly playback status, folded from the active backend. Errors that
+    // are non-fatal to video (e.g. audio muted on a sample-rate mismatch) are left
+    // out here and surfaced via LastErrorMessage so playback still reads "Playing".
+    public BasisMediaPlayerStatus Status
+    {
+        get
+        {
+            if (nativeEngine != null)
+            {
+                switch (nativeEngine.State)
+                {
+                    case BasisMediaEngineState.Connecting: return BasisMediaPlayerStatus.Connecting;
+                    case BasisMediaEngineState.Buffering: return BasisMediaPlayerStatus.Buffering;
+                    case BasisMediaEngineState.Playing: return runtimeIsPaused ? BasisMediaPlayerStatus.Paused : BasisMediaPlayerStatus.Playing;
+                    case BasisMediaEngineState.Paused: return BasisMediaPlayerStatus.Paused;
+                    case BasisMediaEngineState.Ended: return BasisMediaPlayerStatus.Ended;
+                    case BasisMediaEngineState.Error: return BasisMediaPlayerStatus.Error;
+                    default: return runtimeIsPlaying ? BasisMediaPlayerStatus.Connecting : BasisMediaPlayerStatus.Stopped;
+                }
+            }
+
+            if (source != null)
+            {
+                if (runtimeIsPaused) return BasisMediaPlayerStatus.Paused;
+                if (runtimeIsPlaying) return runtimePresentedFrameCount > 0 ? BasisMediaPlayerStatus.Playing : BasisMediaPlayerStatus.Buffering;
+                if (runtimeIsPrepared) return BasisMediaPlayerStatus.Ready;
+                return BasisMediaPlayerStatus.Stopped;
+            }
+
+            // No backend attached: a load that failed before one could attach (blocked
+            // URL, missing native lib, unresolvable page URL) leaves an error but no source.
+            if (!string.IsNullOrEmpty(LastErrorMessage)) return BasisMediaPlayerStatus.Error;
+            return BasisMediaPlayerStatus.NoMedia;
+        }
+    }
+
     public TimeSpan Duration => seekableSource != null && seekableSource.IsPrepared
         ? seekableSource.Duration
         : TimeSpan.Zero;
@@ -305,11 +364,14 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
             return;
         }
+        LastErrorMessage = null;
         LoadGeneration++;
         if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
         if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
         {
             // A missing optional resolver is expected graceful degradation, not a fault — warn.
+            // Surfaced to LastErrorMessage too so the Media Players panel can explain why nothing played.
+            LastErrorMessage = "This looks like a page URL (e.g. YouTube/Twitch). Playing it needs the optional yt-dlp resolver package, which isn't installed.";
             BasisDebug.LogWarning(
                 $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
                 "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
@@ -344,6 +406,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             throw new ArgumentNullException(nameof(media));
         }
 
+        LastErrorMessage = null;
         activeMediaSource = media;
 
         /* not needed anymore!
@@ -756,6 +819,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         pendingSeekCompletedUs = long.MinValue;
         pendingBitrateTrack = null;
         pendingError = null;
+        LastErrorMessage = null;
         pendingVideoSize = 0;
         audioRateMismatchReported = false;
     }
@@ -1043,6 +1107,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         {
             var ex = pendingError;
             pendingError = null;
+            LastErrorMessage = ex.Message;
             OnError?.Invoke(ex);
         }
 
