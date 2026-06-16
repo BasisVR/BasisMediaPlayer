@@ -40,6 +40,11 @@ public sealed class BasisMediaCaptionOverlay : MonoBehaviour
         if (player == null) player = GetComponentInParent<BasisMediaPlayer>();
         if (label == null)
             BasisDebug.LogWarning("BasisMediaCaptionOverlay has no TMP_Text assigned or in children; captions won't be drawn.", BasisDebug.LogTag.Video);
+        // Caption text is stream-provided: keep TMP rich-text off so literal '<...>'
+        // shows verbatim instead of being parsed as markup. Captions are a passive
+        // overlay, so neither graphic should swallow pointer/UI raycasts.
+        if (label != null) { label.richText = false; label.raycastTarget = false; }
+        if (background != null) background.raycastTarget = false;
     }
 
     private void OnEnable() => Bind(player);
@@ -58,11 +63,16 @@ public sealed class BasisMediaCaptionOverlay : MonoBehaviour
 
     private void Unbind()
     {
-        if (bound == null) return;
-        bound.OnCaptionCueChanged -= HandleCue;
-        bound.OnCaptionsEnabledChanged -= HandleEnabled;
-        bound.OnCaptionStyleChanged -= HandleStyle;
-        bound = null;
+        if (bound != null)
+        {
+            bound.OnCaptionCueChanged -= HandleCue;
+            bound.OnCaptionsEnabledChanged -= HandleEnabled;
+            bound.OnCaptionStyleChanged -= HandleStyle;
+            bound = null;
+        }
+        // Drop any caption text so it can't linger across a rebind or after disable.
+        currentText = null;
+        Apply();
     }
 
     private void HandleCue(BasisCaptionCue cue)
