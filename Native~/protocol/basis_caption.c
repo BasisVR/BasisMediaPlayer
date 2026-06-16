@@ -90,6 +90,10 @@ static uint16_t (*cur_buf(cea608_t* s))[COLS] {
     return (s->mode == MODE_POPON) ? s->nond : s->disp;
 }
 
+/* Pop-on loads into off-screen memory (no visible change until EOC flips it);
+ * roll-up and paint-on write straight to displayed memory, so each write is live. */
+static int live(const cea608_t* s) { return s->mode != MODE_POPON; }
+
 static void put_cp(cea608_t* s, uint16_t cp) {
     if (s->row < 0 || s->row >= ROWS) return;
     if (s->col < 0) s->col = 0;
@@ -145,8 +149,8 @@ static int misc_control(cea608_t* s, uint8_t b1) {
     uint16_t (*buf)[COLS] = cur_buf(s);
     switch (b1) {
         case 0x20: s->mode = MODE_POPON; return 0;                    /* RCL */
-        case 0x21: if (s->col > 0) { s->col--; buf[s->row][s->col] = 0; } return 0; /* BS */
-        case 0x24: for (int c = s->col; c < COLS; ++c) buf[s->row][c] = 0; return 0; /* DER */
+        case 0x21: if (s->col > 0) { s->col--; buf[s->row][s->col] = 0; } return live(s); /* BS */
+        case 0x24: for (int c = s->col; c < COLS; ++c) buf[s->row][c] = 0; return live(s); /* DER */
         case 0x25: s->mode = MODE_ROLLUP; s->rollup = 2; return 0;    /* RU2 */
         case 0x26: s->mode = MODE_ROLLUP; s->rollup = 3; return 0;    /* RU3 */
         case 0x27: s->mode = MODE_ROLLUP; s->rollup = 4; return 0;    /* RU4 */
@@ -186,18 +190,19 @@ static int cea608_pair(cea608_t* s, uint8_t b0, uint8_t b1) {
 
     if (is_ctrl) {
         if (b1 >= 0x40)                              { apply_pac(s, b0, b1); return 0; }
-        if (b0 == 0x11 && b1 >= 0x20 && b1 <= 0x2F)  { put_cp(s, 0x20); return 0; }      /* mid-row style */
-        if (b0 == 0x11 && b1 >= 0x30 && b1 <= 0x3F)  { put_cp(s, kSpecial[b1 - 0x30]); return 0; }
-        if (b0 == 0x12 && b1 >= 0x20 && b1 <= 0x3F)  { put_ext(s, kExt12[b1 - 0x20]); return 0; }
-        if (b0 == 0x13 && b1 >= 0x20 && b1 <= 0x3F)  { put_ext(s, kExt13[b1 - 0x20]); return 0; }
+        if (b0 == 0x11 && b1 >= 0x20 && b1 <= 0x2F)  { put_cp(s, 0x20); return live(s); }      /* mid-row style */
+        if (b0 == 0x11 && b1 >= 0x30 && b1 <= 0x3F)  { put_cp(s, kSpecial[b1 - 0x30]); return live(s); }
+        if (b0 == 0x12 && b1 >= 0x20 && b1 <= 0x3F)  { put_ext(s, kExt12[b1 - 0x20]); return live(s); }
+        if (b0 == 0x13 && b1 >= 0x20 && b1 <= 0x3F)  { put_ext(s, kExt13[b1 - 0x20]); return live(s); }
         if (b0 == 0x17 && b1 >= 0x21 && b1 <= 0x23)  { s->col += (b1 - 0x20); if (s->col > COLS) s->col = COLS; return 0; }
         if (b0 == 0x14 && b1 >= 0x20 && b1 <= 0x2F)  { return misc_control(s, b1); }
         return 0;
     }
 
-    if (b0 >= 0x20) put_cp(s, basic_cp(b0));
-    if (b1 >= 0x20) put_cp(s, basic_cp(b1));
-    return 0;
+    int wrote = 0;
+    if (b0 >= 0x20) { put_cp(s, basic_cp(b0)); wrote = 1; }
+    if (b1 >= 0x20) { put_cp(s, basic_cp(b1)); wrote = 1; }
+    return wrote ? live(s) : 0;
 }
 
 static int utf8_put(char* out, int cap, int n, uint16_t cp) {
@@ -241,6 +246,10 @@ static void cea608_serialize(const cea608_t* s, char* out, int cap) {
 #define CUE_TEXT_MAX 256
 #define CUE_RING 64
 
+/* PTS gap (µs) beyond which a backwards jump is treated as a new timeline rather
+ * than B-frame decode-order reordering (which is sub-second). */
+#define CAPTION_EPOCH_SLACK_US 1000000
+
 typedef struct {
     int64_t start, end;
     char text[CUE_TEXT_MAX];
@@ -252,6 +261,7 @@ struct basis_caption_ctx {
     cue_t ring[CUE_RING];
     int head;            /* next write slot */
     int count;
+    int64_t last_pts;    /* last scanned AU PTS; INT64_MIN until first AU */
 };
 
 /* Append a cue starting at pts_us; close the previous cue at the same instant.
@@ -297,6 +307,7 @@ static void parse_user_data(basis_caption_ctx_t* c, const uint8_t* d, int len, i
     if (!((cc[0] >> 6) & 1)) return;                /* process_cc_data_flag */
     int count = cc[0] & 0x1F;
     int idx = 2;                                    /* skip flags byte + em_data byte */
+    int changed = 0;
     for (int i = 0; i < count; ++i) {
         if (idx + 3 > cclen) break;
         uint8_t f = cc[idx];
@@ -305,11 +316,13 @@ static void parse_user_data(basis_caption_ctx_t* c, const uint8_t* d, int len, i
         uint8_t d1 = cc[idx + 1], d2 = cc[idx + 2];
         idx += 3;
         if (!valid) continue;
-        if (ctype == 0) {                           /* CEA-608 field 1 */
-            if (cea608_pair(&c->dec, d1, d2)) emit(c, pts_us);
-        }
+        if (ctype == 0)                             /* CEA-608 field 1 */
+            changed |= cea608_pair(&c->dec, d1, d2);
         /* ctype 1 = field 2, 2/3 = CEA-708 DTVCC — not decoded in slice 1 */
     }
+    /* One cue per AU: roll-up/paint-on mutate displayed memory on every pair, so
+     * coalescing keeps the ring from churning while still tracking live updates. */
+    if (changed) emit(c, pts_us);
 }
 
 /* Walk the SEI messages in one NAL (header stripped, RBSP unescaped). */
@@ -334,17 +347,27 @@ static void scan_sei_rbsp(basis_caption_ctx_t* c, const uint8_t* rbsp, int rlen,
 static void scan_nal_sei(basis_caption_ctx_t* c, const uint8_t* nal, int nal_len, int hevc, int64_t pts_us) {
     int hdr = hevc ? 2 : 1;
     if (nal_len <= hdr) return;
-    /* Unescape emulation-prevention bytes (00 00 03) into a bounded buffer; a
-     * caption SEI is tiny, so a fixed buffer covers it without heap churn. */
-    uint8_t rbsp[2048];
+    /* Unescape emulation-prevention bytes (00 00 03). The common caption SEI is
+     * tiny, so the stack buffer covers it; a larger NAL (caption payload trailing
+     * other SEI messages) spills to the heap rather than truncating. */
+    int cap = nal_len - hdr;            /* unescaping only shrinks the payload */
+    uint8_t stackbuf[2048];
+    uint8_t* rbsp = stackbuf;
+    uint8_t* heap = NULL;
+    if (cap > (int)sizeof(stackbuf)) {
+        heap = (uint8_t*)malloc((size_t)cap);
+        if (!heap) return;             /* skip the NAL rather than parse a partial one */
+        rbsp = heap;
+    }
     int rlen = 0, zeros = 0;
-    for (int i = hdr; i < nal_len && rlen < (int)sizeof(rbsp); ++i) {
+    for (int i = hdr; i < nal_len; ++i) {
         uint8_t b = nal[i];
         if (zeros >= 2 && b == 0x03) { zeros = 0; continue; }
         rbsp[rlen++] = b;
         zeros = (b == 0) ? zeros + 1 : 0;
     }
     scan_sei_rbsp(c, rbsp, rlen, pts_us);
+    free(heap);
 }
 
 /* ---- public API --------------------------------------------------------- */
@@ -354,6 +377,7 @@ basis_caption_ctx_t* basis_caption_create(void) {
     if (!c) return NULL;
     bc_mutex_init(&c->lock);
     cea608_reset(&c->dec);
+    c->last_pts = INT64_MIN;
     return c;
 }
 
@@ -366,6 +390,22 @@ void basis_caption_destroy(basis_caption_ctx_t* c) {
 void basis_caption_scan_au(basis_caption_ctx_t* c, const uint8_t* annexb, int len,
                            int hevc, int64_t pts_us) {
     if (!c || !annexb || len <= 0) return;
+
+    /* A large backwards PTS jump marks a new timeline (loop replay, reconnect or a
+     * mid-stream discontinuity). Drop the decoder + cue ring so captions from the old
+     * epoch can't outlive it. The slack absorbs B-frame decode-order reordering,
+     * which is sub-second, without swallowing a real reset. */
+    if (pts_us >= 0) {
+        if (c->last_pts != INT64_MIN && pts_us + CAPTION_EPOCH_SLACK_US < c->last_pts) {
+            bc_lock(&c->lock);
+            c->head = 0;
+            c->count = 0;
+            bc_unlock(&c->lock);
+            cea608_reset(&c->dec);
+        }
+        c->last_pts = pts_us;
+    }
+
     int pos = 0, off, nl;
     while ((pos = basis_annexb_next(annexb, len, pos, &off, &nl)) >= 0) {
         if (nl <= 0) continue;
@@ -388,12 +428,12 @@ int basis_caption_poll(basis_caption_ctx_t* c, int64_t presentation_pts_us,
     for (int i = 0; i < c->count; ++i) {
         cue_t* cue = &c->ring[(c->head + CUE_RING - 1 - i) % CUE_RING];
         if (cue->start <= presentation_pts_us) {     /* newest cue at/after which we sit */
-            if (cue->text[0]) {
+            if (out_start_us) *out_start_us = cue->start;
+            if (out_end_us) *out_end_us = cue->end;
+            if (cue->text[0]) {                      /* empty text = a clear cue */
                 n = (int)strlen(cue->text);
                 if (n >= buf_size) n = buf_size - 1;
                 memcpy(buf, cue->text, (size_t)n);
-                if (out_start_us) *out_start_us = cue->start;
-                if (out_end_us) *out_end_us = cue->end;
             }
             break;
         }
