@@ -114,6 +114,9 @@ internal static class BasisNativeMedia
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
     private static extern int basis_media_seek_back_us(IntPtr engine, long backUs);
 
+    [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
+    private static extern int basis_media_poll_caption(IntPtr engine, byte[] buf, int bufSize, out long startUs, out long endUs);
+
     // ---- Managed wrappers (translate the flat ABI into friendlier types) ----
 
     public static IntPtr Open(string url)
@@ -320,6 +323,18 @@ internal static class BasisNativeMedia
         if (e == IntPtr.Zero) return false;
         try { return basis_media_seek_back_us(e, backUs) == 0; }
         catch (EntryPointNotFoundException) { return false; }
+    }
+
+    // Polls the in-band caption cue active at the current presentation position into
+    // a caller-owned buffer (avoids per-frame allocation on the poll path). Returns
+    // the number of UTF-8 bytes written (0 = no active cue), or -1 when the engine is
+    // gone or the native lib predates captions (older build without the export).
+    public static int PollCaption(IntPtr e, byte[] buf, out long startUs, out long endUs)
+    {
+        startUs = 0; endUs = 0;
+        if (e == IntPtr.Zero || buf == null || buf.Length == 0) return -1;
+        try { return basis_media_poll_caption(e, buf, buf.Length, out startUs, out endUs); }
+        catch (EntryPointNotFoundException) { return -1; }
     }
 
     private static string ReadCString(byte[] buf)

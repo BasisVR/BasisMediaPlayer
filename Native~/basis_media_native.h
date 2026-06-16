@@ -112,6 +112,14 @@ BASIS_API int BASIS_CALL basis_media_get_video_size(basis_media_engine_t* engine
  * microseconds from stream start. -1 if unknown. */
 BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* engine);
 
+/* Copies the in-band caption cue (CEA-608 CC1) active at the current presentation
+ * position into buf (UTF-8, NUL-terminated). Returns bytes written (0 = no active
+ * cue), or -1 on bad args. out_start_us/out_end_us receive the active cue's time
+ * range in microseconds (may be NULL). Poll once per frame from the main thread;
+ * the text changes only when the displayed caption does. */
+BASIS_API int BASIS_CALL basis_media_poll_caption(basis_media_engine_t* engine, char* buf, int buf_size,
+                                                  int64_t* out_start_us, int64_t* out_end_us);
+
 /* Copies the latest error message (UTF-8, NUL-terminated) into buf. Returns the
  * number of bytes written (excluding NUL), or 0 if there is no error. */
 BASIS_API int BASIS_CALL basis_media_get_last_error(basis_media_engine_t* engine, char* buf, int buf_size);

@@ -76,6 +76,7 @@ set(CORE_SOURCES
     protocol/basis_mp4.c
     protocol/basis_hls.c
     protocol/basis_rist.c
+    protocol/basis_caption.c
 )
 
 # ---------------------------------------------------------------------------
