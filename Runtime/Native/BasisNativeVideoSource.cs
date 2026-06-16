@@ -155,7 +155,11 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
         readyFired = eosRaised = errorRaised = false;
         lastFrameCounter = 0;
         lastTexturePtr = IntPtr.Zero;
-        lastCaptionLen = 0; // re-arm so the first cue of the new stream fires
+        // Re-arm caption polling for the new native handle: clear the dedup state so
+        // the first cue fires, and retry support in case a prior handle lacked it.
+        captionsSupported = true;
+        lastCaptionLen = 0;
+        lastCaptionBytes = Array.Empty<byte>();
     }
 
     // Selects the jitter buffer length and mode. Applied live if running, and

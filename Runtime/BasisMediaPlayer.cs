@@ -536,6 +536,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         if (nativeEngine != null)
         {
             nativeEngine.Stop();
+            ClearCaptionDisplay();
             runtimeIsPlaying = false;
             runtimeIsPaused = false;
             restartScheduled = false;
@@ -792,6 +793,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         catch (Exception ex) { BasisDebug.LogError($"BasisMediaPlayer native engine dispose failed: {ex.Message}", BasisDebug.LogTag.Video); }
         nativeEngine = null;
         lastEngineTexture = null;
+        ClearCaptionDisplay();
     }
 
     private void AttachRenderer()
@@ -922,6 +924,15 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private void HandleCaptionCueChanged(BasisCaptionCue cue)
     {
         pendingCaptionCue = cue;
+    }
+
+    // Drops any caption currently on screen. The engine only emits a clear cue when
+    // a stream actively clears one, so stopping or swapping while a caption is visible
+    // would otherwise leave the old text up until the next stream pushes its own cue.
+    private void ClearCaptionDisplay()
+    {
+        pendingCaptionCue = null;
+        OnCaptionCueChanged?.Invoke(new BasisCaptionCue(null, 0, 0));
     }
 
     private void HandleOutputTextureChanged(Texture texture)
