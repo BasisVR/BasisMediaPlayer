@@ -23,6 +23,7 @@
 #include "protocol/basis_http.h"
 #include "protocol/basis_hls.h"
 #include "protocol/basis_rist.h"
+#include "protocol/basis_caption.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -159,6 +160,12 @@ struct basis_media_engine {
     int64_t pace_wall0_us;
     int64_t pace_base_pts;
 
+    /* In-band CEA-608 caption extraction. video_hevc selects the SEI NAL layout,
+     * set from the video format; the context owns the 608 decoder + cue store and
+     * is scanned per AU on the demux thread, polled from the main thread. */
+    basis_caption_ctx_t* captions;
+    int video_hevc;
+
     /* diagnostics (demux thread writes, main thread reads; minor races OK) */
     volatile long video_au_count;
     volatile long audio_frame_count;
@@ -235,6 +242,7 @@ static void pace_gate(basis_media_engine_t* e, int64_t pts_us) {
  * internally concurrent-safe. */
 static void sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
+    e->video_hevc = (codec == BASIS_CODEC_H265);
     mutex_lock(&e->submit_lock);
     basis_decoder_set_video_format(e->decoder, codec, ed, ed_len, w, h);
     mutex_unlock(&e->submit_lock);
@@ -248,6 +256,9 @@ static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, i
     mutex_lock(&e->submit_lock);
     basis_decoder_submit_video(e->decoder, au, len, pts, key);
     mutex_unlock(&e->submit_lock);
+    /* Extract in-band captions from the same Annex B AU. Independent of the
+     * decoder, so outside submit_lock; the caption context locks its own store. */
+    basis_caption_scan_au(e->captions, au, len, e->video_hevc, pts);
     /* CONNECTING/BUFFERING -> PLAYING once the OS decoder is actually producing
      * frames (a few buffered), so the state doesn't sit at Buffering forever. */
     if ((e->state == BASIS_MEDIA_STATE_CONNECTING || e->state == BASIS_MEDIA_STATE_BUFFERING) &&
@@ -861,11 +872,15 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
     mutex_init(&e->submit_lock);
     e->state = BASIS_MEDIA_STATE_IDLE;
 
+    /* Optional: a NULL context just means captions are unavailable (scan/poll no-op). */
+    e->captions = basis_caption_create();
+
     basis_io_global_init();
 
     e->decoder = basis_decoder_create(e);
     if (!e->decoder) {
         basis_io_global_shutdown();
+        basis_caption_destroy(e->captions);
         mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
@@ -880,6 +895,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
         e->running = 0;
         basis_decoder_destroy(e->decoder);
         basis_io_global_shutdown();
+        basis_caption_destroy(e->captions);
         mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
@@ -894,6 +910,7 @@ static basis_media_engine_t* open_impl(const char* url, const char* audio_url, i
         thread_join(e);
         basis_decoder_destroy(e->decoder);
         basis_io_global_shutdown();
+        basis_caption_destroy(e->captions);
         mutex_destroy(&e->submit_lock);
         mutex_destroy(&e->lock);
         free(e);
@@ -933,6 +950,7 @@ BASIS_API void BASIS_CALL basis_media_close(basis_media_engine_t* e) {
         e->decoder = NULL;
     }
 
+    basis_caption_destroy(e->captions);
     basis_io_global_shutdown();
     mutex_destroy(&e->submit_lock);
     mutex_destroy(&e->lock);
@@ -973,6 +991,13 @@ BASIS_API int BASIS_CALL basis_media_get_video_size(basis_media_engine_t* e, int
 BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* e) {
     if (!e || !e->decoder) return -1;
     return basis_decoder_get_position_us(e->decoder);
+}
+
+BASIS_API int BASIS_CALL basis_media_poll_caption(basis_media_engine_t* e, char* buf, int buf_size,
+                                                  int64_t* out_start_us, int64_t* out_end_us) {
+    if (!e || !buf || buf_size <= 0) return -1;
+    int64_t pos = e->decoder ? basis_decoder_get_position_us(e->decoder) : -1;
+    return basis_caption_poll(e->captions, pos, buf, buf_size, out_start_us, out_end_us);
 }
 
 BASIS_API int BASIS_CALL basis_media_get_last_error(basis_media_engine_t* e, char* buf, int buf_size) {

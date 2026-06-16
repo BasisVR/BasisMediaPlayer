@@ -83,6 +83,14 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     [Tooltip("Playback rate multiplier. 1.0 = real-time. Source backends that don't support rate changes ignore this.")]
     [Range(0.25f, 4f)] public float PlaybackRate = 1f;
 
+    [Header("Captions")]
+    [Tooltip("Show in-band closed captions (CEA-608) when the stream carries them. Client-side only — does not affect playback or sync. A BasisMediaCaptionOverlay (or your own UI) draws the cues; this toggles their visibility.")]
+    [SerializeField] private bool captionsEnabled = false;
+    [Tooltip("Caption text opacity (0..1). Client-side; applied by the caption overlay.")]
+    [Range(0f, 1f)] [SerializeField] private float captionTextOpacity = 1f;
+    [Tooltip("Caption background opacity (0..1). Client-side; applied by the caption overlay.")]
+    [Range(0f, 1f)] [SerializeField] private float captionBackgroundOpacity = 0.5f;
+
     [Header("Sleep Timer")]
     [Tooltip("If > 0, the player calls Stop() automatically this many seconds after Play. 0 disables. Useful for fall-asleep-to-the-stream rooms.")]
     [Min(0f)] public float StopAfterSeconds = 0f;
@@ -128,11 +136,61 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public event Action<BasisBitrateTrack> OnBitrateTrackChanged;
     public event Action<BasisAudioTrack> OnAudioTrackChanged;
 
+    // The active in-band caption cue changed (CEA-608 CC1). Cue.Text is null when
+    // the caption clears. Raised even while CaptionsEnabled is false so a display
+    // can stay primed; honour CaptionsEnabled for visibility.
+    public event Action<BasisCaptionCue> OnCaptionCueChanged;
+
+    // CaptionsEnabled toggled. Client-side only — does not affect playback or sync.
+    public event Action<bool> OnCaptionsEnabledChanged;
+
+    // Caption styling (text/background opacity) changed. Client-side only.
+    public event Action OnCaptionStyleChanged;
+
     // Diagnostic event; not in the public lifecycle list but kept for tooling
     // that wants per-frame callbacks.
     public event Action<BasisVideoFrame> OnFramePresented;
 
     public BasisAVSyncClock Clock { get; } = new BasisAVSyncClock();
+
+    // Whether closed captions should be shown. Client-side preference; raises
+    // OnCaptionsEnabledChanged so a caption overlay can show/hide immediately.
+    public bool CaptionsEnabled
+    {
+        get => captionsEnabled;
+        set
+        {
+            if (captionsEnabled == value) return;
+            captionsEnabled = value;
+            OnCaptionsEnabledChanged?.Invoke(value);
+        }
+    }
+
+    // Caption text opacity, 0..1. Client-side; raises OnCaptionStyleChanged.
+    public float CaptionTextOpacity
+    {
+        get => captionTextOpacity;
+        set
+        {
+            value = Mathf.Clamp01(value);
+            if (captionTextOpacity == value) return;
+            captionTextOpacity = value;
+            OnCaptionStyleChanged?.Invoke();
+        }
+    }
+
+    // Caption background opacity, 0..1. Client-side; raises OnCaptionStyleChanged.
+    public float CaptionBackgroundOpacity
+    {
+        get => captionBackgroundOpacity;
+        set
+        {
+            value = Mathf.Clamp01(value);
+            if (captionBackgroundOpacity == value) return;
+            captionBackgroundOpacity = value;
+            OnCaptionStyleChanged?.Invoke();
+        }
+    }
 
     public IBasisFrameRenderer Renderer
     {
@@ -331,6 +389,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private long pendingSeekCompletedUs = long.MinValue;
     private BasisBitrateTrack pendingBitrateTrack;
     private BasisAudioTrack pendingAudioTrack;
+    private BasisCaptionCue? pendingCaptionCue;
     private Exception pendingError;
     private bool firstFrameEmittedThisPlay;
     private bool audioRateMismatchReported;
@@ -541,6 +600,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         if (nativeEngine != null)
         {
             nativeEngine.Stop();
+            ClearCaptionDisplay();
             runtimeIsPlaying = false;
             runtimeIsPaused = false;
             restartScheduled = false;
@@ -769,6 +829,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             nativeEngine.OnError += HandleError;
             nativeEngine.OnBitrateTrackChanged += HandleBitrateTrackChanged;
             nativeEngine.OnAudioTrackChanged += HandleAudioTrackChanged;
+            nativeEngine.OnCaptionCueChanged += HandleCaptionCueChanged;
         }
         RouteNativePcmSource(nativeEngine);
         if (nativeEngine != null) nativeEngine.SetBuffer(BufferMode, ResolvedBufferMilliseconds());
@@ -789,12 +850,14 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         nativeEngine.OnError -= HandleError;
         nativeEngine.OnBitrateTrackChanged -= HandleBitrateTrackChanged;
         nativeEngine.OnAudioTrackChanged -= HandleAudioTrackChanged;
+        nativeEngine.OnCaptionCueChanged -= HandleCaptionCueChanged;
         if (audioComponent != null && ReferenceEquals(audioComponent.NativePcmSource, nativeEngine))
             audioComponent.NativePcmSource = null;
         try { nativeEngine.Dispose(); }
         catch (Exception ex) { BasisDebug.LogError($"BasisMediaPlayer native engine dispose failed: {ex.Message}", BasisDebug.LogTag.Video); }
         nativeEngine = null;
         lastEngineTexture = null;
+        ClearCaptionDisplay();
     }
 
     private void AttachRenderer()
@@ -818,6 +881,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         loopEventPending = false;
         pendingSeekCompletedUs = long.MinValue;
         pendingBitrateTrack = null;
+        pendingAudioTrack = null;
+        pendingCaptionCue = null;
         pendingError = null;
         LastErrorMessage = null;
         pendingVideoSize = 0;
@@ -920,6 +985,20 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private void HandleAudioTrackChanged(BasisAudioTrack track)
     {
         pendingAudioTrack = track;
+    }
+
+    private void HandleCaptionCueChanged(BasisCaptionCue cue)
+    {
+        pendingCaptionCue = cue;
+    }
+
+    // Drops any caption currently on screen. The engine only emits a clear cue when
+    // a stream actively clears one, so stopping or swapping while a caption is visible
+    // would otherwise leave the old text up until the next stream pushes its own cue.
+    private void ClearCaptionDisplay()
+    {
+        pendingCaptionCue = null;
+        OnCaptionCueChanged?.Invoke(new BasisCaptionCue(null, 0, 0));
     }
 
     private void HandleOutputTextureChanged(Texture texture)
@@ -1157,6 +1236,13 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             var track = pendingAudioTrack;
             pendingAudioTrack = null;
             OnAudioTrackChanged?.Invoke(track);
+        }
+
+        if (pendingCaptionCue.HasValue)
+        {
+            var cue = pendingCaptionCue.Value;
+            pendingCaptionCue = null;
+            OnCaptionCueChanged?.Invoke(cue);
         }
 
         if (sourceEndOfStreamPending)
