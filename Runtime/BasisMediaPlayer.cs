@@ -561,6 +561,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             restartScheduled = false;
             pendingRestartTimer = 0f;
             firstFrameEmittedThisPlay = false;
+            pendingCaptionCue = null;
             if (!nativeEngine.IsRunning) nativeEngine.Start();
             else nativeEngine.Play();
             runtimeIsPlaying = nativeEngine.IsRunning;
