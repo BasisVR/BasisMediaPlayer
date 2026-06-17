@@ -1135,25 +1135,18 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
         if (nativeEngine.TryGetPcmFormat(out int sr, out int ch) && sr > 0 && ch > 0)
         {
-            // The streaming AudioClip is consumed at the output device rate
-            // regardless of its declared frequency, so a source whose rate differs
-            // plays sharp/flat and over-drains its buffer. Guard it: on a mismatch
-            // leave the audio path unbuilt (silent) and surface why, so the stream
-            // is muted cleanly rather than played wrong. Video is unaffected.
+            // The streaming clip is created at the source rate (BasisMediaPlayerAudio.Rebuild),
+            // so the AudioSource resamples it to the output rate — a rate mismatch is noted
+            // once but still builds the audio path rather than muting. Video is unaffected.
             int outputRate = AudioSettings.outputSampleRate;
-            if (sr != outputRate)
+            if (sr != outputRate && !audioRateMismatchReported)
             {
-                if (!audioRateMismatchReported)
-                {
-                    audioRateMismatchReported = true;
-                    HandleError(new Exception(
-                        $"Audio muted: source sample rate {sr} Hz does not match the audio output rate {outputRate} Hz. Re-encode the audio to {outputRate} Hz."));
-                }
+                audioRateMismatchReported = true;
+                BasisDebug.LogWarning(
+                    $"Audio source rate {sr} Hz differs from output {outputRate} Hz; relying on AudioSource resampling.",
+                    BasisDebug.LogTag.Video);
             }
-            else
-            {
-                audioComponent?.SetExpectedFormat(sr, ch);
-            }
+            audioComponent?.SetExpectedFormat(sr, ch);
         }
 
         Texture tex = nativeEngine.OutputTexture;
