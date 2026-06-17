@@ -1,40 +1,104 @@
 using System;
+using System.Collections.Generic;
 
 /// <summary>
-/// Optional URL-resolution seam between the player and a higher-level resolver
-/// (e.g. the yt-dlp integration package). The player core has no reference to any
-/// integration, so this is how a URL field can steer page URLs through a resolver
-/// without the player depending on it.
+/// A URL resolver registered with <see cref="BasisMediaUrlRouter"/>. Several resolvers
+/// can be registered at once; the router tries them in descending <see cref="Priority"/>
+/// order (registration order breaks ties) until one takes ownership of the load. A
+/// resolver that declines lets the router fall through to the next one, and finally to a
+/// direct load. Resolvers route only — they never gate host trust (that's
+/// BasisMediaPlayerSecurity).
+/// </summary>
+public interface IBasisVideoResolver
+{
+    /// <summary>Higher runs first; equal priorities run in the order they registered.</summary>
+    int Priority { get; }
+
+    /// <summary>
+    /// Cheap, side-effect-free test of whether this resolver handles <paramref name="url"/>.
+    /// Returning false skips straight to the next resolver. Must not block or load.
+    /// </summary>
+    bool CanResolve(string url);
+
+    /// <summary>
+    /// Takes ownership of loading <paramref name="url"/> into <paramref name="player"/>
+    /// — resolving a page URL to its stream(s) and loading them, possibly async — and
+    /// returns true; or returns false to let the router try the next resolver, then a
+    /// direct load.
+    /// </summary>
+    bool TryResolve(BasisMediaPlayer player, string url);
+}
+
+/// <summary>
+/// Optional URL-resolution seam between the player and higher-level resolvers (e.g. the
+/// yt-dlp integration package). The player core has no reference to any integration, so
+/// this is how a URL field can steer page URLs through a resolver without the player
+/// depending on it.
 ///
-/// An integration installs <see cref="Resolver"/> at load (e.g. via
-/// <c>RuntimeInitializeOnLoadMethod</c>). Callers with a raw URL hand it to
-/// <see cref="TryResolveAndLoad"/>: the resolver either takes ownership of the load
-/// (resolving a page URL to its stream(s) and loading them, possibly async) and
-/// returns true, or returns false to let the caller load the URL directly. When no
-/// integration is installed <see cref="Resolver"/> is null and every URL loads
-/// directly — identical to having no integration at all. This routes only; it never
-/// blocks a URL (host trust is enforced separately by BasisMediaPlayerSecurity).
+/// Integrations <see cref="Register"/> an <see cref="IBasisVideoResolver"/> at load (e.g.
+/// via <c>RuntimeInitializeOnLoadMethod</c>). Callers with a raw URL hand it to
+/// <see cref="TryResolveAndLoad"/>, which walks the registered resolvers in priority order
+/// until one takes ownership (returns true); if none do, the caller loads the URL directly.
+/// With nothing registered every URL loads directly — identical to having no integration at
+/// all. This routes only; it never blocks a URL (host trust is enforced separately by
+/// BasisMediaPlayerSecurity).
 /// </summary>
 public static class BasisMediaUrlRouter
 {
+    private static readonly List<IBasisVideoResolver> Resolvers = new List<IBasisVideoResolver>();
+    private static LegacyResolverAdapter legacy;
+
     /// <summary>
-    /// Installed by an optional integration. Returns true if it took ownership of the
-    /// load for the given URL, false to let the caller load it directly. Null when no
-    /// integration is present.
+    /// Back-compatible single-resolver slot. Assigning a non-null delegate registers it as a
+    /// priority-0 resolver; assigning null removes it. Prefer <see cref="Register"/> with an
+    /// <see cref="IBasisVideoResolver"/> for new integrations — this is kept so existing
+    /// callers that set a delegate keep working.
     /// </summary>
-    public static Func<BasisMediaPlayer, string, bool> Resolver;
+    public static Func<BasisMediaPlayer, string, bool> Resolver
+    {
+        get => legacy?.Func;
+        set
+        {
+            if (legacy != null) { Unregister(legacy); legacy = null; }
+            if (value != null) { legacy = new LegacyResolverAdapter(value); Register(legacy); }
+        }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="resolver"/> so <see cref="TryResolveAndLoad"/> consults it,
+    /// keeping the list ordered by descending <see cref="IBasisVideoResolver.Priority"/>
+    /// (registration order breaks ties). Registering the same instance twice is a no-op.
+    /// </summary>
+    public static void Register(IBasisVideoResolver resolver)
+    {
+        if (resolver == null) throw new ArgumentNullException(nameof(resolver));
+        if (Resolvers.Contains(resolver)) return;
+        int i = 0;
+        while (i < Resolvers.Count && Resolvers[i].Priority >= resolver.Priority) i++;
+        Resolvers.Insert(i, resolver);
+    }
+
+    /// <summary>Removes a resolver registered via <see cref="Register"/>. Returns false if it wasn't registered.</summary>
+    public static bool Unregister(IBasisVideoResolver resolver) => Resolvers.Remove(resolver);
 
     // Delimiters that end the path portion of a URL (query / fragment), hoisted so
     // IsDirectlyPlayable doesn't allocate a char[] per call.
     private static readonly char[] PathEnd = { '?', '#' };
 
     /// <summary>
-    /// Routes <paramref name="url"/> through the installed resolver, if any. Returns
-    /// true when the resolver took ownership (the caller should not also load); false
-    /// when there is no resolver or it declined (the caller loads directly).
+    /// Routes <paramref name="url"/> through the registered resolvers in priority order.
+    /// Returns true as soon as one takes ownership (the caller should not also load); false
+    /// when none handle it (the caller loads directly).
     /// </summary>
     public static bool TryResolveAndLoad(BasisMediaPlayer player, string url)
-        => Resolver != null && Resolver(player, url);
+    {
+        for (int i = 0; i < Resolvers.Count; i++)
+        {
+            IBasisVideoResolver resolver = Resolvers[i];
+            if (resolver.CanResolve(url) && resolver.TryResolve(player, url)) return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// True if the player can open <paramref name="url"/> directly, without a resolver:
@@ -66,5 +130,34 @@ public static class BasisMediaUrlRouter
             || path.EndsWith(".m2ts", StringComparison.OrdinalIgnoreCase)   // Blu-ray-flavour MPEG-TS
             || path.EndsWith(".mts", StringComparison.OrdinalIgnoreCase)    // AVCHD-flavour MPEG-TS
             || path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Guarantees <paramref name="url"/> carries a scheme so it can route and load as an
+    /// absolute URL. A bare web URL with no scheme (e.g. "www.youtube.com/watch?v=…") gets
+    /// "https://" prepended; anything that already has a scheme (http(s)/rtsp/rtmp/rist/file/…)
+    /// or is a local path (leading slash, UNC, or a drive letter like C:\) is returned trimmed
+    /// but otherwise unchanged. Null/whitespace passes through untouched.
+    /// </summary>
+    public static string NormalizeUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return url;
+        string trimmed = url.Trim();
+        if (trimmed.Contains("://")) return trimmed;                   // already has a scheme
+        if (trimmed[0] == '/' || trimmed[0] == '\\') return trimmed;   // unix / UNC / rooted path
+        if (trimmed.Length >= 2 && trimmed[1] == ':') return trimmed;  // windows drive path (C:\, C:/)
+        return "https://" + trimmed;
+    }
+
+    // Adapts a legacy Resolver delegate to IBasisVideoResolver. The delegate self-selects
+    // (returns false to decline), so CanResolve is always true and the decision happens in
+    // TryResolve — preserving the original single-slot semantics.
+    private sealed class LegacyResolverAdapter : IBasisVideoResolver
+    {
+        internal readonly Func<BasisMediaPlayer, string, bool> Func;
+        public LegacyResolverAdapter(Func<BasisMediaPlayer, string, bool> func) => Func = func;
+        public int Priority => 0;
+        public bool CanResolve(string url) => true;
+        public bool TryResolve(BasisMediaPlayer player, string url) => Func(player, url);
     }
 }
