@@ -96,8 +96,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     [Min(0f)] public float StopAfterSeconds = 0f;
 
     [Header("Capture")]
-    [Tooltip("CaptureScreenshot flips rows before encoding to PNG. Native GPU textures (D3D11/12) read back top-left origin and need flipping to be right-way-up on disk; toggle if your platform already reads bottom-left origin.")]
-    public bool FlipVerticallyForScreenshot = true;
+    [Tooltip("CaptureScreenshot flips rows before encoding to PNG. The native decoder emits a bottom-left origin frame, so the readback is already top-down for PNG and this defaults OFF; toggle if your platform reads back the other way.")]
+    public bool FlipVerticallyForScreenshot = false;
 
     [Header("DVR")]
     [Tooltip("If true and the source is live, BufferMilliseconds is forced up to DvrWindowSeconds*1000 (capped at 60s) so the engine holds a rolling rewind window. Has no effect on seekable sources, which already support Seek to any position.")]
