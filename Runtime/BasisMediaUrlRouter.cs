@@ -42,6 +42,11 @@ public interface IBasisVideoResolver
 /// With nothing registered every URL loads directly — identical to having no integration at
 /// all. This routes only; it never blocks a URL (host trust is enforced separately by
 /// BasisMediaPlayerSecurity).
+///
+/// Not thread-safe. Register, Unregister and TryResolveAndLoad must all run on Unity's main
+/// thread — the resolver list is unsynchronised, so registering while a resolve is iterating
+/// would corrupt it. Integrations register from <c>RuntimeInitializeOnLoadMethod</c> and the
+/// player resolves from its load path, both main-thread, so this holds in practice.
 /// </summary>
 public static class BasisMediaUrlRouter
 {

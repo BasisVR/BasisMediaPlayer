@@ -426,7 +426,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     // already-resolved or direct sources, e.g. the resolver's own output).
     public void LoadUrl(string url)
     {
-        if (string.IsNullOrEmpty(url))
+        if (string.IsNullOrWhiteSpace(url))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
             return;
@@ -456,7 +456,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     // streaming-assets-relative path and calls LoadSource.
     public void LoadLocalPath(string path)
     {
-        if (string.IsNullOrEmpty(path))
+        if (string.IsNullOrWhiteSpace(path))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadLocalPath called with empty path.", BasisDebug.LogTag.Video);
             return;

@@ -193,7 +193,7 @@ namespace Basis.BasisUI.MediaPlayer
             {
                 if (_activePlayer == null || _urlField == null) return;
                 string u = _urlField.Value;
-                if (string.IsNullOrEmpty(u)) return;
+                if (string.IsNullOrWhiteSpace(u)) return;
                 // Reflect the scheme we add back into the field so a bare "youtube.com/…"
                 // visibly becomes "https://youtube.com/…" rather than being silently rewritten.
                 string normalized = BasisMediaUrlRouter.NormalizeUrl(u);
