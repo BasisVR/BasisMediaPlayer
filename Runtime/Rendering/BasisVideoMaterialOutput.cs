@@ -38,8 +38,8 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
     [Tooltip("If true, the placeholder is rebound whenever the player raises OnEnded.")]
     public bool RestorePlaceholderOnEnded = true;
 
-    [Tooltip("Flip the video vertically. Native GPU textures (D3D11/D3D12) are top-left origin and come in upside-down for Unity sampling, so this defaults ON. Toggle if your content/platform is already the right way up.")]
-    public bool FlipVertically = true;
+    [Tooltip("Flip the video vertically. The native decoder already emits a Unity-correct (bottom-left origin) frame, so this defaults OFF. Toggle only if your content/platform arrives upside-down.")]
+    public bool FlipVertically = false;
 
     [Tooltip("Flip the video horizontally. Use when the screen mesh's UV winding presents the video mirrored to the viewer.")]
     public bool FlipHorizontally = false;

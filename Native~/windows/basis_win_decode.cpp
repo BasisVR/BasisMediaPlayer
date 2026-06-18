@@ -438,6 +438,15 @@ static void video_process_to_shared(basis_decoder* d, ID3D11Texture2D* nv12, UIN
         cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
         if (FAILED(d->vdevice->CreateVideoProcessorEnumerator(&cd, &d->vprocEnum))) return;
         if (FAILED(d->vdevice->CreateVideoProcessor(d->vprocEnum, 0, &d->vproc))) return;
+        /* Output bottom-left origin so Unity samples the frame right-way-up
+         * directly — no UV flip on the consumer material. The blit already runs;
+         * the mirror is free. VideoProcessorSetStreamMirror lives on
+         * ID3D11VideoContext1 (D3D11.1+), so query it from the base context. */
+        ID3D11VideoContext1* vctx1 = nullptr;
+        if (SUCCEEDED(d->vcontext->QueryInterface(__uuidof(ID3D11VideoContext1), (void**)&vctx1)) && vctx1) {
+            vctx1->VideoProcessorSetStreamMirror(d->vproc, 0, TRUE, FALSE, TRUE);
+            vctx1->Release();
+        }
     }
 
     int slot = (int)(d->writeSeq % basis_decoder::RING);

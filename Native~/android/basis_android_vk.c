@@ -504,7 +504,10 @@ int basis_vk_render_update(basis_vk_present* v) {
     rp.renderArea.extent.width = (uint32_t)rw; rp.renderArea.extent.height = (uint32_t)rh;
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport vpr = { 0.0f, 0.0f, (float)rw, (float)rh, 0.0f, 1.0f };
+    /* Negative-height viewport flips the resolve vertically so the Unity RT comes
+     * out right-way-up (no UV flip on the consumer material). Core in Vulkan 1.1,
+     * the Quest baseline; harmless to winding since the pipeline culls nothing. */
+    VkViewport vpr = { 0.0f, (float)rh, (float)rw, -(float)rh, 0.0f, 1.0f };
     VkRect2D sc = { {0,0}, { (uint32_t)rw, (uint32_t)rh } };
     vkCmdSetViewport(cmd, 0, 1, &vpr);
     vkCmdSetScissor(cmd, 0, 1, &sc);
