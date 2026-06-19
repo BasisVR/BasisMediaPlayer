@@ -40,12 +40,13 @@ public static class BasisVideoScreenMeshGenerator
             new Vector3(-hw,  hh, 0f),
             new Vector3( hw,  hh, 0f),
         };
+        // UVs map +X to U=1 so the texture reads left-to-right despite the negated X.
         mesh.uv = new[]
         {
-            new Vector2(0f, 0f),
             new Vector2(1f, 0f),
-            new Vector2(1f, 1f),
+            new Vector2(0f, 0f),
             new Vector2(0f, 1f),
+            new Vector2(1f, 1f),
         };
         mesh.normals = new[]
         {
