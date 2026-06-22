@@ -548,8 +548,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         if (media == null) return;
         Loop = media.Loop;
         PlaybackRate = media.PlaybackRate;
-        Volume = media.Volume;
-        Mute = media.Mute;
+        if (media.Volume.HasValue) Volume = media.Volume.Value;
+        if (media.Mute.HasValue) Mute = media.Mute.Value;
         ApplyAudioSettingsToComponent();
     }
 

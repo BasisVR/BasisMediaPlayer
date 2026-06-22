@@ -61,11 +61,11 @@ public sealed class BasisMediaSource
     // Initial playback rate (1.0 = real-time). Mirrors BasisMediaPlayer.PlaybackRate.
     public float PlaybackRate = 1f;
 
-    // Initial volume (0..1). Mirrors BasisMediaPlayer.Volume.
-    public float Volume = 1f;
+    // Optional volume override (0..1); null keeps the player's current volume.
+    public float? Volume;
 
-    // Initial mute state. Mirrors BasisMediaPlayer.Mute.
-    public bool Mute;
+    // Optional mute override; null keeps the player's current mute state.
+    public bool? Mute;
 
     // If set, the player will Seek to this position once OnReady fires.
     // Use TimeSpan.Zero to start at the beginning explicitly.
