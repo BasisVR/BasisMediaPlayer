@@ -988,6 +988,11 @@ BASIS_API int BASIS_CALL basis_media_get_video_size(basis_media_engine_t* e, int
     return basis_decoder_get_video_size(e->decoder, w, h);
 }
 
+BASIS_API int BASIS_CALL basis_media_get_frame_origin(basis_media_engine_t* e) {
+    if (!e || !e->decoder) return 0; /* upright until a backend says otherwise */
+    return basis_decoder_get_frame_origin(e->decoder);
+}
+
 BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* e) {
     if (!e || !e->decoder) return -1;
     return basis_decoder_get_position_us(e->decoder);

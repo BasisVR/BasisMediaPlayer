@@ -32,6 +32,7 @@ public class BasisVideoMaterialOutputInspector : Editor
         BindByName("MaterialIndexField", "MaterialIndex");
         BindByName("TexturePropertyField", "TexturePropertyName");
         BindByName("UseSharedMaterialField", "UseSharedMaterial");
+        BindByName("AdditionalTargetsField", "AdditionalTargets");
         BindByName("PlaceholderField", "PlaceholderTexture");
         BindByName("RestoreOnEndedField", "RestorePlaceholderOnEnded");
         BindByName("FlipVerticallyField", "FlipVertically");

@@ -1,22 +1,45 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 // Renderer/material sink for BasisMediaPlayer. Subscribes to the player's
-// OnOutputTextureChanged and binds the current OutputTexture to a target
-// Renderer's material property.
+// OnOutputTextureChanged and binds the current OutputTexture to one or more
+// target Renderer material properties. The primary TargetRenderer/MaterialIndex
+// plus every entry in AdditionalTargets are all driven from the same output, so
+// one player can feed several screens or materials at once.
 //
-// Two binding strategies:
-//   * UseSharedMaterial = false (default): assigns to TargetRenderer.material,
+// Two binding strategies (applied to every target):
+//   * UseSharedMaterial = false (default): assigns to Renderer.materials,
 //     which clones the shared material the first time it's accessed. Safe for
 //     per-instance video; avoids stomping other renderers sharing the asset.
-//   * UseSharedMaterial = true: assigns to TargetRenderer.sharedMaterial,
+//   * UseSharedMaterial = true: assigns to Renderer.sharedMaterials,
 //     mutating the project asset. Use only when you intend every renderer
 //     sharing this material to receive the same video texture.
 //
-// On disable, the original texture is restored so editor scenes don't end up
-// with the runtime video texture baked into the material.
+// On disable, the original texture is restored on each target so editor scenes
+// don't end up with the runtime video texture baked into the material.
 [DisallowMultipleComponent]
 public sealed class BasisVideoMaterialOutput : MonoBehaviour
 {
+    [System.Serializable]
+    public sealed class MaterialTarget
+    {
+        [Tooltip("Renderer whose material receives the OutputTexture.")]
+        public Renderer Renderer;
+
+        [Tooltip("Index into Renderer.materials for multi-material renderers. 0 by default.")]
+        [Min(0)] public int MaterialIndex = 0;
+
+        [Tooltip("Shader texture property to bind. Leave empty to inherit the component-level Texture Property Name.")]
+        public string TexturePropertyName = "";
+
+        [System.NonSerialized] public Texture OriginalTexture;
+        [System.NonSerialized] public Vector2 OriginalScale;
+        [System.NonSerialized] public Vector2 OriginalOffset;
+        [System.NonSerialized] public bool Captured;
+        [System.NonSerialized] public int PropertyId;
+        [System.NonSerialized] public string ActiveKeyword;
+    }
+
     [Tooltip("Player to subscribe to. If unassigned, GetComponentInParent<BasisMediaPlayer>() is used.")]
     public BasisMediaPlayer Player;
 
@@ -32,13 +55,16 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
     [Tooltip("If true, the renderer's sharedMaterial is mutated — every renderer using that material will see the video. Otherwise a per-instance copy is created via Renderer.material.")]
     public bool UseSharedMaterial = false;
 
+    [Tooltip("Extra renderers/materials driven by the same OutputTexture. Each entry may override the Texture Property Name; leave it empty to inherit the one above. All entries share the projection/aspect/picture settings below.")]
+    public List<MaterialTarget> AdditionalTargets = new List<MaterialTarget>();
+
     [Tooltip("Optional fallback bound when the player has no output texture (before first frame, after Stop). Leave empty to leave the material's prior texture in place.")]
     public Texture PlaceholderTexture;
 
     [Tooltip("If true, the placeholder is rebound whenever the player raises OnEnded.")]
     public bool RestorePlaceholderOnEnded = true;
 
-    [Tooltip("Flip the video vertically. The native decoder already emits a Unity-correct (bottom-left origin) frame, so this defaults OFF. Toggle only if your content/platform arrives upside-down.")]
+    [Tooltip("Flip the video vertically. Per-GPU orientation differences are now corrected automatically (the backend reports its frame origin), so leave this OFF for normal content; enable it only if the source itself is encoded upside-down — which is consistent across all machines.")]
     public bool FlipVertically = false;
 
     [Tooltip("Flip the video horizontally. Use when the screen mesh's UV winding presents the video mirrored to the viewer.")]
@@ -68,13 +94,8 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
     private static readonly int PropSaturation = Shader.PropertyToID("_BasisSaturation");
     private static readonly int PropGamma = Shader.PropertyToID("_BasisGamma");
 
-    private Texture originalTexture;
-    private Vector2 originalScale = Vector2.one;
-    private Vector2 originalOffset = Vector2.zero;
-    private bool capturedOriginal;
-    private int propertyId;
+    private readonly List<MaterialTarget> activeTargets = new List<MaterialTarget>();
     private MaterialPropertyBlock mpb;
-    private string activeShaderKeyword;
 
     private void Reset()
     {
@@ -90,17 +111,15 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
             BasisDebug.LogWarning("BasisVideoMaterialOutput: no BasisMediaPlayer found in parents and Player field is empty.", BasisDebug.LogTag.Video);
             return;
         }
-        if (TargetRenderer == null)
+
+        RebuildActiveTargets();
+        if (activeTargets.Count == 0)
         {
-            BasisDebug.LogWarning("BasisVideoMaterialOutput: TargetRenderer is null; cannot bind output texture.", BasisDebug.LogTag.Video);
+            BasisDebug.LogWarning("BasisVideoMaterialOutput: no target renderers assigned; cannot bind output texture.", BasisDebug.LogTag.Video);
             return;
         }
 
-        propertyId = !string.IsNullOrEmpty(TexturePropertyName)
-            ? Shader.PropertyToID(TexturePropertyName)
-            : FallbackPropertyId;
-
-        CaptureOriginal();
+        for (int i = 0; i < activeTargets.Count; i++) CaptureOriginal(activeTargets[i]);
 
         Player.OnOutputTextureChanged += HandleTextureChanged;
         Player.OnEnded += HandleEnded;
@@ -115,66 +134,96 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
             Player.OnOutputTextureChanged -= HandleTextureChanged;
             Player.OnEnded -= HandleEnded;
         }
-        RestoreOriginal();
+        for (int i = 0; i < activeTargets.Count; i++) RestoreOriginal(activeTargets[i]);
+        activeTargets.Clear();
+    }
+
+    private void RebuildActiveTargets()
+    {
+        activeTargets.Clear();
+        int defaultPropertyId = !string.IsNullOrEmpty(TexturePropertyName)
+            ? Shader.PropertyToID(TexturePropertyName)
+            : FallbackPropertyId;
+
+        if (TargetRenderer != null)
+        {
+            activeTargets.Add(new MaterialTarget
+            {
+                Renderer = TargetRenderer,
+                MaterialIndex = MaterialIndex,
+                PropertyId = defaultPropertyId
+            });
+        }
+
+        if (AdditionalTargets != null)
+        {
+            for (int i = 0; i < AdditionalTargets.Count; i++)
+            {
+                var target = AdditionalTargets[i];
+                if (target == null || target.Renderer == null) continue;
+                target.PropertyId = !string.IsNullOrEmpty(target.TexturePropertyName)
+                    ? Shader.PropertyToID(target.TexturePropertyName)
+                    : defaultPropertyId;
+                activeTargets.Add(target);
+            }
+        }
     }
 
     private void HandleTextureChanged(Texture texture)
     {
-        if (TargetRenderer == null) return;
         if (texture == null) texture = PlaceholderTexture;
-        SetTexture(texture);
+        for (int i = 0; i < activeTargets.Count; i++) SetTexture(activeTargets[i], texture);
     }
 
     private void HandleEnded()
     {
-        if (!RestorePlaceholderOnEnded || TargetRenderer == null) return;
-        SetTexture(PlaceholderTexture);
+        if (!RestorePlaceholderOnEnded) return;
+        for (int i = 0; i < activeTargets.Count; i++) SetTexture(activeTargets[i], PlaceholderTexture);
     }
 
-    private void CaptureOriginal()
+    private void CaptureOriginal(MaterialTarget target)
     {
-        if (capturedOriginal) return;
-        var material = GetMaterial();
+        if (target.Captured) return;
+        var material = GetMaterial(target);
         if (material == null) return;
-        if (material.HasProperty(propertyId))
+        if (material.HasProperty(target.PropertyId))
         {
-            originalTexture = material.GetTexture(propertyId);
-            originalScale = material.GetTextureScale(propertyId);
-            originalOffset = material.GetTextureOffset(propertyId);
-            capturedOriginal = true;
+            target.OriginalTexture = material.GetTexture(target.PropertyId);
+            target.OriginalScale = material.GetTextureScale(target.PropertyId);
+            target.OriginalOffset = material.GetTextureOffset(target.PropertyId);
+            target.Captured = true;
         }
     }
 
-    private void RestoreOriginal()
+    private void RestoreOriginal(MaterialTarget target)
     {
-        if (!capturedOriginal || TargetRenderer == null) return;
-        var material = GetMaterial();
-        if (material == null) return;
-        if (material.HasProperty(propertyId))
+        if (!target.Captured) return;
+        var material = GetMaterial(target);
+        if (material != null && material.HasProperty(target.PropertyId))
         {
-            material.SetTexture(propertyId, originalTexture);
-            material.SetTextureScale(propertyId, originalScale);
-            material.SetTextureOffset(propertyId, originalOffset);
+            material.SetTexture(target.PropertyId, target.OriginalTexture);
+            material.SetTextureScale(target.PropertyId, target.OriginalScale);
+            material.SetTextureOffset(target.PropertyId, target.OriginalOffset);
         }
-        capturedOriginal = false;
-        originalTexture = null;
+        target.Captured = false;
+        target.OriginalTexture = null;
     }
 
-    private void SetTexture(Texture texture)
+    private void SetTexture(MaterialTarget target, Texture texture)
     {
-        var material = GetMaterial();
+        var material = GetMaterial(target);
         if (material == null) return;
-        if (!material.HasProperty(propertyId)) return;
+        if (!material.HasProperty(target.PropertyId)) return;
 
-        material.SetTexture(propertyId, texture);
+        material.SetTexture(target.PropertyId, texture);
 
         bool isLiveVideo = texture != null && texture != PlaceholderTexture;
         if (!isLiveVideo)
         {
-            material.SetTextureScale(propertyId, originalScale);
-            material.SetTextureOffset(propertyId, originalOffset);
-            ApplyShaderKeyword(material, null);
-            ClearPicture();
+            material.SetTextureScale(target.PropertyId, target.OriginalScale);
+            material.SetTextureOffset(target.PropertyId, target.OriginalOffset);
+            ApplyShaderKeyword(material, target, null);
+            ClearPicture(target);
             return;
         }
 
@@ -186,91 +235,96 @@ public sealed class BasisVideoMaterialOutput : MonoBehaviour
         if (ProjectionMode == BasisVideoProjectionMode.SideBySideLR || ProjectionMode == BasisVideoProjectionMode.SideBySideRL) vw /= 2;
         else if (ProjectionMode == BasisVideoProjectionMode.OverUnderTB || ProjectionMode == BasisVideoProjectionMode.OverUnderBT) vh /= 2;
 
-        float displayAspect = DisplayAspectOverride > 0f ? DisplayAspectOverride : EstimateRendererAspect();
+        float displayAspect = DisplayAspectOverride > 0f ? DisplayAspectOverride : EstimateRendererAspect(target.Renderer);
         BasisVideoOutputMath.GetAspectUv(AspectMode, vw, vh, displayAspect,
             out Vector2 aspScale, out Vector2 aspOffset);
 
         BasisVideoOutputMath.Compose(projScale, projOffset, aspScale, aspOffset,
             out Vector2 scale, out Vector2 offset);
 
-        scale.x *= originalScale.x;
-        scale.y *= originalScale.y;
-        offset.x = originalOffset.x + originalScale.x * offset.x;
-        offset.y = originalOffset.y + originalScale.y * offset.y;
+        scale.x *= target.OriginalScale.x;
+        scale.y *= target.OriginalScale.y;
+        offset.x = target.OriginalOffset.x + target.OriginalScale.x * offset.x;
+        offset.y = target.OriginalOffset.y + target.OriginalScale.y * offset.y;
 
-        if (FlipVertically && FlipHorizontally) BasisVideoOutputMath.ApplyBothFlip(ref scale, ref offset);
-        else if (FlipVertically) BasisVideoOutputMath.ApplyVerticalFlip(ref scale, ref offset);
+        // The backend may publish the frame upside-down on GPUs that can't
+        // normalize orientation natively (the Windows video-processor mirror is
+        // driver-optional); fold that per-client correction into the authored flip
+        // so one serialized FlipVertically value is correct on every machine.
+        bool flipV = FlipVertically ^ (Player != null && Player.OutputFrameIsTopLeftOrigin);
+        if (flipV && FlipHorizontally) BasisVideoOutputMath.ApplyBothFlip(ref scale, ref offset);
+        else if (flipV) BasisVideoOutputMath.ApplyVerticalFlip(ref scale, ref offset);
         else if (FlipHorizontally) BasisVideoOutputMath.ApplyHorizontalFlip(ref scale, ref offset);
 
-        material.SetTextureScale(propertyId, scale);
-        material.SetTextureOffset(propertyId, offset);
+        material.SetTextureScale(target.PropertyId, scale);
+        material.SetTextureOffset(target.PropertyId, offset);
 
-        ApplyShaderKeyword(material, keyword);
-        ApplyPicture();
+        ApplyShaderKeyword(material, target, keyword);
+        ApplyPicture(target);
     }
 
-    private float EstimateRendererAspect()
+    private float EstimateRendererAspect(Renderer renderer)
     {
-        if (TargetRenderer == null) return 1f;
-        var b = TargetRenderer.localBounds.size;
+        if (renderer == null) return 1f;
+        var b = renderer.localBounds.size;
         if (b.x > 0f && b.y > 0f) return b.x / b.y;
         return 1f;
     }
 
-    private void ApplyShaderKeyword(Material material, string keyword)
+    private void ApplyShaderKeyword(Material material, MaterialTarget target, string keyword)
     {
         if (material == null) return;
-        if (!string.IsNullOrEmpty(activeShaderKeyword) && activeShaderKeyword != keyword)
+        if (!string.IsNullOrEmpty(target.ActiveKeyword) && target.ActiveKeyword != keyword)
         {
-            material.DisableKeyword(activeShaderKeyword);
+            material.DisableKeyword(target.ActiveKeyword);
         }
-        activeShaderKeyword = keyword;
+        target.ActiveKeyword = keyword;
         if (!string.IsNullOrEmpty(keyword)) material.EnableKeyword(keyword);
     }
 
-    private void ApplyPicture()
+    private void ApplyPicture(MaterialTarget target)
     {
-        if (TargetRenderer == null) return;
+        if (target.Renderer == null) return;
         mpb ??= new MaterialPropertyBlock();
-        TargetRenderer.GetPropertyBlock(mpb, MaterialIndex);
+        target.Renderer.GetPropertyBlock(mpb, target.MaterialIndex);
         mpb.SetFloat(PropBrightness, Picture.Brightness);
         mpb.SetFloat(PropContrast, Picture.Contrast);
         mpb.SetFloat(PropSaturation, Picture.Saturation);
         mpb.SetFloat(PropGamma, Picture.Gamma <= 0f ? 1f : Picture.Gamma);
-        TargetRenderer.SetPropertyBlock(mpb, MaterialIndex);
+        target.Renderer.SetPropertyBlock(mpb, target.MaterialIndex);
     }
 
-    private void ClearPicture()
+    private void ClearPicture(MaterialTarget target)
     {
-        if (TargetRenderer == null || mpb == null) return;
-        TargetRenderer.GetPropertyBlock(mpb, MaterialIndex);
+        if (target.Renderer == null || mpb == null) return;
+        target.Renderer.GetPropertyBlock(mpb, target.MaterialIndex);
         mpb.SetFloat(PropBrightness, 1f);
         mpb.SetFloat(PropContrast, 1f);
         mpb.SetFloat(PropSaturation, 1f);
         mpb.SetFloat(PropGamma, 1f);
-        TargetRenderer.SetPropertyBlock(mpb, MaterialIndex);
+        target.Renderer.SetPropertyBlock(mpb, target.MaterialIndex);
     }
 
-    // Re-apply when the flip toggle changes in the inspector during play.
     private void OnValidate()
     {
         if (Application.isPlaying && isActiveAndEnabled && Player != null)
-            SetTexture(Player.OutputTexture);
+            HandleTextureChanged(Player.OutputTexture);
     }
 
-    private Material GetMaterial()
+    private Material GetMaterial(MaterialTarget target)
     {
-        if (TargetRenderer == null) return null;
+        var renderer = target.Renderer;
+        if (renderer == null) return null;
         if (UseSharedMaterial)
         {
-            var shared = TargetRenderer.sharedMaterials;
-            if (MaterialIndex < 0 || MaterialIndex >= shared.Length) return null;
-            return shared[MaterialIndex];
+            var shared = renderer.sharedMaterials;
+            if (target.MaterialIndex < 0 || target.MaterialIndex >= shared.Length) return null;
+            return shared[target.MaterialIndex];
         }
         // Access .materials once to take ownership of a cloned array, then
         // index into it; accessing .materials repeatedly leaks instances.
-        var instances = TargetRenderer.materials;
-        if (MaterialIndex < 0 || MaterialIndex >= instances.Length) return null;
-        return instances[MaterialIndex];
+        var instances = renderer.materials;
+        if (target.MaterialIndex < 0 || target.MaterialIndex >= instances.Length) return null;
+        return instances[target.MaterialIndex];
     }
 }

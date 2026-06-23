@@ -2,7 +2,7 @@
     <engine:VisualElement class="bvp-root">
         <engine:VisualElement name="HeaderCard" class="bvp-card bvp-header-card">
             <engine:Label text="Basis Video Material Output" name="HeaderTitle" selectable="false" class="bvp-header-title"/>
-            <engine:Label text="Binds the player's OutputTexture to a Renderer material property" name="HeaderSubtitle" selectable="false" class="bvp-header-subtitle"/>
+            <engine:Label text="Binds the player's OutputTexture to one or more Renderer material properties" name="HeaderSubtitle" selectable="false" class="bvp-header-subtitle"/>
         </engine:VisualElement>
 
         <engine:Foldout text="Binding" name="BindingFoldout" value="true" class="bvp-foldout">
@@ -11,6 +11,7 @@
             <engine:IntegerField label="Material Index" name="MaterialIndexField"/>
             <engine:TextField label="Texture Property Name" name="TexturePropertyField" tooltip="URP uses _BaseMap; legacy BiRP uses _MainTex."/>
             <engine:Toggle label="Use Shared Material" name="UseSharedMaterialField" tooltip="When ON, every renderer using the material will see the video. When OFF, a per-instance copy is created."/>
+            <editor:PropertyField name="AdditionalTargetsField" label="Additional Targets" tooltip="Extra renderers/materials driven by the same video. Each entry may override the Texture Property Name; the settings below apply to all targets."/>
         </engine:Foldout>
 
         <engine:Foldout text="Behavior" name="BehaviorFoldout" value="true" class="bvp-foldout">

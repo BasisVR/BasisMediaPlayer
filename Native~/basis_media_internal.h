@@ -113,6 +113,10 @@ void basis_decoder_render_release(basis_decoder_t* dec);
 void*    basis_decoder_get_texture(basis_decoder_t* dec, int* out_w, int* out_h);
 uint64_t basis_decoder_get_frame_counter(basis_decoder_t* dec);
 int      basis_decoder_get_video_size(basis_decoder_t* dec, int* out_w, int* out_h);
+/* 0 = bottom-left origin (frame upright; sample as-is). 1 = top-left origin
+ * (frame upside-down; consumer must flip V). Windows reports 1 when the D3D11
+ * video processor can't mirror on this GPU; Vulkan always normalizes to 0. */
+int      basis_decoder_get_frame_origin(basis_decoder_t* dec);
 int64_t  basis_decoder_get_position_us(basis_decoder_t* dec);
 int      basis_decoder_get_audio_format(basis_decoder_t* dec, int* out_rate, int* out_channels);
 int      basis_decoder_read_audio(basis_decoder_t* dec, float* out, int max_floats); /* audio thread */

@@ -223,6 +223,14 @@ struct basis_decoder {
     ID3D11Texture2D* outTexD11 = nullptr;   /* CreateExternalTexture target (D3D11) */
     void* outTexD12 = nullptr;              /* ID3D12Resource* (D3D12 path) */
 
+    /* Vertical origin of the published frame: 0 = bottom-left (upright; Unity
+     * samples it with no UV flip), 1 = top-left (consumer must flip V). Set once
+     * when the video processor is created — 0 if its stream-mirror was actually
+     * applied, 1 if this GPU's VP lacks mirror support so the frame stays
+     * un-flipped and the consumer corrects it. Defaults to upright (no surprise
+     * flip) before the first frame. */
+    volatile LONG frameTopLeft = 0;
+
     volatile LONG frameCounter = 0;
     int64_t lastPtsUs = -1;
     int64_t prevWritePts = INT64_MIN;        /* last frame PTS written to the ring */
@@ -438,15 +446,29 @@ static void video_process_to_shared(basis_decoder* d, ID3D11Texture2D* nv12, UIN
         cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
         if (FAILED(d->vdevice->CreateVideoProcessorEnumerator(&cd, &d->vprocEnum))) return;
         if (FAILED(d->vdevice->CreateVideoProcessor(d->vprocEnum, 0, &d->vproc))) return;
-        /* Output bottom-left origin so Unity samples the frame right-way-up
-         * directly — no UV flip on the consumer material. The blit already runs;
-         * the mirror is free. VideoProcessorSetStreamMirror lives on
-         * ID3D11VideoContext1 (D3D11.1+), so query it from the base context. */
-        ID3D11VideoContext1* vctx1 = nullptr;
-        if (SUCCEEDED(d->vcontext->QueryInterface(__uuidof(ID3D11VideoContext1), (void**)&vctx1)) && vctx1) {
-            vctx1->VideoProcessorSetStreamMirror(d->vproc, 0, TRUE, FALSE, TRUE);
-            vctx1->Release();
+        /* Try to make the video processor emit a bottom-left origin frame so Unity
+         * samples it right-way-up with no UV flip. VideoProcessorSetStreamMirror is
+         * an OPTIONAL feature: a GPU's VP advertises it via the MIRROR caps bit, and
+         * drivers that lack it (some Intel iGPU / WARP / virtualized adapters)
+         * silently ignore the call — that is the "video is upside-down only on some
+         * machines" bug, since the method returns void so the no-op is invisible. So
+         * gate on the cap: when the mirror actually runs, mark the frame upright;
+         * otherwise leave it top-left and report that origin so the consumer applies
+         * a free, deterministic UV flip instead. VideoProcessorSetStreamMirror lives
+         * on ID3D11VideoContext1 (D3D11.1+), so query it from the base context. */
+        bool mirrored = false;
+        D3D11_VIDEO_PROCESSOR_CAPS vpcaps = {};
+        bool canMirror = SUCCEEDED(d->vprocEnum->GetVideoProcessorCaps(&vpcaps)) &&
+                         (vpcaps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_MIRROR);
+        if (canMirror) {
+            ID3D11VideoContext1* vctx1 = nullptr;
+            if (SUCCEEDED(d->vcontext->QueryInterface(__uuidof(ID3D11VideoContext1), (void**)&vctx1)) && vctx1) {
+                vctx1->VideoProcessorSetStreamMirror(d->vproc, 0, TRUE, FALSE, TRUE);
+                vctx1->Release();
+                mirrored = true;
+            }
         }
+        d->frameTopLeft = mirrored ? 0 : 1;
     }
 
     int slot = (int)(d->writeSeq % basis_decoder::RING);
@@ -1098,6 +1120,7 @@ extern "C" int basis_decoder_get_video_size(basis_decoder_t* d, int* w, int* h) 
     if (!d || d->sharedW <= 0) return -1;
     if (w) *w = d->sharedW; if (h) *h = d->sharedH; return 0;
 }
+extern "C" int basis_decoder_get_frame_origin(basis_decoder_t* d) { return d ? (int)d->frameTopLeft : 0; }
 extern "C" int64_t basis_decoder_get_position_us(basis_decoder_t* d) { return d ? d->lastPtsUs : -1; }
 extern "C" int basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c) {
     if (!d || !d->aconfigured) return -1;

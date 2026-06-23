@@ -108,6 +108,15 @@ BASIS_API int BASIS_CALL basis_media_get_state(basis_media_engine_t* engine); /*
 /* 0 and fills w/h once the first frame's dimensions are known; -1 otherwise. */
 BASIS_API int BASIS_CALL basis_media_get_video_size(basis_media_engine_t* engine, int* out_w, int* out_h);
 
+/* Vertical origin of the output texture's rows, so the consumer can apply a free
+ * UV flip on backends that can't normalize orientation themselves:
+ *   0 = bottom-left origin — the frame is upright; sample with no flip.
+ *   1 = top-left origin — the frame is upside-down; the consumer must flip V.
+ * Windows returns 1 when the GPU's D3D11 video processor lacks mirror support
+ * (driver-dependent — the root cause of "flip only works on some machines"); the
+ * Vulkan path always returns 0. Returns 0 before the first frame (safe default). */
+BASIS_API int BASIS_CALL basis_media_get_frame_origin(basis_media_engine_t* engine);
+
 /* Presentation position of the most recently published video frame, in
  * microseconds from stream start. -1 if unknown. */
 BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* engine);

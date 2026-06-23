@@ -280,8 +280,7 @@ namespace Basis.BasisUI.MediaPlayer
             resyncBtn.OnClicked += () =>
             {
                 if (_activePlayer == null) return;
-                _activePlayer.AudioComponent?.ResetSyncAnchor();
-                _activePlayer.Clock.Reset();
+                _activePlayer.Reload();
             };
 
             _advancedToggle = PanelToggle.CreateNewEntry(content);

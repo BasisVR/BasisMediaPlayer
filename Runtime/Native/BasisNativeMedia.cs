@@ -58,6 +58,9 @@ internal static class BasisNativeMedia
     private static extern int basis_media_get_video_size(IntPtr engine, out int w, out int h);
 
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
+    private static extern int basis_media_get_frame_origin(IntPtr engine);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
     private static extern long basis_media_get_position_us(IntPtr engine);
 
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
@@ -174,6 +177,16 @@ internal static class BasisNativeMedia
     {
         w = 0; h = 0;
         return e != IntPtr.Zero && basis_media_get_video_size(e, out w, out h) == 0;
+    }
+
+    // 0 = bottom-left origin (frame upright; sample as-is), 1 = top-left origin
+    // (frame upside-down; the consumer must flip vertically). Native libraries that
+    // predate the export default to 0 (upright) — identical to the prior behavior.
+    public static int GetFrameOrigin(IntPtr e)
+    {
+        if (e == IntPtr.Zero) return 0;
+        try { return basis_media_get_frame_origin(e); }
+        catch (EntryPointNotFoundException) { return 0; }
     }
 
     public static long GetPositionUs(IntPtr e) => e == IntPtr.Zero ? -1 : basis_media_get_position_us(e);

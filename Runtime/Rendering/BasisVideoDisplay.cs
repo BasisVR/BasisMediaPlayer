@@ -135,6 +135,13 @@ public sealed class BasisVideoDisplay : MonoBehaviour
         BasisVideoOutputMath.Compose(projScale, projOffset, aspScale, aspOffset,
             out Vector2 scale, out Vector2 offset);
 
+        // Correct backends that publish the frame upside-down (e.g. a Windows GPU
+        // whose video processor can't mirror) so the RawImage matches the
+        // material-output path on every client. RawImage honors a negative-height
+        // uvRect as a vertical flip.
+        if (Player != null && Player.OutputFrameIsTopLeftOrigin)
+            BasisVideoOutputMath.ApplyVerticalFlip(ref scale, ref offset);
+
         TargetRawImage.uvRect = new Rect(offset.x, offset.y, scale.x, scale.y);
     }
 

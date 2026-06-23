@@ -39,6 +39,7 @@ void basis_decoder_render_release(basis_decoder_t* d) { (void)d; }
 void*    basis_decoder_get_texture(basis_decoder_t* d, int* w, int* h) { (void)d; if(w)*w=0; if(h)*h=0; return NULL; }
 uint64_t basis_decoder_get_frame_counter(basis_decoder_t* d) { (void)d; return 0; }
 int      basis_decoder_get_video_size(basis_decoder_t* d, int* w, int* h) { (void)d;(void)w;(void)h; return -1; }
+int      basis_decoder_get_frame_origin(basis_decoder_t* d) { (void)d; return 0; }
 int64_t  basis_decoder_get_position_us(basis_decoder_t* d) { (void)d; return -1; }
 int      basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c) { (void)d;(void)r;(void)c; return -1; }
 int      basis_decoder_read_audio(basis_decoder_t* d, float* o, int m) { (void)d;(void)o;(void)m; return 0; }

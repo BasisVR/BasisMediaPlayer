@@ -234,6 +234,14 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     // otherwise the CPU renderer's RenderTexture is the output.
     public Texture OutputTexture => nativeEngine != null ? nativeEngine.OutputTexture : _renderer?.OutputTexture;
 
+    // Vertical orientation correction the active backend needs the consumer to
+    // apply. True when the output frame arrives upside-down relative to Unity's UV
+    // convention (e.g. a Windows GPU whose video processor can't mirror); the video
+    // sinks XOR this into their own FlipVertically so a screen authored on one GPU
+    // looks correct on every client. False on the CPU source path and whenever the
+    // frame is already upright.
+    public bool OutputFrameIsTopLeftOrigin => nativeEngine != null && nativeEngine.FrameIsTopLeftOrigin;
+
     public bool IsPlaying => runtimeIsPlaying;
     public bool IsPaused => runtimeIsPaused;
     public bool IsPrepared => runtimeIsPrepared;
@@ -452,6 +460,18 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
         var media = BasisMediaSource.FromLocalPath(path);
         LoadSource(media);
+    }
+
+    public void Reload()
+    {
+        if (activeMediaSource == null)
+        {
+            return;
+        }
+
+        Clock.Reset();
+        audioComponent?.ResetSyncAnchor();
+        LoadSource(activeMediaSource);
     }
 
     // Resolves the descriptor to the OS-codec engine and starts it. All network

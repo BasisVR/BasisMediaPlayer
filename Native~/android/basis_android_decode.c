@@ -384,6 +384,9 @@ uint64_t basis_decoder_get_frame_counter(basis_decoder_t* d) { return d && d->vk
 int basis_decoder_get_video_size(basis_decoder_t* d, int* w, int* h) {
     if (!d || d->vw <= 0) return -1; if (w) *w = d->vw; if (h) *h = d->vh; return 0;
 }
+/* The Vulkan resolve always flips to upright via a negative-height viewport, so
+ * the published frame is bottom-left origin on every Android GPU. */
+int basis_decoder_get_frame_origin(basis_decoder_t* d) { (void)d; return 0; }
 int64_t basis_decoder_get_position_us(basis_decoder_t* d) { return d ? d->lastPtsUs : -1; }
 int basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c) {
     if (!d || !d->aconfigured) return -1; if (r) *r = d->asr ? d->asr : 48000; if (c) *c = d->ach ? d->ach : 2; return 0;

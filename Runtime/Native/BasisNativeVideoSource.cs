@@ -52,6 +52,13 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     public BasisMediaDelivery Delivery { get; }
     public Texture OutputTexture => unityOwnedRT != null ? (Texture)unityOwnedRT : externalTexture;
     public Vector2Int VideoSize => new Vector2Int(texW, texH);
+
+    // True when the active backend publishes the frame top-left origin (upside-down
+    // versus Unity's bottom-left UV convention) and the consumer must flip it
+    // vertically. Windows reports this when the GPU's D3D11 video processor can't
+    // mirror; the Vulkan path always normalizes to upright (false). Known by the
+    // time the first frame's texture is published, so it's safe to read live.
+    public bool FrameIsTopLeftOrigin => BasisNativeMedia.GetFrameOrigin(handle) == 1;
     public bool IsRunning => handle != IntPtr.Zero && started && !disposed;
     public BasisMediaEngineState State => (BasisMediaEngineState)(int)BasisNativeMedia.GetState(handle);
 
