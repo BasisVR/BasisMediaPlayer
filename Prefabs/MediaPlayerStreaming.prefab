@@ -927,7 +927,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: d2aa9116619ed954aa8e19d984b58ada, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Basis Framework::BasisObjectSyncNetworking
+  m_EditorClassIdentifier: Basis Framework::BasisPickupSyncNetworking
   HasNetworkID: 0
   IsOwnedLocallyOnServer: 0
   IsOwnedLocallyOnClient: 0
