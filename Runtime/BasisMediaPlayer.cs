@@ -962,7 +962,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
     private void HandleError(Exception ex)
     {
-        BasisDebug.LogWarning($"BasisMediaPlayer source error: {ex.Message}", BasisDebug.LogTag.Video);
+        BasisDebug.LogError($"BasisMediaPlayer source error: {ex.Message}", BasisDebug.LogTag.Video);
         pendingError = ex;
     }
 
