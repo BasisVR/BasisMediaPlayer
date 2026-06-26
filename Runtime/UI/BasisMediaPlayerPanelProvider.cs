@@ -58,12 +58,27 @@ namespace Basis.BasisUI.MediaPlayer
             _instance = new BasisMediaPlayerPanelProvider();
             BasisMenuBase<BasisMainMenu>.AddProvider(_instance);
             BasisMediaPlayerRegistry.OnChanged += RefreshMainMenu;
+            SettingsProvider.AudioTabExtraBuilder = BuildAudioSettingsEntry;
         }
 
         private static void RefreshMainMenu()
         {
             if (BasisMenuBase<BasisMainMenu>.Instance) BasisMenuBase<BasisMainMenu>.Instance.BindProvidersToButtons();
             if (BasisMainMenu.ActiveMenuTitle == StaticTitle && _instance != null) _instance.RebuildSelector();
+        }
+
+        private static void BuildAudioSettingsEntry(RectTransform parent)
+        {
+            if (BasisMediaPlayerRegistry.Count == 0) return;
+
+            PanelElementDescriptor group = PanelElementDescriptor.CreateNew(
+                PanelElementDescriptor.ElementStyles.Group, parent);
+            group.SetTitle(StaticTitle);
+            group.SetDescription("Open the media player panel to control playback and per-player volume.");
+
+            PanelButton open = PanelButton.CreateNew(group.ContentParent);
+            open.Descriptor.SetTitle("Open Media Players");
+            open.OnClicked += () => _instance?.RunAction();
         }
 
         public static bool HasControlPermission()
