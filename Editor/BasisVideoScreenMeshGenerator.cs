@@ -12,7 +12,7 @@ public static class BasisVideoScreenMeshGenerator
     const float Width = 14.463681f;
     const float Height = 8.13582f;
 
-    [MenuItem("Basis/Media Player/Generate 16:9 Screen Mesh")]
+    [MenuItem("Basis/Tools/Generate 16:9 Screen Mesh")]
     public static void Generate()
     {
         string dir = Path.GetDirectoryName(OutputPath).Replace('\\', '/');
