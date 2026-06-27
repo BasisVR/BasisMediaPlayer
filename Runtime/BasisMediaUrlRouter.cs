@@ -124,9 +124,11 @@ public static class BasisMediaUrlRouter
     /// Guarantees <paramref name="url"/> carries a scheme so it can route and load as an
     /// absolute URL. A bare web URL with no scheme (e.g. "www.youtube.com/watch?v=…") gets
     /// "https://" prepended, and a protocol-relative URL ("//host/…") gets "https:"; anything
-    /// that already has a scheme (http(s)/rtsp/rtmp/rist/file/…) or is a local path (leading
-    /// slash, UNC, or a drive letter like C:\) is returned trimmed but otherwise unchanged.
-    /// Null/whitespace passes through untouched.
+    /// that already has a scheme (http(s)/rtsp/rtmp/rist/file/…) or is a local path (a single
+    /// leading slash, a backslash UNC path like \\server\share, or a drive letter like C:\) is
+    /// returned trimmed but otherwise unchanged. Because "//host/…" is read as a protocol-relative
+    /// web URL, a network path must use the backslash UNC form (or a file:// URL), not forward
+    /// slashes. Null/whitespace passes through untouched.
     /// </summary>
     public static string NormalizeUrl(string url)
     {
