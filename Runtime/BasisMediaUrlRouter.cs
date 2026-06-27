@@ -83,7 +83,20 @@ public static class BasisMediaUrlRouter
         for (int i = 0; i < Resolvers.Count; i++)
         {
             IBasisVideoResolver resolver = Resolvers[i];
-            if (resolver.CanResolve(url) && resolver.TryResolve(player, url)) return true;
+            // Resolvers are external integrations (third-party packages). Contain a throwing
+            // one so a single bad resolver can't break lower-priority resolvers or the
+            // direct-load fallback; a failed attempt is treated as "declined" and routing
+            // continues. Not a hot path — this runs on a user-initiated load.
+            try
+            {
+                if (resolver.CanResolve(url) && resolver.TryResolve(player, url)) return true;
+            }
+            catch (Exception e)
+            {
+                BasisDebug.LogError(
+                    $"BasisMediaUrlRouter: resolver '{resolver.GetType().Name}' threw while handling '{Redact(url)}'; skipping it. {e}",
+                    BasisDebug.LogTag.Video);
+            }
         }
         return false;
     }
@@ -121,6 +134,29 @@ public static class BasisMediaUrlRouter
     }
 
     /// <summary>
+    /// A log-safe form of <paramref name="url"/> — the scheme, host and path with the query and
+    /// fragment dropped, since those can carry signed tokens or private identifiers that
+    /// shouldn't reach logs. Returns the input unchanged when it has no query/fragment, and a
+    /// placeholder for null/blank.
+    /// </summary>
+    public static string Redact(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return "(empty)";
+        string trimmed = url.Trim();
+        int cut = trimmed.IndexOfAny(PathEnd); // '?' or '#'
+        string withoutQuery = cut >= 0 ? trimmed.Substring(0, cut) : trimmed;
+
+        // Strip userinfo (user:pass@host) too — those are credentials. Rebuild from the
+        // parsed parts only when it's present, so ordinary URLs keep their exact form.
+        if (Uri.TryCreate(withoutQuery, UriKind.Absolute, out Uri uri) && !string.IsNullOrEmpty(uri.UserInfo))
+        {
+            string host = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
+            return $"{uri.Scheme}://{host}{uri.AbsolutePath}";
+        }
+        return withoutQuery;
+    }
+
+    /// <summary>
     /// Guarantees <paramref name="url"/> carries a scheme so it can route and load as an
     /// absolute URL. A bare web URL with no scheme (e.g. "www.youtube.com/watch?v=…") gets
     /// "https://" prepended, and a protocol-relative URL ("//host/…") gets "https:"; anything
@@ -138,7 +174,7 @@ public static class BasisMediaUrlRouter
         if (trimmed.StartsWith("//", StringComparison.Ordinal))          // protocol-relative ("//host/…")
             return "https:" + trimmed;
         if (trimmed[0] == '/' || trimmed[0] == '\\') return trimmed;      // unix / UNC / rooted path
-        if (trimmed.Length >= 2 && trimmed[1] == ':') return trimmed;     // windows drive path (C:\, C:/)
+        if (trimmed.Length >= 2 && char.IsLetter(trimmed[0]) && trimmed[1] == ':') return trimmed; // windows drive path (C:\, C:/) — letter-prefixed so "[::1]/…" isn't caught
         return "https://" + trimmed;
     }
 }

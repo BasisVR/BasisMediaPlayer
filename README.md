@@ -116,9 +116,9 @@ Basis ships a yt-dlp-based resolver as that package, but any
 **Without it**, the router is inert: every URL loads directly, so all the stream URLs
 above keep working — but page URLs are no longer resolved, so **YouTube, Twitch and
 similar links won't play**. Loading one degrades gracefully rather than failing silently:
-the player goes to an error state with a short message — *"…needs a media URL resolver
-package, and none is installed."* — shown in the **Media Players** panel and logged once
-as a warning (it never throws or tries to demux the HTML page). Removing the
+the player reports a short message — *"…needs a media URL resolver
+package, and none is installed."* — surfaced in the **Media Players** panel and logged
+as a warning on each such load (it never throws or tries to demux the HTML page). Removing the
 package is a supported choice: you lose common-site resolution and nothing else. (This
 only steers — it never blocks a URL; host trust is enforced separately.)
 
@@ -164,6 +164,12 @@ internal static class MyResolverInstaller
 }
 ```
 
+- **Async resolves must guard against stale loads.** If `TryResolve` resolves
+  asynchronously, capture `player.LoadGeneration` before you start and skip your
+  `LoadSource` / `LoadUrl` when the async work completes if it no longer matches. The player
+  bumps `LoadGeneration` on every `LoadUrl`, so without this a slow resolve of an earlier URL
+  can overwrite a newer load. Return `true` as soon as you take ownership (kick off the
+  resolve), not when it finishes.
 - **Main thread only.** The resolver list is unsynchronised — `Register` / `Unregister`
   and resolution all run on Unity's main thread. Registering from
   `RuntimeInitializeOnLoadMethod` and resolving from the player's load path satisfies this.
