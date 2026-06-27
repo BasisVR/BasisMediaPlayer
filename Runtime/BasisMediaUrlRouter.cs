@@ -51,23 +51,6 @@ public interface IBasisVideoResolver
 public static class BasisMediaUrlRouter
 {
     private static readonly List<IBasisVideoResolver> Resolvers = new List<IBasisVideoResolver>();
-    private static LegacyResolverAdapter legacy;
-
-    /// <summary>
-    /// Back-compatible single-resolver slot. Assigning a non-null delegate registers it as a
-    /// priority-0 resolver; assigning null removes it. Prefer <see cref="Register"/> with an
-    /// <see cref="IBasisVideoResolver"/> for new integrations — this is kept so existing
-    /// callers that set a delegate keep working.
-    /// </summary>
-    public static Func<BasisMediaPlayer, string, bool> Resolver
-    {
-        get => legacy?.Func;
-        set
-        {
-            if (legacy != null) { Unregister(legacy); legacy = null; }
-            if (value != null) { legacy = new LegacyResolverAdapter(value); Register(legacy); }
-        }
-    }
 
     /// <summary>
     /// Registers <paramref name="resolver"/> so <see cref="TryResolveAndLoad"/> consults it,
@@ -152,17 +135,5 @@ public static class BasisMediaUrlRouter
         if (trimmed[0] == '/' || trimmed[0] == '\\') return trimmed;   // unix / UNC / rooted path
         if (trimmed.Length >= 2 && trimmed[1] == ':') return trimmed;  // windows drive path (C:\, C:/)
         return "https://" + trimmed;
-    }
-
-    // Adapts a legacy Resolver delegate to IBasisVideoResolver. The delegate self-selects
-    // (returns false to decline), so CanResolve is always true and the decision happens in
-    // TryResolve — preserving the original single-slot semantics.
-    private sealed class LegacyResolverAdapter : IBasisVideoResolver
-    {
-        internal readonly Func<BasisMediaPlayer, string, bool> Func;
-        public LegacyResolverAdapter(Func<BasisMediaPlayer, string, bool> func) => Func = func;
-        public int Priority => 0;
-        public bool CanResolve(string url) => true;
-        public bool TryResolve(BasisMediaPlayer player, string url) => Func(player, url);
     }
 }
