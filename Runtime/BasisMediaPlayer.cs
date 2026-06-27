@@ -441,10 +441,10 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         {
             // A missing optional resolver is expected graceful degradation, not a fault — warn.
             // Surfaced to LastErrorMessage too so the Media Players panel can explain why nothing played.
-            LastErrorMessage = "This looks like a page URL (e.g. YouTube/Twitch). Playing it needs the optional yt-dlp resolver package, which isn't installed.";
+            LastErrorMessage = "This looks like a page URL (e.g. YouTube/Twitch). Playing it needs a media URL resolver package, and none is installed.";
             BasisDebug.LogWarning(
-                $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
-                "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
+                $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch); no media URL " +
+                "resolver package is installed to handle it, so it can't be played.",
                 BasisDebug.LogTag.Video);
             return;
         }

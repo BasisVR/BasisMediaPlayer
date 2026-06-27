@@ -100,9 +100,10 @@ A null `AudioUri` (the default) is an ordinary single muxed stream.
 
 The player opens **stream** URLs (the schemes above) directly. It does **not** itself
 turn a **page** URL — a YouTube or Twitch watch page — into a stream. That resolution
-is provided by a **separate, optional package** (a yt-dlp-based resolver) which
-registers itself on `BasisMediaUrlRouter`; the player core has no dependency on it and
-never references it.
+is provided by a **separate, optional resolver package** which registers itself on
+`BasisMediaUrlRouter`; the player core has no dependency on it and never references it.
+Basis ships a yt-dlp-based resolver as that package, but any
+[resolver](#writing-a-resolver) can fill the role.
 
 **With the resolver package installed**, a URL field such as
 `BasisMediaPlayerStreaming.StreamUrl` steers each URL automatically:
@@ -115,9 +116,9 @@ never references it.
 **Without it**, the router is inert: every URL loads directly, so all the stream URLs
 above keep working — but page URLs are no longer resolved, so **YouTube, Twitch and
 similar links won't play**. Loading one degrades gracefully rather than failing silently:
-the player goes to an error state with a short message — *"…needs the optional yt-dlp
-resolver package, which isn't installed."* — shown in the **Media Players** panel and
-logged once as a warning (it never throws or tries to demux the HTML page). Removing the
+the player goes to an error state with a short message — *"…needs a media URL resolver
+package, and none is installed."* — shown in the **Media Players** panel and logged once
+as a warning (it never throws or tries to demux the HTML page). Removing the
 package is a supported choice: you lose common-site resolution and nothing else. (This
 only steers — it never blocks a URL; host trust is enforced separately.)
 
