@@ -114,10 +114,12 @@ never references it.
 
 **Without it**, the router is inert: every URL loads directly, so all the stream URLs
 above keep working — but page URLs are no longer resolved, so **YouTube, Twitch and
-similar links won't play** (loading one reports that the resolver package is needed,
-rather than failing silently). Removing the package is a supported choice: you lose
-common-site resolution and nothing else. (This only steers — it never blocks a URL;
-host trust is enforced separately.)
+similar links won't play**. Loading one degrades gracefully rather than failing silently:
+the player goes to an error state with a short message — *"…needs the optional yt-dlp
+resolver package, which isn't installed."* — shown in the **Media Players** panel and
+logged once as a warning (it never throws or tries to demux the HTML page). Removing the
+package is a supported choice: you lose common-site resolution and nothing else. (This
+only steers — it never blocks a URL; host trust is enforced separately.)
 
 > **Known gap.** The steering keys off the URL's form, so a **direct HTTP stream with
 > no file extension** (e.g. `https://host/live/feed` with no `.ts`/`.mp4`) can't be
