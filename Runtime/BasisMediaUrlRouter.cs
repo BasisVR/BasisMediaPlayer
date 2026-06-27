@@ -123,17 +123,20 @@ public static class BasisMediaUrlRouter
     /// <summary>
     /// Guarantees <paramref name="url"/> carries a scheme so it can route and load as an
     /// absolute URL. A bare web URL with no scheme (e.g. "www.youtube.com/watch?v=…") gets
-    /// "https://" prepended; anything that already has a scheme (http(s)/rtsp/rtmp/rist/file/…)
-    /// or is a local path (leading slash, UNC, or a drive letter like C:\) is returned trimmed
-    /// but otherwise unchanged. Null/whitespace passes through untouched.
+    /// "https://" prepended, and a protocol-relative URL ("//host/…") gets "https:"; anything
+    /// that already has a scheme (http(s)/rtsp/rtmp/rist/file/…) or is a local path (leading
+    /// slash, UNC, or a drive letter like C:\) is returned trimmed but otherwise unchanged.
+    /// Null/whitespace passes through untouched.
     /// </summary>
     public static string NormalizeUrl(string url)
     {
         if (string.IsNullOrWhiteSpace(url)) return url;
         string trimmed = url.Trim();
-        if (trimmed.Contains("://")) return trimmed;                   // already has a scheme
-        if (trimmed[0] == '/' || trimmed[0] == '\\') return trimmed;   // unix / UNC / rooted path
-        if (trimmed.Length >= 2 && trimmed[1] == ':') return trimmed;  // windows drive path (C:\, C:/)
+        if (trimmed.Contains("://")) return trimmed;                      // already has a scheme
+        if (trimmed.StartsWith("//", StringComparison.Ordinal))          // protocol-relative ("//host/…")
+            return "https:" + trimmed;
+        if (trimmed[0] == '/' || trimmed[0] == '\\') return trimmed;      // unix / UNC / rooted path
+        if (trimmed.Length >= 2 && trimmed[1] == ':') return trimmed;     // windows drive path (C:\, C:/)
         return "https://" + trimmed;
     }
 }
