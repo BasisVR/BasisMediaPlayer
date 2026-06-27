@@ -231,13 +231,13 @@ configure step below. You also need Unity's PluginAPI headers — see
 `Native~/unity/README.md`.
 
 **Windows → `Plugins/Windows/x86_64/basis_media_native.dll`**
-```
+```sh
 cmake -S Native~ -B Native~/build -A x64 -DUNITY_PLUGIN_API_DIR="<UnityEditor>/Editor/Data/PluginAPI"
 cmake --build Native~/build --config Release
 ```
 
 **Android (arm64, Vulkan) → `Plugins/Android/arm64-v8a/libbasis_media_native.so`**
-```
+```sh
 cmake -S Native~ -B Native~/build-android \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
