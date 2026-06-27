@@ -126,6 +126,47 @@ host trust is enforced separately.)
 > than loading directly. Give direct HTTP streams a recognised
 > extension, or use a transport scheme (`rtsp`/`rtmp`), to avoid this.
 
+### Writing a resolver
+
+A resolver is any `IBasisVideoResolver` registered on `BasisMediaUrlRouter`. The player
+core never references it — register one at startup and the router consults it for every
+load, in `Priority` order, until one takes ownership. The bundled
+[yt-dlp integration](../com.basis.integration.ytdlp/README.md) is a complete worked
+example; the shape is:
+
+```csharp
+using UnityEngine;
+
+internal sealed class MyResolver : IBasisVideoResolver
+{
+    public int Priority => 0; // higher runs first; equal priorities run in registration order
+
+    // Cheap, side-effect-free pre-filter. Decline directly-playable URLs so the player
+    // opens them itself — IsDirectlyPlayable is the shared steering check.
+    public bool CanResolve(string url) => !BasisMediaUrlRouter.IsDirectlyPlayable(url);
+
+    // Take ownership: turn the page URL into its stream(s) and load them (may be async).
+    // Return true once taken; false to fall through to the next resolver, then a direct load.
+    public bool TryResolve(BasisMediaPlayer player, string url)
+    {
+        // … resolve, then player.LoadSource(resolvedSource) / player.LoadUrl(streamUrl) …
+        return true;
+    }
+}
+
+internal static class MyResolverInstaller
+{
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    private static void Install() => BasisMediaUrlRouter.Register(new MyResolver());
+}
+```
+
+- **Main thread only.** The resolver list is unsynchronised — `Register` / `Unregister`
+  and resolution all run on Unity's main thread. Registering from
+  `RuntimeInitializeOnLoadMethod` and resolving from the player's load path satisfies this.
+- **Routing only, never trust.** A resolver decides *how* a URL loads, not *whether* it's
+  allowed — host trust stays with `BasisMediaPlayerSecurity`.
+
 ## Usage
 
 ```csharp
