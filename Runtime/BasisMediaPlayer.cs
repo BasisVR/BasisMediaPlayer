@@ -426,11 +426,14 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     // already-resolved or direct sources, e.g. the resolver's own output).
     public void LoadUrl(string url)
     {
-        if (string.IsNullOrEmpty(url))
+        if (string.IsNullOrWhiteSpace(url))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadUrl called with empty URL.", BasisDebug.LogTag.Video);
             return;
         }
+        // Default a missing scheme to https so a bare "www.example.com/…" routes and loads
+        // as an absolute URL instead of being mis-read as a direct/transport source.
+        url = BasisMediaUrlRouter.NormalizeUrl(url);
         LastErrorMessage = null;
         LoadGeneration++;
         if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
@@ -438,10 +441,10 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         {
             // A missing optional resolver is expected graceful degradation, not a fault — warn.
             // Surfaced to LastErrorMessage too so the Media Players panel can explain why nothing played.
-            LastErrorMessage = "This looks like a page URL (e.g. YouTube/Twitch). Playing it needs the optional yt-dlp resolver package, which isn't installed.";
+            LastErrorMessage = "This looks like a page URL (e.g. YouTube/Twitch). Playing it needs a media URL resolver package, and none is installed.";
             BasisDebug.LogWarning(
-                $"BasisMediaPlayer: '{url}' looks like a page URL (e.g. YouTube/Twitch), which needs the " +
-                "optional yt-dlp resolver package — it isn't installed, so this URL can't be played.",
+                $"BasisMediaPlayer: '{BasisMediaUrlRouter.Redact(url)}' looks like a page URL (e.g. YouTube/Twitch); no media URL " +
+                "resolver package is installed to handle it, so it can't be played.",
                 BasisDebug.LogTag.Video);
             return;
         }
@@ -453,7 +456,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     // streaming-assets-relative path and calls LoadSource.
     public void LoadLocalPath(string path)
     {
-        if (string.IsNullOrEmpty(path))
+        if (string.IsNullOrWhiteSpace(path))
         {
             BasisDebug.LogWarning("BasisMediaPlayer.LoadLocalPath called with empty path.", BasisDebug.LogTag.Video);
             return;
@@ -1194,14 +1197,33 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
     }
 
+    // Records a failure message (drives the Error status and the Media Players panel) and
+    // raises OnError. Main thread only.
+    private void RaiseError(Exception ex)
+    {
+        LastErrorMessage = ex.Message;
+        OnError?.Invoke(ex);
+    }
+
+    /// <summary>
+    /// Reports a load failure from an external URL resolver. A resolver that takes ownership via
+    /// <see cref="BasisMediaUrlRouter"/> resolves asynchronously, so the player can't observe the
+    /// outcome itself — it calls this (on the main thread) when resolution fails, so the reason
+    /// surfaces through <see cref="LastErrorMessage"/> and <see cref="OnError"/> instead of the
+    /// player sitting silently with no media.
+    /// </summary>
+    public void ReportLoadError(Exception error)
+    {
+        if (error != null) RaiseError(error);
+    }
+
     private void DrainPendingEvents()
     {
         if (pendingError != null)
         {
             var ex = pendingError;
             pendingError = null;
-            LastErrorMessage = ex.Message;
-            OnError?.Invoke(ex);
+            RaiseError(ex);
         }
 
         long packedSize = System.Threading.Interlocked.Exchange(ref pendingVideoSize, 0);
@@ -1222,7 +1244,7 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             if (activeMediaSource != null && activeMediaSource.StartPosition > TimeSpan.Zero && seekableSource != null)
             {
                 try { seekableSource.Seek(activeMediaSource.StartPosition); }
-                catch (Exception ex) { OnError?.Invoke(ex); }
+                catch (Exception ex) { RaiseError(ex); }
             }
         }
 

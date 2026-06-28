@@ -100,9 +100,10 @@ A null `AudioUri` (the default) is an ordinary single muxed stream.
 
 The player opens **stream** URLs (the schemes above) directly. It does **not** itself
 turn a **page** URL — a YouTube or Twitch watch page — into a stream. That resolution
-is provided by a **separate, optional package** (a yt-dlp-based resolver) which
-registers itself on `BasisMediaUrlRouter`; the player core has no dependency on it and
-never references it.
+is provided by a **separate, optional resolver package** which registers itself on
+`BasisMediaUrlRouter`; the player core has no dependency on it and never references it.
+Basis ships a yt-dlp-based resolver as that package, but any
+[resolver](#writing-a-resolver) can fill the role.
 
 **With the resolver package installed**, a URL field such as
 `BasisMediaPlayerStreaming.StreamUrl` steers each URL automatically:
@@ -114,10 +115,12 @@ never references it.
 
 **Without it**, the router is inert: every URL loads directly, so all the stream URLs
 above keep working — but page URLs are no longer resolved, so **YouTube, Twitch and
-similar links won't play** (loading one reports that the resolver package is needed,
-rather than failing silently). Removing the package is a supported choice: you lose
-common-site resolution and nothing else. (This only steers — it never blocks a URL;
-host trust is enforced separately.)
+similar links won't play**. Loading one degrades gracefully rather than failing silently:
+the player reports a short message — *"…needs a media URL resolver
+package, and none is installed."* — surfaced in the **Media Players** panel and logged
+as a warning on each such load (it never throws or tries to demux the HTML page). Removing the
+package is a supported choice: you lose common-site resolution and nothing else. (This
+only steers — it never blocks a URL; host trust is enforced separately.)
 
 > **Known gap.** The steering keys off the URL's form, so a **direct HTTP stream with
 > no file extension** (e.g. `https://host/live/feed` with no `.ts`/`.mp4`) can't be
@@ -125,6 +128,53 @@ host trust is enforced separately.)
 > which finds no extractable stream and reports an error — so playback fails rather
 > than loading directly. Give direct HTTP streams a recognised
 > extension, or use a transport scheme (`rtsp`/`rtmp`), to avoid this.
+
+### Writing a resolver
+
+A resolver is any `IBasisVideoResolver` registered on `BasisMediaUrlRouter`. The player
+core never references it — register one at startup and the router consults it for every
+load, in `Priority` order, until one takes ownership. The bundled
+[yt-dlp integration](../com.basis.integration.ytdlp/README.md) is a complete worked
+example; the shape is:
+
+```csharp
+using UnityEngine;
+
+internal sealed class MyResolver : IBasisVideoResolver
+{
+    public int Priority => 0; // higher runs first; equal priorities run in registration order
+
+    // Cheap, side-effect-free pre-filter. Decline directly-playable URLs so the player
+    // opens them itself — IsDirectlyPlayable is the shared steering check.
+    public bool CanResolve(string url) => !BasisMediaUrlRouter.IsDirectlyPlayable(url);
+
+    // Take ownership: turn the page URL into its stream(s) and load them (may be async).
+    // Return true once taken; false to fall through to the next resolver, then a direct load.
+    public bool TryResolve(BasisMediaPlayer player, string url)
+    {
+        // … resolve, then player.LoadSource(resolvedSource) / player.LoadUrl(streamUrl) …
+        return true;
+    }
+}
+
+internal static class MyResolverInstaller
+{
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    private static void Install() => BasisMediaUrlRouter.Register(new MyResolver());
+}
+```
+
+- **Async resolves must guard against stale loads.** If `TryResolve` resolves
+  asynchronously, capture `player.LoadGeneration` before you start and skip your
+  `LoadSource` / `LoadUrl` when the async work completes if it no longer matches. The player
+  bumps `LoadGeneration` on every `LoadUrl`, so without this a slow resolve of an earlier URL
+  can overwrite a newer load. Return `true` as soon as you take ownership (kick off the
+  resolve), not when it finishes.
+- **Main thread only.** The resolver list is unsynchronised — `Register` / `Unregister`
+  and resolution all run on Unity's main thread. Registering from
+  `RuntimeInitializeOnLoadMethod` and resolving from the player's load path satisfies this.
+- **Routing only, never trust.** A resolver decides *how* a URL loads, not *whether* it's
+  allowed — host trust stays with `BasisMediaPlayerSecurity`.
 
 ## Usage
 
@@ -188,13 +238,13 @@ configure step below. You also need Unity's PluginAPI headers — see
 `Native~/unity/README.md`.
 
 **Windows → `Plugins/Windows/x86_64/basis_media_native.dll`**
-```
+```sh
 cmake -S Native~ -B Native~/build -A x64 -DUNITY_PLUGIN_API_DIR="<UnityEditor>/Editor/Data/PluginAPI"
 cmake --build Native~/build --config Release
 ```
 
 **Android (arm64, Vulkan) → `Plugins/Android/arm64-v8a/libbasis_media_native.so`**
-```
+```sh
 cmake -S Native~ -B Native~/build-android \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
