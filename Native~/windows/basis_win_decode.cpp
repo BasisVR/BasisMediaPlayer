@@ -12,10 +12,14 @@
  *
  * Graphics targets:
  *   D3D11 — output texture created on Unity's ID3D11Device (BGRA). Primary path.
- *   D3D12 — the shared BGRA is opened on Unity's ID3D12Device via OpenSharedHandle
- *           and handed straight to CreateExternalTexture. See the D3D12 notes by
- *           the present code: cross-API sync uses the keyed mutex where possible;
- *           validate fence/tearing behaviour on real hardware.
+ *   D3D12 — present copies the due ring slot into a TYPELESS shared texture on the
+ *           decode device; Unity opens that on its ID3D12Device and wraps it with
+ *           CreateExternalTexture. Typeless is required so Unity can cast the sRGB
+ *           SRV its (linear) colour space needs — a typed UNORM resource rejects
+ *           sRGB SRV creation under D3D12. The render thread polls an event query until
+ *           the copy retires on the GPU and only publishes once completion is confirmed
+ *           and Unity holds the external texture, so Unity never samples a half-written
+ *           or absent copy. A keyed mutex orders the decode-write against Unity's read.
  *
  * Notes / iterate-here:
  *   - Uses a synchronous (DXVA) decoder MFT via MFTEnumEx. Async hardware MFTs
@@ -222,6 +226,11 @@ struct basis_decoder {
     ID3D11DeviceContext* ctxUnity = nullptr;
     ID3D11Texture2D* outTexD11 = nullptr;   /* CreateExternalTexture target (D3D11) */
     void* outTexD12 = nullptr;              /* ID3D12Resource* (D3D12 path) */
+    ID3D11Texture2D* outSharedD12 = nullptr;       /* D3D12 path: typeless shared copy target (decode device) */
+    IDXGIKeyedMutex* outSharedD12Mutex = nullptr;
+    HANDLE outSharedD12Handle = nullptr;
+    ID3D11Query* presentQuery = nullptr;           /* D3D12 path: event query — polled to copy completion */
+    int d12OpenFail = 0;                           /* consecutive D3D12 OpenSharedHandle failures (render thread) */
 
     /* Vertical origin of the published frame: 0 = bottom-left (upright; Unity
      * samples it with no UV flip), 1 = top-left (consumer must flip V). Set once
@@ -281,6 +290,19 @@ static bool create_decode_device(basis_decoder* d) {
     if (SUCCEEDED(d->devDec->QueryInterface(__uuidof(ID3D11Multithread), (void**)&mt))) {
         mt->SetMultithreadProtected(TRUE);
         mt->Release();
+    }
+
+    /* D3D12 present-copy completion query (decode device). The render thread polls it
+     * to GPU completion so the copied frame is fully written before it is published to
+     * Unity's D3D12 device, which has no other handoff sync — Flush alone does not wait.
+     * End() re-arms it each present, so a timed-out wait leaves no stale state. It is the
+     * only completion primitive on this path, so a creation failure is fatal for D3D12. */
+    if (d->api == BASIS_GFX_D3D12) {
+        D3D11_QUERY_DESC qd = {}; qd.Query = D3D11_QUERY_EVENT;
+        if (FAILED(d->devDec->CreateQuery(&qd, &d->presentQuery)) || !d->presentQuery) {
+            basis_engine_set_error(d->engine, "failed to create D3D12 present completion query");
+            return false;
+        }
     }
 
     hr = MFCreateDXGIDeviceManager(&d->resetToken, &d->devMgr);
@@ -368,6 +390,10 @@ static void release_shared_locked(basis_decoder* d) {
     }
     SAFE_RELEASE(d->outTexD11);
     if (d->outTexD12) { ((ID3D12Resource*)d->outTexD12)->Release(); d->outTexD12 = nullptr; }
+    SAFE_RELEASE(d->outSharedD12Mutex);
+    SAFE_RELEASE(d->outSharedD12);
+    if (d->outSharedD12Handle) { CloseHandle(d->outSharedD12Handle); d->outSharedD12Handle = nullptr; }
+    d->d12OpenFail = 0;   /* new handle on the next build — don't carry the old retry count */
     d->writeSeq = 0;
     d->clockStarted = false;
     d->lastPresentedPts = INT64_MIN;
@@ -380,6 +406,7 @@ static bool ensure_shared_textures(basis_decoder* d, int w, int h) {
 
     EnterCriticalSection(&d->presentLock);
     release_shared_locked(d);
+    d->sharedW = d->sharedH = 0;   /* only re-set on full success below, so a failed build retries */
 
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width = w; desc.Height = h; desc.MipLevels = 1; desc.ArraySize = 1;
@@ -408,10 +435,13 @@ static bool ensure_shared_textures(basis_decoder* d, int w, int h) {
             if (d->ringOnUnity[i])
                 d->ringOnUnity[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&d->ringMutexUnity[i]);
         }
+        /* D3D11 presents by copying ringOnUnity (the slot opened on Unity's device);
+         * without it this slot can never present, so fail the build and retry rather
+         * than caching a half-set ring. D3D12 copies ringTex directly, so it doesn't
+         * need the shared mirror. */
+        if (d->api == BASIS_GFX_D3D11 && !d->ringOnUnity[i]) { ok = false; break; }
         d->ringPts[i] = INT64_MIN;
     }
-
-    d->sharedW = w; d->sharedH = h;
 
     /* Unity-visible output texture (TYPELESS so Unity makes a UNORM or sRGB SRV as
      * its colour space needs; a typed UNORM fails sRGB SRV creation with 0x80070057). */
@@ -425,7 +455,43 @@ static bool ensure_shared_textures(basis_decoder* d, int w, int h) {
             ok = false;
         }
     }
-    /* D3D12: outTexD12 opened lazily in render_update from a buffer's handle. */
+    /* D3D12: there is no Unity D3D11 device to copy into, so present copies the due
+     * ring slot into this TYPELESS shared texture on the decode device; Unity opens
+     * it on its ID3D12Device (typeless so it can cast the UNORM or sRGB SRV its
+     * colour space needs — a typed UNORM rejects sRGB SRV creation under D3D12).
+     * NTHANDLE sharing requires a keyed mutex, so it carries one like the ring. */
+    if (ok && d->api == BASIS_GFX_D3D12) {
+        D3D11_TEXTURE2D_DESC od = desc;
+        od.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        od.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        if (FAILED(d->devDec->CreateTexture2D(&od, nullptr, &d->outSharedD12))) {
+            basis_engine_set_error(d->engine, "failed to create D3D12 shared output texture");
+            ok = false;
+        } else {
+            d->outSharedD12->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&d->outSharedD12Mutex);
+            if (!d->outSharedD12Mutex) {
+                /* The present path depends on this mutex for cross-device (decode->Unity
+                 * D3D12) ordering; without it the copy would publish unsynchronised. */
+                basis_engine_set_error(d->engine, "failed to acquire D3D12 shared output keyed mutex");
+                ok = false;
+            }
+            IDXGIResource1* res1 = nullptr;
+            if (ok && SUCCEEDED(d->outSharedD12->QueryInterface(__uuidof(IDXGIResource1), (void**)&res1))) {
+                res1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &d->outSharedD12Handle);
+                res1->Release();
+            }
+            if (ok && !d->outSharedD12Handle) {
+                basis_engine_set_error(d->engine, "failed to share D3D12 output texture handle");
+                ok = false;
+            }
+        }
+    }
+
+    /* Cache the size only once the full path (ring + output texture) succeeded, so a
+     * failed output-texture/share create isn't masked by the early-return guard and
+     * is retried on the next call instead of leaving no usable shared output. */
+    if (ok) { d->sharedW = w; d->sharedH = h; }
 
     LeaveCriticalSection(&d->presentLock);
     return ok;
@@ -749,6 +815,7 @@ extern "C" void basis_decoder_destroy(basis_decoder_t* d) {
     SAFE_RELEASE(d->vdec);
     SAFE_RELEASE(d->adec);
     SAFE_RELEASE(d->devMgr);
+    SAFE_RELEASE(d->presentQuery);
     SAFE_RELEASE(d->ctxDec);
     SAFE_RELEASE(d->devDec);
     SAFE_RELEASE(d->ctxUnity);
@@ -918,6 +985,36 @@ extern "C" int basis_decoder_try_open_url(basis_decoder_t* d, const char* url) {
 
 /* ---- render thread ------------------------------------------------------ */
 
+/* Block until the decode-device copy into outSharedD12 has retired on the GPU, so the
+ * caller can release the shared surface and publish only a fully-written frame — Flush
+ * alone submits but does not wait, and the surface is single-buffered, so returning while
+ * the copy is in flight would let Unity sample a torn write. Polls an event query; End()
+ * re-arms it each present, so no stale completion carries over. Returns false only when
+ * completion can never come — a genuine GetData error (device lost) or a multi-second
+ * stall (GPU wedged) — both of which it surfaces as an engine error; the caller then
+ * neither releases the surface nor advances. A normal copy retires in well under a ms. */
+static bool present_copy_complete(basis_decoder* d, int64_t freq) {
+    if (!d->presentQuery) return false; /* no primitive to confirm completion */
+    d->ctxDec->End(d->presentQuery);
+    d->ctxDec->Flush();
+    LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+    for (;;) {
+        BOOL gpuDone = FALSE;
+        HRESULT hr = d->ctxDec->GetData(d->presentQuery, &gpuDone, sizeof(gpuDone), 0);
+        if (hr == S_OK) return true;        /* GPU reached End — copy retired */
+        if (hr != S_FALSE) {                /* genuine error, e.g. device removed */
+            basis_engine_set_error(d->engine, "D3D12 present copy completion query failed");
+            return false;
+        }
+        LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
+        if (tn.QuadPart - t0.QuadPart >= freq) {   /* ~1s: a copy this slow means a wedged GPU */
+            basis_engine_set_error(d->engine, "D3D12 present copy did not complete (GPU stalled)");
+            return false;
+        }
+        Sleep(0);
+    }
+}
+
 extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
     if (!d) return -1;
     InterlockedIncrement(&d->dbg_render);
@@ -1086,11 +1183,63 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
         } else {
             InterlockedIncrement(&d->dbg_acqfail);
         }
-    } else if (d->api == BASIS_GFX_D3D12 && !d->outTexD12 && d->ringHandle[best]) {
-        ID3D12Device* dev12 = (ID3D12Device*)basis_gfx_get_d3d12_device();
-        if (dev12) {
-            ID3D12Resource* res = nullptr;
-            if (SUCCEEDED(dev12->OpenSharedHandle(d->ringHandle[best], IID_PPV_ARGS(&res)))) d->outTexD12 = res;
+    } else if (d->api == BASIS_GFX_D3D12 && d->outSharedD12 && d->outSharedD12Mutex && d->ctxDec) {
+        /* Make sure Unity has opened the shared output on its D3D12 device first —
+         * without that external texture there is nothing for it to sample, so
+         * presentation state must not advance until the open succeeds. */
+        if (!d->outTexD12 && d->outSharedD12Handle) {
+            ID3D12Device* dev12 = (ID3D12Device*)basis_gfx_get_d3d12_device();
+            if (dev12) {
+                ID3D12Resource* res = nullptr;
+                HRESULT hr = dev12->OpenSharedHandle(d->outSharedD12Handle, IID_PPV_ARGS(&res));
+                if (SUCCEEDED(hr)) {
+                    d->outTexD12 = res;
+                    d->d12OpenFail = 0;
+                } else if (++d->d12OpenFail == 120) {
+                    /* Persisted ~2s: the shared frame never reached Unity. Surface the
+                     * HRESULT once (further frames keep retrying) so this integration
+                     * failure is diagnosable instead of a silent black screen. */
+                    char m[96];
+                    snprintf(m, sizeof(m), "D3D12 OpenSharedHandle failed (hr=0x%08lX)", (unsigned long)hr);
+                    basis_engine_set_error(d->engine, m);
+                }
+            }
+        }
+        /* Copy the due ring slot into the typeless shared output on the decode device
+         * (D3D11). Unity's D3D12 device has no handoff sync with this copy, so wait for
+         * GPU completion before publishing. Publish only when completion is confirmed
+         * AND Unity holds the external texture, so it never shows a half-written or
+         * not-yet-available frame; otherwise leave the slot for the next present. D3D11
+         * copies on Unity's own (serialized) context instead — there is no Unity D3D11
+         * context here, so the copy runs decode-side. */
+        if (d->outTexD12) {
+            HRESULT a = d->ringMutexDec[best] ? d->ringMutexDec[best]->AcquireSync(0, 8) : S_OK;
+            if (a == S_OK) {
+                HRESULT ad = d->outSharedD12Mutex->AcquireSync(0, 8);
+                if (ad == S_OK) {
+                    d->ctxDec->CopyResource(d->outSharedD12, d->ringTex[best]);
+                    if (present_copy_complete(d, freq)) {
+                        /* Release only after the copy retired, so the shared surface is
+                         * never handed on (or sampled) mid-write. */
+                        d->outSharedD12Mutex->ReleaseSync(0);
+                        d->lastPresentedPts = bestPts;
+                        InterlockedIncrement(&d->dbg_copy);
+                        if (d->ttffMs < 0) {
+                            LARGE_INTEGER tnow; QueryPerformanceCounter(&tnow);
+                            d->ttffMs = (LONG)((tnow.QuadPart - d->createQpc.QuadPart) * 1000 / freq);
+                        }
+                    } else {
+                        /* Completion can't be confirmed — present_copy_complete only
+                         * returns false on a device-lost / wedged GPU it already flagged
+                         * as an engine error. Keep the mutex held rather than expose an
+                         * in-flight write; teardown frees it as playback stops. */
+                        InterlockedIncrement(&d->dbg_drop);
+                    }
+                }
+                if (d->ringMutexDec[best]) d->ringMutexDec[best]->ReleaseSync(0);
+            } else {
+                InterlockedIncrement(&d->dbg_acqfail);
+            }
         }
     }
     LeaveCriticalSection(&d->presentLock);
