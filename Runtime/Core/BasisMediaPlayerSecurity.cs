@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Threading.Tasks;
 using UnityEngine;
 
 public static class BasisMediaPlayerSecurity
@@ -64,8 +65,8 @@ public static class BasisMediaPlayerSecurity
         reason = null;
         if (string.IsNullOrEmpty(host)) { reason = "missing host"; return true; }
 
-        string lower = host.ToLowerInvariant();
         bool allowLoopback = Application.isEditor;
+        string lower = host.ToLowerInvariant();
         if (!allowLoopback && (lower == "localhost" || lower.EndsWith(".localhost")))
         {
             reason = "loopback host is blocked in builds.";
@@ -73,56 +74,87 @@ public static class BasisMediaPlayerSecurity
         }
 
         if (IPAddress.TryParse(host.Trim('[', ']'), out IPAddress ip))
-        {
-            if (!allowLoopback && IPAddress.IsLoopback(ip))
-            {
-                reason = "loopback address is blocked in builds.";
-                return true;
-            }
-            if (IsLinkLocal(ip))
-            {
-                reason = "link-local address (including cloud metadata) is blocked.";
-                return true;
-            }
-            if (IsPrivate(ip))
-            {
-                reason = "RFC1918 private address is blocked.";
-                return true;
-            }
-            if (IsUniqueLocalIPv6(ip))
-            {
-                reason = "IPv6 unique-local address is blocked.";
-                return true;
-            }
-        }
+            return IsBlockedAddress(ip, allowLoopback, out reason);
+
         return false;
     }
 
-    private static bool IsLinkLocal(IPAddress ip)
+    // DNS layer: resolves a real host name off the main thread and blocks it if any
+    // resolved address is non-global. Closes the name-that-points-at-a-private-IP
+    // bypass that the literal-only IsBlockedHost can't see. null = allowed.
+    public static async Task<string> ValidateResolvedHostAsync(string url)
     {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri)) return null;
+        string host = uri.Host;
+        if (string.IsNullOrEmpty(host)) return null;
+        if (IPAddress.TryParse(host.Trim('[', ']'), out _)) return null;
+
+        bool allowLoopback = Application.isEditor;
+        IPAddress[] addresses;
+        try { addresses = await Dns.GetHostAddressesAsync(host); }
+        catch { return null; }
+        if (addresses == null) return null;
+
+        foreach (IPAddress ip in addresses)
+            if (IsBlockedAddress(ip, allowLoopback, out string reason))
+                return $"host '{host}' resolves to a blocked address ({reason}).";
+        return null;
+    }
+
+    // Blocks anything that is not global unicast, including a private/loopback target
+    // smuggled through IPv4-mapped or 6to4 IPv6. allowLoopback exempts loopback only.
+    public static bool IsBlockedAddress(IPAddress ip, bool allowLoopback, out string reason)
+    {
+        reason = null;
+        if (ip == null) { reason = "null address"; return true; }
+
+        byte[] b = ip.GetAddressBytes();
+
+        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && b.Length == 16)
+        {
+            bool mapped = true;
+            for (int i = 0; i < 10; i++) if (b[i] != 0) { mapped = false; break; }
+            if (mapped && b[10] == 0xFF && b[11] == 0xFF)
+                return IsBlockedAddress(new IPAddress(new[] { b[12], b[13], b[14], b[15] }), allowLoopback, out reason);
+        }
+
         if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
-            byte[] b = ip.GetAddressBytes();
-            return b[0] == 169 && b[1] == 254;
+            if (b[0] == 127) { if (allowLoopback) return false; reason = "loopback 127/8"; return true; }
+            if (b[0] == 0) { reason = "unspecified 0/8"; return true; }
+            if (b[0] == 10) { reason = "RFC1918 10/8"; return true; }
+            if (b[0] == 100 && (b[1] & 0xC0) == 64) { reason = "CGNAT 100.64/10"; return true; }
+            if (b[0] == 169 && b[1] == 254) { reason = "link-local 169.254/16"; return true; }
+            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) { reason = "RFC1918 172.16/12"; return true; }
+            if (b[0] == 192 && b[1] == 168) { reason = "RFC1918 192.168/16"; return true; }
+            if (b[0] >= 224) { reason = "multicast/reserved >=224/4"; return true; }
+            return false;
         }
-        return ip.IsIPv6LinkLocal;
-    }
 
-    private static bool IsPrivate(IPAddress ip)
-    {
-        if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
-        byte[] b = ip.GetAddressBytes();
-        if (b[0] == 10) return true;
-        if (b[0] == 192 && b[1] == 168) return true;
-        if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
-        return false;
-    }
+        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+        {
+            bool allZero = true;
+            for (int i = 0; i < 16; i++) if (b[i] != 0) { allZero = false; break; }
+            if (allZero) { reason = "IPv6 unspecified ::"; return true; }
 
-    private static bool IsUniqueLocalIPv6(IPAddress ip)
-    {
-        if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6) return false;
-        byte[] b = ip.GetAddressBytes();
-        return (b[0] & 0xFE) == 0xFC;
+            bool isLoop = b[15] == 1;
+            if (isLoop) for (int i = 0; i < 15; i++) if (b[i] != 0) { isLoop = false; break; }
+            if (isLoop) { if (allowLoopback) return false; reason = "IPv6 loopback ::1"; return true; }
+
+            if ((b[0] & 0xFE) == 0xFC) { reason = "IPv6 ULA fc00::/7"; return true; }
+            if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) { reason = "IPv6 link-local fe80::/10"; return true; }
+            if (b[0] == 0xFF) { reason = "IPv6 multicast ff00::/8"; return true; }
+
+            if (b[0] == 0x20 && b[1] == 0x02 &&
+                IsBlockedAddress(new IPAddress(new[] { b[2], b[3], b[4], b[5] }), allowLoopback, out string r6to4))
+            { reason = "6to4→" + r6to4; return true; }
+
+            return false;
+        }
+
+        reason = "non-IP address family";
+        return true;
     }
 
     public static bool TrySandboxLogPath(string requested, out string sandboxed, out string reason)

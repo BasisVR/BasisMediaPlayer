@@ -56,9 +56,11 @@ extern "C" void* basis_win_http_open(const char* url) {
         free(wurl); free(h); return NULL;
     }
 
-    /* Disable response buffering so live streams flow as they arrive. */
-    DWORD opt = WINHTTP_DISABLE_REDIRECTS; /* keep redirects on by NOT setting? we want them on */
-    (void)opt;
+    /* SSRF: never let a public URL redirect down to plaintext (the classic
+     * https://public -> http://127.0.0.1 downgrade). Same-scheme redirects still
+     * follow, but a private https target has no valid cert and fails the TLS check. */
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(h->request, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     if (!WinHttpSendRequest(h->request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||

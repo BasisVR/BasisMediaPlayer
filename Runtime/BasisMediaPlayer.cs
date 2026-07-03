@@ -509,8 +509,13 @@ public sealed class BasisMediaPlayer : MonoBehaviour
 
     private void StartNativeEngineForSource(BasisMediaSource media)
     {
-        // The decision may resolve a frame or more later (dialog), so re-check this
-        // is still the source we were asked to load before starting the engine.
+        _ = StartNativeEngineForSourceAsync(media);
+    }
+
+    private async System.Threading.Tasks.Task StartNativeEngineForSourceAsync(BasisMediaSource media)
+    {
+        // The decision may resolve a frame or more later (dialog / DNS), so re-check
+        // this is still the source we were asked to load before starting the engine.
         if (!ReferenceEquals(activeMediaSource, media)) return;
 
         try
@@ -525,14 +530,22 @@ public sealed class BasisMediaPlayer : MonoBehaviour
                 !BasisMediaPlayerSecurity.IsUrlAllowed(media.AudioUri, out string audioBlockReason))
                 throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load audio '{media.AudioUri}': {audioBlockReason}");
 
+            string dnsReason = await BasisMediaPlayerSecurity.ValidateResolvedHostAsync(media.Uri);
+            if (dnsReason == null && !string.IsNullOrEmpty(media.AudioUri))
+                dnsReason = await BasisMediaPlayerSecurity.ValidateResolvedHostAsync(media.AudioUri);
+            if (dnsReason != null)
+                throw new UnauthorizedAccessException($"BasisMediaPlayer refused to load '{media.Uri}': {dnsReason}");
+
+            if (!ReferenceEquals(activeMediaSource, media)) return;
+
             SetNativeEngine(new BasisNativeVideoSource(ResolveNativeUri(media), ResolveNativeAudioUri(media), media.Delivery));
         }
         catch (Exception ex)
         {
-            HandleError(ex);
+            if (ReferenceEquals(activeMediaSource, media)) HandleError(ex);
         }
 
-        ApplyMediaSourceSettings(media);
+        if (ReferenceEquals(activeMediaSource, media)) ApplyMediaSourceSettings(media);
     }
 
     // RIST exposes a receive-buffer depth that librist parses straight from the URL

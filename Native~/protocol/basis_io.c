@@ -68,6 +68,57 @@ void basis_io_set_read_timeout(basis_io_t* io, int timeout_ms) {
 #endif
 }
 
+static int local_allowed(void) {
+    const char* v = getenv("BASIS_MEDIA_ALLOW_LOCAL");
+    return v && v[0];
+}
+
+static int ipv4_octets_blocked(uint8_t b0, uint8_t b1) {
+    if (b0 == 0) return 1;                              /* 0/8 unspecified */
+    if (b0 == 10) return 1;                             /* 10/8 */
+    if (b0 == 127) return 1;                            /* 127/8 loopback */
+    if (b0 == 100 && (b1 & 0xC0) == 64) return 1;       /* 100.64/10 CGNAT */
+    if (b0 == 169 && b1 == 254) return 1;               /* 169.254/16 link-local (metadata) */
+    if (b0 == 172 && b1 >= 16 && b1 <= 31) return 1;    /* 172.16/12 */
+    if (b0 == 192 && b1 == 168) return 1;               /* 192.168/16 */
+    if (b0 >= 224) return 1;                            /* multicast/reserved */
+    return 0;
+}
+
+/* SSRF guard: reject connecting to a non-global-unicast target. Checks the ACTUAL
+ * resolved address, so a public name pointed at a private IP (and DNS rebinding) is
+ * caught here at connect time, not just at the URL string. */
+static int sockaddr_is_blocked(const struct sockaddr* sa) {
+    if (!sa) return 1;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in* s = (const struct sockaddr_in*)sa;
+        const uint8_t* b = (const uint8_t*)&s->sin_addr.s_addr; /* network order = octets in order */
+        return ipv4_octets_blocked(b[0], b[1]);
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6* s = (const struct sockaddr_in6*)sa;
+        const uint8_t* b = (const uint8_t*)s->sin6_addr.s6_addr;
+        int i, nz = 0, loop = (b[15] == 1);
+        for (i = 0; i < 16; i++) if (b[i]) { nz = 1; break; }
+        if (!nz) return 1;                                 /* :: unspecified */
+        for (i = 0; i < 15; i++) if (b[i]) { loop = 0; break; }
+        if (loop) return 1;                                /* ::1 loopback */
+        if ((b[0] & 0xFE) == 0xFC) return 1;               /* fc00::/7 ULA */
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return 1; /* fe80::/10 link-local */
+        if (b[0] == 0xFF) return 1;                        /* ff00::/8 multicast */
+        {
+            int mapped = 1;
+            for (i = 0; i < 10; i++) if (b[i]) { mapped = 0; break; }
+            if (mapped && b[10] == 0xFF && b[11] == 0xFF)  /* ::ffff:a.b.c.d */
+                return ipv4_octets_blocked(b[12], b[13]);
+        }
+        if (b[0] == 0x20 && b[1] == 0x02)                  /* 2002::/16 6to4 */
+            return ipv4_octets_blocked(b[2], b[3]);
+        return 0;
+    }
+    return 1;
+}
+
 basis_io_t* basis_io_connect(const char* host, int port, int timeout_ms) {
     if (!host || port <= 0) return NULL;
 
@@ -82,7 +133,9 @@ basis_io_t* basis_io_connect(const char* host, int port, int timeout_ms) {
     if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return NULL;
 
     sock_t fd = BASIS_INVALID_SOCK;
+    int allow_local = local_allowed();
     for (ai = res; ai; ai = ai->ai_next) {
+        if (!allow_local && sockaddr_is_blocked(ai->ai_addr)) continue;
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd == BASIS_INVALID_SOCK) continue;
 
