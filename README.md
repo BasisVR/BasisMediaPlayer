@@ -134,7 +134,7 @@ only steers — it never blocks a URL; host trust is enforced separately.)
 A resolver is any `IBasisVideoResolver` registered on `BasisMediaUrlRouter`. The player
 core never references it — register one at startup and the router consults it for every
 load, in `Priority` order, until one takes ownership. The bundled
-[yt-dlp integration](../com.basis.integration.ytdlp/README.md) is a complete worked
+[yt-dlp integration](https://github.com/BasisVR/BasisYtDlpIntegration) is a complete worked
 example; the shape is:
 
 ```csharp
