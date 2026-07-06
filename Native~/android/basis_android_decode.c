@@ -33,16 +33,28 @@
 
 /* ---- PCM ring ----------------------------------------------------------- */
 
+/* Interleaved float FIFO. Same alignment contract as the Windows ring: drops
+ * are always whole-frame counts, so the surviving stream keeps its channel
+ * phase; reads may return partial frames — the managed splitter carries
+ * sub-frame remainders across pulls. Neither end anchors head/tail to an
+ * absolute frame boundary. */
 typedef struct {
     float* buf; int cap, head, tail;
+    int frame; /* floats per interleaved frame (channel count) */
     pthread_mutex_t m;
 } pcm_ring;
 
-static void ring_init(pcm_ring* r, int floats) { r->buf = malloc(sizeof(float) * floats); r->cap = floats; r->head = r->tail = 0; pthread_mutex_init(&r->m, NULL); }
+static void ring_init(pcm_ring* r, int floats) { r->buf = malloc(sizeof(float) * floats); r->cap = floats; r->head = r->tail = 0; r->frame = 2; pthread_mutex_init(&r->m, NULL); }
 static void ring_free(pcm_ring* r) { free(r->buf); r->buf = NULL; pthread_mutex_destroy(&r->m); }
+static void ring_set_frame(pcm_ring* r, int frame) {
+    pthread_mutex_lock(&r->m);
+    r->frame = frame > 0 ? frame : 1;
+    r->head = r->tail = 0; /* buffered floats are in the old framing */
+    pthread_mutex_unlock(&r->m);
+}
 static void ring_write(pcm_ring* r, const float* s, int n) {
     pthread_mutex_lock(&r->m);
-    for (int i = 0; i < n; ++i) { int nt = (r->tail + 1) % r->cap; if (nt == r->head) r->head = (r->head + 1) % r->cap; r->buf[r->tail] = s[i]; r->tail = nt; }
+    for (int i = 0; i < n; ++i) { int nt = (r->tail + 1) % r->cap; if (nt == r->head) r->head = (r->head + r->frame) % r->cap; r->buf[r->tail] = s[i]; r->tail = nt; }
     pthread_mutex_unlock(&r->m);
 }
 static int ring_read(pcm_ring* r, float* out, int n) {
@@ -70,6 +82,7 @@ struct basis_decoder {
     int vconfigured, aconfigured;
 
     int asr, ach;
+    int apcm_float; /* decoder emits float PCM (pcm-encoding 4) instead of 16-bit */
 
     basis_vk_present* vk;
 
@@ -145,15 +158,19 @@ static void drain_audio_output(basis_decoder_t* d) {
             size_t cap = 0;
             uint8_t* buf = AMediaCodec_getOutputBuffer(d->acodec, oi, &cap);
             if (buf && info.size >= 2) {
-                int n = info.size / 2; /* 16-bit PCM */
-                float tmp[4096];
-                const int16_t* s16 = (const int16_t*)(buf + info.offset);
-                int off = 0;
-                while (off < n) {
-                    int chunk = n - off; if (chunk > 4096) chunk = 4096;
-                    for (int i = 0; i < chunk; ++i) tmp[i] = s16[off + i] / 32768.0f;
-                    ring_write(&d->pcm, tmp, chunk);
-                    off += chunk;
+                if (d->apcm_float) {
+                    ring_write(&d->pcm, (const float*)(buf + info.offset), (int)(info.size / 4));
+                } else {
+                    int n = info.size / 2; /* 16-bit PCM */
+                    float tmp[4096];
+                    const int16_t* s16 = (const int16_t*)(buf + info.offset);
+                    int off = 0;
+                    while (off < n) {
+                        int chunk = n - off; if (chunk > 4096) chunk = 4096;
+                        for (int i = 0; i < chunk; ++i) tmp[i] = s16[off + i] / 32768.0f;
+                        ring_write(&d->pcm, tmp, chunk);
+                        off += chunk;
+                    }
                 }
             }
             AMediaCodec_releaseOutputBuffer(d->acodec, oi, false);
@@ -161,9 +178,25 @@ static void drain_audio_output(basis_decoder_t* d) {
             AMediaFormat* f = AMediaCodec_getOutputFormat(d->acodec);
             AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, &d->asr);
             AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &d->ach);
+            int32_t enc = 2; /* android.media.AudioFormat.ENCODING_PCM_*: 2 = 16-bit (the default when the key is absent), 4 = float */
+            AMediaFormat_getInt32(f, "pcm-encoding", &enc);
+            d->apcm_float = (enc == 4);
+            if (d->ach > 0 && d->ach != d->pcm.frame) ring_set_frame(&d->pcm, d->ach);
+            __android_log_print(ANDROID_LOG_INFO, "basis_media",
+                "audio output format: %d Hz, %d ch, pcm-encoding %d", d->asr, d->ach, (int)enc);
             AMediaFormat_delete(f);
         } else break;
     }
+}
+
+/* Ask the audio decoder for the stream's full channel layout: AAC decoders on
+ * some devices fold multichannel down to stereo unless configured with an
+ * output-channel ceiling. Both the generic (API 32+) and the legacy AAC key
+ * are set — unknown keys are ignored, and values above the stream's channel
+ * count clamp to it. */
+static void request_full_channel_output(AMediaFormat* fmt) {
+    AMediaFormat_setInt32(fmt, "max-output-channel-count", 99);
+    AMediaFormat_setInt32(fmt, "aac-max-output-channel_count", 99);
 }
 
 /* ---- URL path: extractor + worker thread -------------------------------- */
@@ -174,6 +207,7 @@ static AMediaCodec* create_codec_for_track(basis_decoder_t* d, AMediaFormat* fmt
     AMediaCodec* c = AMediaCodec_createDecoderByType(mime);
     if (!c) return NULL;
     ANativeWindow* surface = NULL;
+    if (!video) request_full_channel_output(fmt);
     if (video) {
         int32_t w = 1280, h = 720;
         AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &w);
@@ -271,6 +305,7 @@ int basis_decoder_try_open_url(basis_decoder_t* d, const char* url) {
             AMediaExtractor_selectTrack(d->extractor, i);
             AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, &d->asr);
             AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &d->ach);
+            if (d->ach > 0) ring_set_frame(&d->pcm, d->ach);
             d->acodec = create_codec_for_track(d, f, 0);
             d->aconfigured = 1;
         }
@@ -318,10 +353,12 @@ int basis_decoder_set_audio_format(basis_decoder_t* d, basis_codec_t codec,
                                    int sample_rate, int channels, const uint8_t* asc, int asc_len) {
     if (!d || d->aconfigured || codec != BASIS_CODEC_AAC) return 0;
     d->asr = sample_rate; d->ach = channels;
+    ring_set_frame(&d->pcm, channels ? channels : 2);
     AMediaFormat* fmt = AMediaFormat_new();
     AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "audio/mp4a-latm");
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, sample_rate ? sample_rate : 48000);
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, channels ? channels : 2);
+    request_full_channel_output(fmt);
     if (asc && asc_len > 0) AMediaFormat_setBuffer(fmt, "csd-0", (void*)asc, asc_len);
     AMediaCodec* c = AMediaCodec_createDecoderByType("audio/mp4a-latm");
     if (!c || AMediaCodec_configure(c, fmt, NULL, NULL, 0) != AMEDIA_OK ||

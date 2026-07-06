@@ -154,23 +154,14 @@ uint64_t basis_gfx_vk_physical_device(void);
 uint64_t basis_gfx_vk_graphics_queue(void);
 uint32_t basis_gfx_vk_graphics_queue_family(void);
 
-/* Vulkan: fetch Unity's currently-recording command buffer (so the YCbCr->RGBA
- * resolve runs inside Unity's frame, no separate submit/fence) and ensure we're
- * outside Unity's render pass. Writes Unity's current and "safe" (GPU-completed)
- * frame numbers for resource lifetime tracking. Returns VkCommandBuffer as
- * uintptr_t, or 0 if no buffer is available this call. Render thread only. */
-uint64_t basis_gfx_vk_begin_record(uint64_t* out_current_frame, uint64_t* out_safe_frame);
-
-/* Vulkan: ask Unity for the VkImage backing a C#-side Texture/RenderTexture
- * (its GetNativeTexturePtr()). Unity inserts pipeline barriers to transition
- * the resource to the requested layout/stage/access for the calling command
- * buffer. Returns 1 on success (out_image/out_layout/out_format/out_w/out_h
- * filled), 0 if unavailable. requested_layout uses raw VkImageLayout values
- * (e.g. VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2). */
+/* Vulkan: query the VkImage backing a C#-side Texture/RenderTexture (its
+ * GetNativeTexturePtr()). Observe-only — nothing is recorded into Unity's
+ * command buffer and no layout transition is requested; the caller owns all
+ * synchronisation against the image. Returns 1 on success
+ * (out_image/out_format/out_w/out_h filled), 0 if unavailable. Render thread
+ * only. */
 int basis_gfx_vk_access_texture(void* native_texture,
-                                int requested_layout,
                                 uint64_t* out_image,
-                                int* out_layout,
                                 int* out_format,
                                 int* out_w,
                                 int* out_h);

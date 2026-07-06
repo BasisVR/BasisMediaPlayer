@@ -764,6 +764,7 @@ MonoBehaviour:
   MaterialIndex: 0
   TexturePropertyName: _BaseMap
   UseSharedMaterial: 0
+  AdditionalTargets: []
   PlaceholderTexture: {fileID: 2800000, guid: 93f0d4f9be07b5e4094ac46f24473eb1, type: 3}
   RestorePlaceholderOnEnded: 1
   FlipVertically: 0
@@ -805,8 +806,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: BasisSDK::BasisProp
   BasisBundleDescription:
-    AssetBundleName: BasisMediaPlayer
-    AssetBundleDescription: 0.02 Made by the basis team
+    AssetBundleName: Basis Media Player
+    AssetBundleDescription: 0.1.0 Made by the Basis team
     AssetBundleIcon: {fileID: 0}
     Tags:
     - MediaPlayer
@@ -932,37 +933,100 @@ MonoBehaviour:
   IsOwnedLocallyOnServer: 0
   IsOwnedLocallyOnClient: 0
   CurrentOwnerId: 0
-  BasisPickupInteractable: {fileID: 0}
+  SendIntervalSeconds: 0.05
+  KeyframeIntervalSeconds: 0.5
+  ContinuousEpsilon: 0.0001
+  RotationSendThresholdDegrees: 0.5
+  UseDirectP2P: 1
+  ForceP2POnly: 0
+  OverrideP2PRate: 0
+  P2PSendIntervalSeconds: 0.033
+  P2PKeyframeIntervalSeconds: 0.5
+  Delivery: 4
+  KeyframeDelivery: 2
+  Extrapolate: 0
+  MaxExtrapolationSeconds: 0.2
+  JitterBufferDepth: 2
+  UseTeleportThreshold: 0
+  TeleportThreshold: 3
+  DistanceReduction: 1
+  RelevanceCulling: 0
+  RelevanceRadius: 50
+  UseChecksum: 1
+  _serializedVersion: 3
+  Target: {fileID: 4507114126077030822}
+  SyncPosition: 1
+  PositionX: 1
+  PositionY: 1
+  PositionZ: 1
+  SyncRotation: 1
+  RotationMode: 0
+  SmallestThreeBits: 9
+  RotationX: 1
+  RotationY: 1
+  RotationZ: 1
+  SyncScale: 1
+  ScaleUniform: 0
+  ScaleX: 1
+  ScaleY: 1
+  ScaleZ: 1
+  WorldSpace: 0
+  RelativeTo: {fileID: 0}
+  InterpolatePosition: 1
+  InterpolateRotation: 1
+  InterpolateScale: 1
+  PosCompX:
+    Mode: 0
+    Min: -1024
+    Max: 1024
+    Bits: 16
+  PosCompY:
+    Mode: 0
+    Min: -1024
+    Max: 1024
+    Bits: 16
+  PosCompZ:
+    Mode: 0
+    Min: -1024
+    Max: 1024
+    Bits: 16
+  RotCompX:
+    Mode: 0
+    Min: 0
+    Max: 360
+    Bits: 16
+  RotCompY:
+    Mode: 0
+    Min: 0
+    Max: 360
+    Bits: 16
+  RotCompZ:
+    Mode: 0
+    Min: 0
+    Max: 360
+    Bits: 16
+  ScaleCompX:
+    Mode: 0
+    Min: 0
+    Max: 64
+    Bits: 16
+  ScaleCompY:
+    Mode: 0
+    Min: 0
+    Max: 64
+    Bits: 16
+  ScaleCompZ:
+    Mode: 0
+    Min: 0
+    Max: 64
+    Bits: 16
+  BasisPickupInteractable: {fileID: 3404733239259574964}
   CanNetworkSteal: 1
   IsStatic: 0
-  LocalLastData:
-    x: 0
-    y: 0
-    z: 0
-    Rotation: 0
-    Scalex: 0
-    Scaley: 0
-    Scalez: 0
-  BTU:
-    TargetPosition:
-      x: 0
-      y: 0
-      z: 0
-    TargetRotation:
-      value:
-        x: 0
-        y: 0
-        z: 0
-        w: 0
-    TargetScales:
-      x: 0
-      y: 0
-      z: 0
-    LerpMultipliers: 0
   pendingStealRequest: {fileID: 0}
-  CatchupLerp: 5
-  buffer: 00000000000000000000000000000000
-  SelfTransform: {fileID: 0}
+  RemoteDeadReckon: 0
+  AttachToHandOnGrab: 1
+  FullRateWhileHeld: 1
 --- !u!54 &7733138127675236971
 Rigidbody:
   m_ObjectHideFlags: 0

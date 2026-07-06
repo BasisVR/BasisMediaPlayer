@@ -114,11 +114,12 @@ static int rtsp_recv(rtsp_t* r, char* body, int bodycap, int* bodylen) {
         }
     }
     if (bodylen) *bodylen = 0;
-    if (content_len > 0 && body) {
-        int want = content_len < bodycap ? content_len : bodycap;
-        int got = basis_io_read_full(r->io, (uint8_t*)body, want);
+    if (content_len > 0) {
+        int want = body ? (content_len < bodycap ? content_len : bodycap) : 0;
+        int got = want > 0 ? basis_io_read_full(r->io, (uint8_t*)body, want) : 0;
         if (bodylen) *bodylen = got;
-        /* drain any overflow beyond bodycap */
+        /* drain whatever the caller's buffer didn't take, so an ignored or
+         * oversized body can't desynchronise the next reply on the socket */
         for (int rest = content_len - got; rest > 0; ) {
             uint8_t tmp[256]; int t = rest < (int)sizeof(tmp) ? rest : (int)sizeof(tmp);
             if (basis_io_read_full(r->io, tmp, t) != t) break;
@@ -241,6 +242,7 @@ typedef struct {
     int64_t au_ts;                       /* RTP ts of current AU */
     int have_au_ts;
     int video_announced;
+    int audio_announced;
 
     uint8_t* fu; int fu_len, fu_cap;     /* FU reassembly */
     int fu_active;
@@ -387,15 +389,12 @@ static void depkt_audio(depkt_t* d, const uint8_t* rtp, int len) {
     int dpos = 2 + num * 2;
     if (num <= 0 || dpos > plen) { /* assume single AU, no header */ num = 1; dpos = 0; }
 
-    static int announced = 0;
-    if (!d->audio->asc_len && !announced) { /* fall back to a stereo 48k ASC */ }
-
-    /* announce format once */
-    {
+    if (!d->audio_announced) {
         int sr = d->audio->clock ? d->audio->clock : 48000;
         int ch = d->audio->channels ? d->audio->channels : 2;
         d->sink->on_audio_format(d->sink->user, BASIS_CODEC_AAC, sr, ch,
                                  d->audio->asc_len ? d->audio->asc : NULL, d->audio->asc_len);
+        d->audio_announced = 1;
     }
 
     int off = dpos;
@@ -473,6 +472,7 @@ int basis_rtsp_run(basis_media_sink_t* sink, const basis_url_t* url) {
 
     sdp_media_t video, audio; int nmedia;
     memset(&video, 0, sizeof(video)); memset(&audio, 0, sizeof(audio));
+    video.pt = audio.pt = -1; /* pt 0 is a valid payload type; -1 marks the media absent */
     nmedia = parse_sdp(body, blen, &video, &audio);
     if (nmedia == 0 || video.pt < 0) { sink->on_error(sink->user, "RTSP: no usable media in SDP"); basis_io_close(r.io); return -1; }
 

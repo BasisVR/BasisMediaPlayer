@@ -5,10 +5,19 @@
  * VK_ANDROID_external_memory_android_hardware_buffer and resolves it to an RGBA
  * VkImage that Unity samples. The resolve is a fullscreen draw that samples the
  * AHB through an immutable Y'CbCr-conversion sampler (the conversion does
- * YCbCr->RGB), recorded into Unity's own command buffer (IUnityGraphicsVulkan)
- * so there is no separate queue submit or fence to manage — it runs as part of
- * Unity's frame, and Unity's safeFrameNumber tells us when an imported buffer is
- * free to release.
+ * YCbCr->RGB), recorded into a plugin-owned command buffer and submitted on the
+ * graphics queue from the render event. The event is configured with
+ * kUnityVulkanGraphicsQueueAccess_Allow, so Unity holds its own queue users off
+ * the queue while the callback runs; a fence per ring slot tells us when an
+ * imported buffer is free to release. Nothing is ever recorded into Unity's
+ * command buffers: a foreign render pass recorded there corrupts the Adreno
+ * driver's command-buffer state and crashes later in vkCmdExecuteCommands.
+ *
+ * No layout coordination with Unity is needed: the render pass takes the target
+ * from UNDEFINED (contents discarded — every draw overwrites the full frame) and
+ * hands it back in SHADER_READ_ONLY, the layout Unity samples it in. Same-queue
+ * submission order plus the render pass's external dependencies order the write
+ * against Unity's subsequent sampling.
  *
  * Pipeline objects (Y'CbCr conversion, immutable sampler, descriptor layout,
  * render pass, graphics pipeline) depend only on the AHB external format, so they
@@ -19,8 +28,8 @@
  * ON-DEVICE VALIDATION POINTS (can't be exercised off-Quest):
  *   - external-format image view + ycbcr immutable sampler descriptor wiring
  *   - the render pass leaves rgbaImage in SHADER_READ_ONLY_OPTIMAL, which is the
- *     layout Unity expects for a CreateExternalTexture image
- *   - safeFrameNumber-based reclamation depth (BASIS_VK_RING) vs frames in flight
+ *     layout Unity expects to sample
+ *   - fence-based reclamation depth (BASIS_VK_RING) vs frames in flight
  */
 
 #include "basis_android_vk.h"
@@ -45,7 +54,8 @@ typedef struct {
     VkDeviceMemory   memory;
     VkImageView      view;
     VkDescriptorSet  set;
-    uint64_t         lastUsedFrame;  /* Unity frame this slot was recorded into */
+    VkCommandBuffer  cmd;    /* allocated once with the pool, re-recorded per submit */
+    VkFence          fence;  /* created signaled; reset just before each submit */
     int              inUse;
 } basis_vk_slot;
 
@@ -55,6 +65,8 @@ struct basis_vk_present {
     VkDevice device;
     VkQueue queue;
     uint32_t queueFamily;
+
+    VkCommandPool cmdPool;   /* backs the per-slot command buffers */
 
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID getAHBProps;
 
@@ -121,6 +133,22 @@ void basis_vk_set_hardware_buffer(basis_vk_present* v, AHardwareBuffer* ahb, int
 }
 
 /* ---- slot (per-frame source image) ------------------------------------- */
+
+/* Wait out any in-flight submissions before destroying resources their
+ * command buffers reference — slot images/descriptors and the Unity
+ * framebuffer alike. Never-submitted fences were created signaled. The wait
+ * is capped: a resolve draw that hasn't completed after 1s means a wedged or
+ * lost device, where hanging teardown would be worse than proceeding — but
+ * log it so a teardown-on-hang is diagnosable. */
+static void wait_in_flight(basis_vk_present* v) {
+    for (int i = 0; i < BASIS_VK_RING; ++i)
+        if (v->ring[i].inUse && v->ring[i].fence) {
+            VkResult r = vkWaitForFences(v->device, 1, &v->ring[i].fence, VK_TRUE, 1000000000ull);
+            if (r != VK_SUCCESS)
+                __android_log_print(ANDROID_LOG_WARN, "basis_media",
+                    "wait_in_flight: slot %d fence wait returned %d; destroying anyway", i, (int)r);
+        }
+}
 
 static void destroy_slot(basis_vk_present* v, basis_vk_slot* s) {
     if (s->view)   { vkDestroyImageView(v->device, s->view, NULL); s->view = VK_NULL_HANDLE; }
@@ -212,6 +240,7 @@ static VkShaderModule make_module(basis_vk_present* v, const uint32_t* code, siz
 }
 
 static void destroy_format_objects(basis_vk_present* v) {
+    wait_in_flight(v); /* slots may still be in flight on a mid-stream external-format change */
     for (int i = 0; i < BASIS_VK_RING; ++i) destroy_slot(v, &v->ring[i]);
     if (v->pipeline)   { vkDestroyPipeline(v->device, v->pipeline, NULL); v->pipeline = VK_NULL_HANDLE; }
     if (v->renderPass) { vkDestroyRenderPass(v->device, v->renderPass, NULL); v->renderPass = VK_NULL_HANDLE; }
@@ -359,6 +388,7 @@ static int ensure_format_objects(basis_vk_present* v, uint64_t externalFormat,
 }
 
 static void destroy_unity_fbo(basis_vk_present* v) {
+    if (v->fbo) wait_in_flight(v); /* in-flight command buffers reference the framebuffer */
     if (v->fbo)            { vkDestroyFramebuffer(v->device, v->fbo, NULL); v->fbo = VK_NULL_HANDLE; }
     if (v->unityImageView) { vkDestroyImageView(v->device, v->unityImageView, NULL); v->unityImageView = VK_NULL_HANDLE; }
     v->cachedUnityImage = VK_NULL_HANDLE;
@@ -417,6 +447,42 @@ void basis_vk_set_output_texture(basis_vk_present* v, void* native_texture, int 
     v->unityH = h;
 }
 
+/* ---- plugin-owned submission objects ------------------------------------ */
+
+static void destroy_cmd_objects(basis_vk_present* v) {
+    for (int i = 0; i < BASIS_VK_RING; ++i) {
+        if (v->ring[i].fence) { vkDestroyFence(v->device, v->ring[i].fence, NULL); v->ring[i].fence = VK_NULL_HANDLE; }
+        v->ring[i].cmd = VK_NULL_HANDLE; /* freed with the pool */
+    }
+    if (v->cmdPool) { vkDestroyCommandPool(v->device, v->cmdPool, NULL); v->cmdPool = VK_NULL_HANDLE; }
+}
+
+/* One pool plus a command buffer and fence per ring slot, created lazily on
+ * the render thread. Fences start signaled so a never-submitted slot can't
+ * block a wait. */
+static int ensure_cmd_objects(basis_vk_present* v) {
+    if (v->cmdPool) return 0;
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = v->queueFamily;
+    if (vkCreateCommandPool(v->device, &pci, NULL, &v->cmdPool) != VK_SUCCESS) return -1;
+
+    VkCommandBuffer cbs[BASIS_VK_RING];
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = v->cmdPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = BASIS_VK_RING;
+    if (vkAllocateCommandBuffers(v->device, &cai, cbs) != VK_SUCCESS) { destroy_cmd_objects(v); return -1; }
+
+    for (int i = 0; i < BASIS_VK_RING; ++i) {
+        v->ring[i].cmd = cbs[i];
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (vkCreateFence(v->device, &fci, NULL, &v->ring[i].fence) != VK_SUCCESS) { destroy_cmd_objects(v); return -1; }
+    }
+    return 0;
+}
+
 /* ---- per-frame resolve ------------------------------------------------- */
 
 int basis_vk_render_update(basis_vk_present* v) {
@@ -439,17 +505,15 @@ int basis_vk_render_update(basis_vk_present* v) {
 
     if (ensure_format_objects(v, fmtProps.externalFormat, &fmtProps) != 0) { AHardwareBuffer_release(ahb); return 0; }
 
-    /* AccessTexture takes the destination from UNDEFINED/whatever -> COLOR_ATTACHMENT_OPTIMAL
-     * via a pipeline barrier and returns the underlying VkImage + format. This is
-     * the handoff the Mali driver crashes on when done via CreateExternalTexture
-     * (it builds an image view for a plugin-owned image and walks past a table);
-     * the AccessTexture path has Unity build the view at allocation time and just
-     * reuse it here, which doesn't trip the bug. NOTE: this invalidates any prior
-     * CommandRecordingState, so we must call basis_gfx_vk_begin_record AFTER. */
-    uint64_t unityImageU64 = 0; int unityLayout = 0, unityFormat = 0, unityW = 0, unityH = 0;
+    /* Query the VkImage behind the Unity RenderTexture (observe-only — nothing
+     * is recorded into Unity's command buffer). Going through AccessTexture is
+     * still required: the Mali driver crashes when Unity wraps a plugin-owned
+     * VkImage via CreateExternalTexture, so C# owns the RT and we resolve into
+     * it. The render pass takes the attachment from UNDEFINED and returns it
+     * SHADER_READ_ONLY, so no layout coordination with Unity is needed. */
+    uint64_t unityImageU64 = 0; int unityFormat = 0, unityW = 0, unityH = 0;
     if (!basis_gfx_vk_access_texture(v->unityNativeTex,
-                                     /*VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL*/ 2,
-                                     &unityImageU64, &unityLayout, &unityFormat, &unityW, &unityH)) {
+                                     &unityImageU64, &unityFormat, &unityW, &unityH)) {
         AHardwareBuffer_release(ahb);
         return 0;
     }
@@ -462,15 +526,12 @@ int basis_vk_render_update(basis_vk_present* v) {
         return 0;
     }
 
-    /* AccessTexture may have recorded into Unity's command buffer; re-query the
-     * recording state now to pick up the post-barrier cursor. */
-    uint64_t curFrame = 0, safeFrame = 0;
-    VkCommandBuffer cmd = (VkCommandBuffer)(uintptr_t)basis_gfx_vk_begin_record(&curFrame, &safeFrame);
-    if (!cmd) { AHardwareBuffer_release(ahb); return 0; }
+    if (ensure_cmd_objects(v) != 0) { AHardwareBuffer_release(ahb); return 0; }
 
-    /* reclaim slots the GPU has finished with, then take a free one */
+    /* reclaim slots whose submission has completed, then take a free one */
     for (int i = 0; i < BASIS_VK_RING; ++i)
-        if (v->ring[i].inUse && safeFrame >= v->ring[i].lastUsedFrame) destroy_slot(v, &v->ring[i]);
+        if (v->ring[i].inUse && vkGetFenceStatus(v->device, v->ring[i].fence) == VK_SUCCESS)
+            destroy_slot(v, &v->ring[i]);
     int slot = -1;
     for (int i = 0; i < BASIS_VK_RING; ++i) if (!v->ring[i].inUse) { slot = i; break; }
     if (slot < 0) { AHardwareBuffer_release(ahb); return 0; } /* all in flight: drop a frame */
@@ -482,6 +543,11 @@ int basis_vk_render_update(basis_vk_present* v) {
         return 0;
     }
     AHardwareBuffer_release(ahb); /* import_into_slot took its own ref */
+
+    VkCommandBuffer cmd = s->cmd;
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) { destroy_slot(v, s); return 0; }
 
     /* transition the imported source UNDEFINED -> SHADER_READ_ONLY for sampling */
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -515,9 +581,18 @@ int basis_vk_render_update(basis_vk_present* v) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipeLayout, 0, 1, &s->set, 0, NULL);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { destroy_slot(v, s); return 0; }
+
+    /* Submit on the graphics queue. Safe: the update event is configured with
+     * kUnityVulkanGraphicsQueueAccess_Allow, so Unity keeps its own queue users
+     * off the queue while this callback runs. */
+    vkResetFences(v->device, 1, &s->fence);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(v->queue, 1, &si, s->fence) != VK_SUCCESS) { destroy_slot(v, s); return 0; }
 
     s->inUse = 1;
-    s->lastUsedFrame = curFrame;
     v->frameCounter++;
     return 1;
 }
@@ -535,8 +610,10 @@ uint64_t basis_vk_frame_counter(basis_vk_present* v) { return v ? v->frameCounte
 
 void basis_vk_release(basis_vk_present* v) {
     if (!v || !v->device) return;
+    /* destroy_format_objects waits the in-flight fences before touching slots */
     destroy_format_objects(v);   /* also destroys ring slots */
     destroy_unity_fbo(v);
+    destroy_cmd_objects(v);
     v->unityNativeTex = NULL;
     pthread_mutex_lock(&v->lock);
     if (v->pending) { AHardwareBuffer_release(v->pending); v->pending = NULL; }
