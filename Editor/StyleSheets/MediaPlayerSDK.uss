@@ -93,6 +93,12 @@
     color: rgb(230, 230, 230);
 }
 
+.bvp-status-value-wrap {
+    white-space: normal;
+    flex-shrink: 1;
+    -unity-text-align: middle-right;
+}
+
 .bvp-status-pill {
     -unity-font-style: bold;
     border-top-left-radius: 8px;
