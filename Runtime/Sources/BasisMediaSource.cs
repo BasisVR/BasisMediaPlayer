@@ -79,6 +79,12 @@ public sealed class BasisMediaSource
     // source; unknown keys are ignored.
     public Dictionary<string, object> Options;
 
+    // Optional display metadata carried with the source. A resolver that knows
+    // the real title/uploader sets this before handing the source to LoadSource,
+    // with Metadata.SourceUrl set to the input/page URL it resolved. Null means
+    // the player derives URL-based defaults at load.
+    public BasisMediaMetadata Metadata;
+
     public static BasisMediaSource FromUrl(string url) => new BasisMediaSource(url);
     public static BasisMediaSource FromLocalPath(string path) => new BasisMediaSource(NormalizeLocalPath(path));
 

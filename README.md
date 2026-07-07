@@ -96,6 +96,45 @@ player.LoadSource(new BasisMediaSource {
 
 A null `AudioUri` (the default) is an ordinary single muxed stream.
 
+## What's playing — metadata
+
+`BasisMediaPlayer.Metadata` describes the current media for display: `Title`,
+`FileName`, `SourceUrl`, and — when an integration supplies them — `Uploader`,
+`ThumbnailUrl` and `Duration`. `OnMetadataChanged` fires whenever it updates.
+
+With no resolver installed, the player derives defaults from the URL alone:
+`https://host/videos/My%20Video.mp4` titles as "My Video" (`FileName`
+"My Video.mp4"); extensionless stream paths fall back to the last path segment
+(`rtspt://host/live/vrcdn` → "vrcdn"), then the host. A resolver can push the
+real page title (and the richer fields) by setting `BasisMediaSource.Metadata`
+before `LoadSource`; anyone can merge fields in later with
+`player.ApplyMetadata(...)`.
+
+On networked players every client derives metadata from the same synced input
+URL, so titles agree across clients with no extra synced state.
+
+## Playlists
+
+`BasisMediaPlayerPlaylist` is an optional component that drives a player
+through an ordered list of entries (`Url` + optional `DisplayName`):
+
+```csharp
+playlist.Entries.Add(new BasisMediaPlaylistEntry { Url = url, DisplayName = "Opening set" });
+playlist.PlayAt(0);   // Next() / Previous() wrap; OnEntryChanged reports jumps
+```
+
+`Advance` selects what happens when an entry ends: `None`, `Sequential` (stop
+after the last entry) or `LoopAll`. Live entries never end, so they never
+auto-advance.
+
+Entries load through the player's normal routing — page URLs resolve per
+client and the security gates apply. On a networked player the playlist routes
+loads through `BasisMediaPlayerNetworking`, so entry changes reach remote
+clients via the existing URL sync; only the controlling client needs the
+playlist populated, and auto-advance runs on the owning client alone. The
+playlist itself is not networked: late joiners see the current entry, not the
+queue.
+
 ## Page URLs (optional resolver package)
 
 The player opens **stream** URLs (the schemes above) directly. It does **not** itself
