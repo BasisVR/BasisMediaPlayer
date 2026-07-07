@@ -1,0 +1,27 @@
+<engine:UXML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:engine="UnityEngine.UIElements" xmlns:editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <engine:VisualElement class="bvp-root">
+        <engine:VisualElement name="HeaderCard" class="bvp-card bvp-header-card">
+            <engine:Label text="Basis Media Playlist" name="HeaderTitle" selectable="false" class="bvp-header-title"/>
+            <engine:Label text="Ordered play queue for a Basis Media Player" name="HeaderSubtitle" selectable="false" class="bvp-header-subtitle"/>
+        </engine:VisualElement>
+
+        <engine:Foldout text="Playlist" name="PlaylistFoldout" value="true" class="bvp-foldout">
+            <editor:PropertyField name="PlayerField" binding-path="Player"/>
+            <editor:PropertyField name="EntriesField" binding-path="Entries"/>
+        </engine:Foldout>
+
+        <engine:Foldout text="Behaviour" name="BehaviourFoldout" value="true" class="bvp-foldout">
+            <editor:PropertyField name="AdvanceField" binding-path="Advance"/>
+            <editor:PropertyField name="PlayOnStartField" binding-path="PlayOnStart"/>
+        </engine:Foldout>
+
+        <engine:VisualElement name="StatusCard" class="bvp-card">
+            <engine:Label text="" name="StatusLabel" selectable="false" class="bvp-mini-note"/>
+        </engine:VisualElement>
+
+        <engine:VisualElement name="ActionsCard" class="bvp-card bvp-actions-card">
+            <engine:Button text="Previous" name="PreviousButton" class="bvp-secondary-button"/>
+            <engine:Button text="Next" name="NextButton" class="bvp-primary-button"/>
+        </engine:VisualElement>
+    </engine:VisualElement>
+</engine:UXML>
