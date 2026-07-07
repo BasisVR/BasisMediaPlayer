@@ -1,5 +1,6 @@
 using UnityEditor;
 using UnityEditor.UIElements;
+using UnityEngine;
 using UnityEngine.UIElements;
 
 [CustomEditor(typeof(BasisMediaPlayer))]
@@ -9,6 +10,8 @@ public class BasisMediaPlayerInspector : Editor
     private const string UssPath = "Packages/com.basis.mediaplayer/Editor/StyleSheets/MediaPlayerSDK.uss";
 
     private VisualElement _root;
+    private VisualElement _nowPlayingCard;
+    private Label _nowPlayingTitle, _nowPlayingDetail;
 
     public override VisualElement CreateInspectorGUI()
     {
@@ -28,7 +31,33 @@ public class BasisMediaPlayerInspector : Editor
         BindFields();
         BindActions();
 
+        _nowPlayingCard = _root.Q<VisualElement>("NowPlayingCard");
+        _nowPlayingTitle = _root.Q<Label>("NowPlayingTitle");
+        _nowPlayingDetail = _root.Q<Label>("NowPlayingDetail");
+        _root.schedule.Execute(RefreshNowPlaying).Every(250);
+        RefreshNowPlaying();
+
         return _root;
+    }
+
+    private void RefreshNowPlaying()
+    {
+        if (_nowPlayingCard == null) return;
+        var player = target as BasisMediaPlayer;
+        BasisMediaMetadata meta = Application.isPlaying && player != null ? player.Metadata : null;
+        if (meta == null)
+        {
+            _nowPlayingCard.style.display = DisplayStyle.None;
+            return;
+        }
+        _nowPlayingCard.style.display = DisplayStyle.Flex;
+        if (_nowPlayingTitle != null) _nowPlayingTitle.text = meta.Title;
+        if (_nowPlayingDetail != null)
+        {
+            string detail = !string.IsNullOrEmpty(meta.Uploader) ? meta.Uploader : meta.FileName;
+            _nowPlayingDetail.text = detail ?? string.Empty;
+            _nowPlayingDetail.style.display = string.IsNullOrEmpty(detail) ? DisplayStyle.None : DisplayStyle.Flex;
+        }
     }
 
     private void BindFields()
