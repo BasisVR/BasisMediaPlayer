@@ -312,14 +312,16 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
                 break;
             case 0x73747364: if (t) parse_stsd(t, body, blen); break;    /* stsd */
             /* classic sample tables (progressive MP4); zero-entry versions in
-             * fMP4 init segments parse to nothing and stay inert */
-            case 0x73747473: if (t) t->ctab.stts = parse_table(body, blen, 2, 2, &t->ctab.stts_count); break;  /* stts */
-            case 0x63747473: if (t) t->ctab.ctts = parse_table(body, blen, 2, 2, &t->ctab.ctts_count); break;  /* ctts */
-            case 0x73747363: if (t) t->ctab.stsc = parse_table(body, blen, 3, 2, &t->ctab.stsc_count); break;  /* stsc */
-            case 0x73747373: if (t) t->ctab.stss = parse_table(body, blen, 1, 1, &t->ctab.stss_count); break;  /* stss */
-            case 0x7374737a: if (t) parse_stsz(&t->ctab, body, blen); break;                                   /* stsz */
-            case 0x7374636f: if (t) parse_chunk_offsets(&t->ctab, body, blen, 0); break;                       /* stco */
-            case 0x636f3634: if (t) parse_chunk_offsets(&t->ctab, body, blen, 1); break;                       /* co64 */
+             * fMP4 init segments parse to nothing and stay inert. First box of
+             * each kind wins — a duplicate in a malformed stbl would otherwise
+             * overwrite (and leak) the earlier allocation. */
+            case 0x73747473: if (t && !t->ctab.stts) t->ctab.stts = parse_table(body, blen, 2, 2, &t->ctab.stts_count); break;  /* stts */
+            case 0x63747473: if (t && !t->ctab.ctts) t->ctab.ctts = parse_table(body, blen, 2, 2, &t->ctab.ctts_count); break;  /* ctts */
+            case 0x73747363: if (t && !t->ctab.stsc) t->ctab.stsc = parse_table(body, blen, 3, 2, &t->ctab.stsc_count); break;  /* stsc */
+            case 0x73747373: if (t && !t->ctab.stss) t->ctab.stss = parse_table(body, blen, 1, 1, &t->ctab.stss_count); break;  /* stss */
+            case 0x7374737a: if (t && !t->ctab.sample_count) parse_stsz(&t->ctab, body, blen); break;                           /* stsz */
+            case 0x7374636f: if (t && !t->ctab.chunk_offsets) parse_chunk_offsets(&t->ctab, body, blen, 0); break;              /* stco */
+            case 0x636f3634: if (t && !t->ctab.chunk_offsets) parse_chunk_offsets(&t->ctab, body, blen, 1); break;              /* co64 */
             default: break;
         }
         off += sz;
