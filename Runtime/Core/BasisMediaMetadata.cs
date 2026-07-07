@@ -71,7 +71,9 @@ public sealed class BasisMediaMetadata
         }
         if (string.IsNullOrEmpty(meta.Title))
         {
-            meta.Title = !string.IsNullOrEmpty(host) ? host : url;
+            // url can be null/unparseable here (a bare BasisMediaSource handed
+            // straight to LoadSource); keep the never-null Title guarantee.
+            meta.Title = !string.IsNullOrEmpty(host) ? host : (url ?? string.Empty);
         }
         return meta;
     }

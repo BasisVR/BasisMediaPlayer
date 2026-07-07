@@ -139,12 +139,23 @@ public class BasisMediaPlayerPlaylist : MonoBehaviour
         if (networking != null && networking.HasNetworkID && !networking.IsOwnedLocallyOnClient) return;
         int count = Entries != null ? Entries.Count : 0;
         if (count == 0) return;
-        int next = CurrentIndex + 1;
-        if (next >= count)
+        // Scan past blank/invalid entries rather than stalling on one: LoadEntry
+        // ignores them without moving CurrentIndex, so retrying the same index
+        // every OnEnded would wedge the playlist.
+        for (int step = 1; step <= count; step++)
         {
-            if (Advance != BasisMediaPlaylistAdvance.LoopAll) return;
-            next = 0;
+            int next = CurrentIndex + step;
+            if (next >= count)
+            {
+                if (Advance != BasisMediaPlaylistAdvance.LoopAll) return;
+                next -= count;
+            }
+            BasisMediaPlaylistEntry entry = Entries[next];
+            if (entry != null && !string.IsNullOrWhiteSpace(entry.Url))
+            {
+                PlayAt(next);
+                return;
+            }
         }
-        PlayAt(next);
     }
 }

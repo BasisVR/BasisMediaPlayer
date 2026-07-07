@@ -136,9 +136,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public event Action<BasisBitrateTrack> OnBitrateTrackChanged;
     public event Action<BasisAudioTrack> OnAudioTrackChanged;
 
-    // Metadata for the loading/loaded media changed — a load seeded fresh
+    // Metadata for the loading/loaded media updated — a load seeded fresh
     // URL-derived defaults, or an enrichment layer (resolver, playlist,
-    // consumer) merged richer fields in. See BasisMediaMetadata.
+    // consumer) merged richer fields in. Fires at least once per load and may
+    // repeat with an unchanged snapshot (reloads, reconnects) — handlers just
+    // re-read the payload. See BasisMediaMetadata.
     public event Action<BasisMediaMetadata> OnMetadataChanged;
 
     // The active in-band caption cue changed (CEA-608 CC1). Cue.Text is null when
@@ -533,10 +535,15 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         string metadataUrl = media.Metadata != null && !string.IsNullOrEmpty(media.Metadata.SourceUrl)
             ? media.Metadata.SourceUrl
             : (seeded && metadata != null ? metadata.SourceUrl : media.Uri);
-        bool rebuilt = metadata == null || !string.Equals(metadata.SourceUrl, metadataUrl, StringComparison.Ordinal);
-        if (rebuilt) metadata = BasisMediaMetadata.FromUrl(metadataUrl);
-        if (media.Metadata != null) metadata.MergeFrom(media.Metadata);
-        if (rebuilt || media.Metadata != null) OnMetadataChanged?.Invoke(metadata);
+        if (metadata == null || !string.Equals(metadata.SourceUrl, metadataUrl, StringComparison.Ordinal))
+            metadata = BasisMediaMetadata.FromUrl(metadataUrl);
+        metadata.MergeFrom(media.Metadata);
+        // Persist the origin on the source itself so a later reload of the SAME
+        // instance (Reload(), the native auto-reconnect) keeps it after the
+        // one-shot LoadUrl seed has been spent.
+        if (media.Metadata == null) media.Metadata = new BasisMediaMetadata { SourceUrl = metadataUrl };
+        else if (string.IsNullOrEmpty(media.Metadata.SourceUrl)) media.Metadata.SourceUrl = metadataUrl;
+        OnMetadataChanged?.Invoke(metadata);
 
         /* not needed anymore!
         // Under Wine/Proton, Media Foundation may be missing and initializing the
