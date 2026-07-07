@@ -523,19 +523,28 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
 
         LastErrorMessage = null;
+        BasisMediaSource previousMediaSource = activeMediaSource;
         activeMediaSource = media;
 
         // Metadata keys on the ORIGIN url — the page URL a resolver started from
         // (media.Metadata.SourceUrl), else the seed a LoadUrl in flight already
         // built (a resolver's stream Uri would title as e.g. "videoplayback"),
-        // else this source's own Uri (direct LoadSource callers). Rebuild only
-        // when the origin changed, then layer source-carried enrichment on top.
+        // else this source's own Uri (direct LoadSource callers). Keep the
+        // existing metadata only for the load it belongs to — the seeded LoadUrl
+        // continuation or a reload of the SAME source instance (Reload(), the
+        // native auto-reconnect); a different instance rebuilds even on a
+        // matching origin so the previous load's enrichment and consumer-stamped
+        // fields don't leak into a fresh load. Source-carried enrichment then
+        // layers on top.
         bool seeded = metadataSeededByLoadUrl;
         metadataSeededByLoadUrl = false;
         string metadataUrl = media.Metadata != null && !string.IsNullOrEmpty(media.Metadata.SourceUrl)
             ? media.Metadata.SourceUrl
             : (seeded && metadata != null ? metadata.SourceUrl : media.Uri);
-        if (metadata == null || !string.Equals(metadata.SourceUrl, metadataUrl, StringComparison.Ordinal))
+        bool sameSourceInstance = ReferenceEquals(previousMediaSource, media);
+        if (metadata == null ||
+            !string.Equals(metadata.SourceUrl, metadataUrl, StringComparison.Ordinal) ||
+            (!seeded && !sameSourceInstance))
             metadata = BasisMediaMetadata.FromUrl(metadataUrl);
         metadata.MergeFrom(media.Metadata);
         // Persist the origin on the source itself so a later reload of the SAME
