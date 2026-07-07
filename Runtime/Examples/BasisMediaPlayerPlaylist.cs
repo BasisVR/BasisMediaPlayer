@@ -42,6 +42,9 @@ public class BasisMediaPlayerPlaylist : MonoBehaviour
     [Tooltip("Advance policy when the current entry ends.")]
     public BasisMediaPlaylistAdvance Advance = BasisMediaPlaylistAdvance.Sequential;
 
+    [Tooltip("If true, the first entry loads on Start (locally, like BasisMediaPlayerStreaming's ConfigureOnStart; networking settles who wins). When a playlist drives the player, disable BasisMediaPlayerStreaming's ConfigureOnStart or both will load a source on start.")]
+    public bool PlayOnStart = true;
+
     // Index of the entry this playlist last loaded; -1 = nothing loaded from
     // the playlist yet. Not reset by direct loads made outside the playlist.
     public int CurrentIndex = -1;
@@ -67,7 +70,19 @@ public class BasisMediaPlayerPlaylist : MonoBehaviour
         if (Player != null) Player.OnEnded -= HandleEnded;
     }
 
-    public void PlayAt(int index)
+    private void Start()
+    {
+        if (!PlayOnStart || CurrentIndex >= 0) return;
+        if (Entries == null || Entries.Count == 0) return;
+        // Local load, not SetUrl: every client starting the same entry is the
+        // same shape as BasisMediaPlayerStreaming's ConfigureOnStart, and the
+        // networking late-join/full-state flow settles who wins.
+        LoadEntry(0, viaNetworking: false);
+    }
+
+    public void PlayAt(int index) => LoadEntry(index, viaNetworking: true);
+
+    private void LoadEntry(int index, bool viaNetworking)
     {
         if (Player == null)
         {
@@ -77,12 +92,12 @@ public class BasisMediaPlayerPlaylist : MonoBehaviour
         if (Entries == null || index < 0 || index >= Entries.Count) return;
         // A client that can't take control couldn't load the entry anyway;
         // bail before touching CurrentIndex so the local cursor stays honest.
-        if (networking != null && !networking.CanLocallyControl) return;
+        if (viaNetworking && networking != null && !networking.CanLocallyControl) return;
         BasisMediaPlaylistEntry entry = Entries[index];
         if (entry == null || string.IsNullOrWhiteSpace(entry.Url)) return;
 
         CurrentIndex = index;
-        if (networking != null)
+        if (viaNetworking && networking != null)
         {
             // Acquires control (ownership permitting); remote clients follow the URL sync.
             _ = networking.SetUrl(entry.Url);

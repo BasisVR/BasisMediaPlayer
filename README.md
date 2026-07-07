@@ -115,8 +115,12 @@ URL, so titles agree across clients with no extra synced state.
 
 ## Playlists
 
-`BasisMediaPlayerPlaylist` is an optional component that drives a player
-through an ordered list of entries (`Url` + optional `DisplayName`):
+`BasisMediaPlayerPlaylist` (`Runtime/Examples`, beside
+`BasisMediaPlayerStreaming`) is an optional orchestration component that drives
+a player through an ordered list of entries (`Url` + optional `DisplayName`).
+With `PlayOnStart` (the default) the first entry loads on Start — when a
+playlist drives the player, disable `BasisMediaPlayerStreaming`'s
+`ConfigureOnStart` (or remove that component) so they don't both load a source.
 
 ```csharp
 playlist.Entries.Add(new BasisMediaPlaylistEntry { Url = url, DisplayName = "Opening set" });
