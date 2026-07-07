@@ -1,16 +1,25 @@
 /*
- * basis_mp4.c — fragmented-MP4 demuxer for live streams (init segment then a
- * sequence of moof+mdat fragments) -> H.264/H.265 + AAC.
+ * basis_mp4.c — MP4 demuxer -> H.264/H.265 + AAC. Handles both MP4 shapes:
  *
- * Parses moov (track config: codec, timescale, avcC/hvcC -> Annex B extradata,
- * esds -> AAC ASC) and each moof (tfhd/tfdt/trun: per-sample sizes, durations,
- * composition offsets, base decode time), then slices the following mdat into
- * samples in trun order.
+ *   fragmented (fMP4/CMAF): init segment (moov) then moof+mdat fragments —
+ *     live streams, DASH/adaptive legs, HLS fMP4 segments. Each moof's
+ *     tfhd/tfdt/trun tables slice the following mdat.
  *
- * Common-case assumptions (sufficient for VRCDN-style fMP4, flagged for iteration):
+ *   progressive (classic): one moov carrying the full sample tables
+ *     (stts/ctts/stsc/stco/stsz/stss) and one big mdat — plain recorded .mp4
+ *     files. Requires faststart layout (moov before mdat): the byte source
+ *     only moves forward, so a trailing moov can't index media that has
+ *     already streamed past — that shape gets a clear error instead.
+ *
+ * Both shapes parse moov for track config (codec, timescale, avcC/hvcC ->
+ * Annex B extradata, esds -> AAC ASC) and emit tracks interleaved in decode
+ * order (fragments) or the muxer's file order (progressive).
+ *
+ * Common-case assumptions (sufficient for VRCDN-style fMP4 and web-optimised
+ * progressive files, flagged for iteration):
  *   - one video track + one audio track
  *   - one trun per traf, mdat samples contiguous in trun order
- *   - 4-byte NAL length (from avcC); version 0/1 boxes
+ *   - 4-byte NAL length (from avcC); version 0/1 boxes; stsz (not stz2)
  */
 
 #include "basis_mp4.h"
@@ -20,6 +29,38 @@
 #include <string.h>
 
 #define MP4_MAX_FRAGS 4   /* per-moof trun runs (audio + video, with headroom) */
+#define MP4_MAX_BOX   (256LL * 1024 * 1024)  /* cap for boxes buffered whole (moov/moof/fragment mdat) */
+#define MP4_MAX_TABLE (16u * 1024 * 1024)    /* per-table entry cap (~hours of samples) */
+
+/* Classic (progressive) sample tables + walk cursor. Valid when sample_count
+ * and chunk_count are non-zero; fMP4 init segments carry these boxes with zero
+ * entries, which leaves the whole struct inert. */
+typedef struct {
+    uint32_t  sample_count;
+    uint32_t  const_size;     /* stsz sample_size != 0 => every sample this size */
+    uint32_t* sizes;          /* per-sample sizes when const_size == 0 */
+    uint32_t  stts_count;     /* {sample_count, delta} run pairs */
+    uint32_t* stts;
+    uint32_t  ctts_count;     /* {sample_count, offset} run pairs; offset read signed */
+    uint32_t* ctts;
+    uint32_t  stsc_count;     /* {first_chunk, samples_per_chunk} pairs */
+    uint32_t* stsc;
+    uint32_t  chunk_count;
+    uint64_t* chunk_offsets;  /* absolute file offsets (stco or co64) */
+    uint32_t  stss_count;     /* sync-sample numbers, 1-based; NULL => all sync */
+    uint32_t* stss;
+
+    /* cursor: the next sample to emit */
+    uint32_t next;            /* global sample index, 0-based */
+    uint32_t chunk;           /* current chunk, 0-based */
+    uint32_t chunk_sample;    /* sample index within the current chunk */
+    uint64_t offset;          /* absolute file offset of the next sample */
+    uint32_t stsc_i;
+    uint32_t stts_i, stts_used;
+    uint32_t ctts_i, ctts_used;
+    uint32_t stss_i;
+    int64_t  dts;             /* running, in track timescale */
+} mp4_ctab_t;
 
 typedef struct {
     int track_id;
@@ -34,6 +75,7 @@ typedef struct {
     int sr, ch, obj;
     int64_t next_dts; /* running, in track timescale */
     int announced;
+    mp4_ctab_t ctab;
 } mp4_track_t;
 
 /* One trun run within a moof: its track, where its samples sit (data-offset,
@@ -58,6 +100,9 @@ typedef struct {
     mp4_track_t tracks[2];
     int ntracks;
 
+    int64_t pos;          /* absolute stream offset consumed so far */
+    int     mdat_skipped; /* media data streamed past before any index arrived */
+
     /* runs from the last moof (one per traf/trun), consumed against its mdat */
     mp4_frag_t frags[MP4_MAX_FRAGS];
     int nfrags;
@@ -69,16 +114,32 @@ static uint64_t rd64(const uint8_t* p) { return ((uint64_t)rd32(p)<<32)|rd32(p+4
 static int read_exact(mp4_t* m, uint8_t* buf, int n) {
     int got = 0;
     while (got < n) {
-        if (!m->sink->is_running(m->sink->user)) return got;
+        if (!m->sink->is_running(m->sink->user)) break;
         int r = m->read(m->ctx, buf + got, n - got);
-        if (r <= 0) return got;
+        if (r <= 0) break;
         got += r;
     }
+    m->pos += got;
     return got;
 }
 
-/* reads a top-level box: header + body into *out (caller frees). type is FOURCC. */
-static int read_box(mp4_t* m, uint32_t* type, uint8_t** out, int64_t* out_len) {
+static int skip_bytes(mp4_t* m, int64_t n) {
+    uint8_t tmp[16384];
+    while (n > 0) {
+        if (!m->sink->is_running(m->sink->user)) return -1;
+        int want = n > (int64_t)sizeof(tmp) ? (int)sizeof(tmp) : (int)n;
+        int r = m->read(m->ctx, tmp, want);
+        if (r <= 0) return -1;
+        m->pos += r;
+        n -= r;
+    }
+    return 0;
+}
+
+/* Reads a top-level box header. *body_len is the payload length, or -1 for a
+ * size-0 box (extends to end of stream). The caller decides whether to buffer,
+ * stream, or skip the payload. */
+static int read_box_header(mp4_t* m, uint32_t* type, int64_t* body_len) {
     uint8_t hdr[8];
     if (read_exact(m, hdr, 8) != 8) return -1;
     int64_t size = rd32(hdr);
@@ -90,12 +151,9 @@ static int read_box(mp4_t* m, uint32_t* type, uint8_t** out, int64_t* out_len) {
         size = (int64_t)rd64(ext);
         header = 16;
     }
-    if (size < header || size > 256LL * 1024 * 1024) return -1;
-    int64_t body = size - header;
-    uint8_t* buf = (uint8_t*)malloc((size_t)body ? (size_t)body : 1);
-    if (!buf) return -1;
-    if (read_exact(m, buf, (int)body) != (int)body) { free(buf); return -1; }
-    *out = buf; *out_len = body;
+    if (size == 0) { *body_len = -1; return 0; }
+    if (size < header) return -1;
+    *body_len = size - header;
     return 0;
 }
 
@@ -171,6 +229,51 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
     }
 }
 
+/* Reads a fixed-stride sample-table box into a u32 array, keeping `keep` of
+ * the `stride` u32 fields per entry. Returns NULL (count 0) on any bound or
+ * allocation failure — an incomplete table just leaves the file unplayable as
+ * progressive rather than risking a bad walk. */
+static uint32_t* parse_table(const uint8_t* p, int len, int stride, int keep, uint32_t* out_count) {
+    *out_count = 0;
+    if (len < 8) return NULL;
+    uint32_t n = rd32(p + 4);
+    if (!n || n > MP4_MAX_TABLE) return NULL;
+    if ((int64_t)8 + (int64_t)n * stride * 4 > len) return NULL;
+    uint32_t* v = (uint32_t*)malloc((size_t)n * keep * sizeof(uint32_t));
+    if (!v) return NULL;
+    for (uint32_t i = 0; i < n; ++i)
+        for (int k = 0; k < keep; ++k)
+            v[i * keep + k] = rd32(p + 8 + (int64_t)i * stride * 4 + k * 4);
+    *out_count = n;
+    return v;
+}
+
+static void parse_stsz(mp4_ctab_t* c, const uint8_t* p, int len) {
+    if (len < 12) return;
+    uint32_t cs = rd32(p + 4);
+    uint32_t n = rd32(p + 8);
+    if (!n || n > MP4_MAX_TABLE) return;
+    if (cs) { c->const_size = cs; c->sample_count = n; return; }
+    if ((int64_t)12 + (int64_t)n * 4 > len) return;
+    c->sizes = (uint32_t*)malloc((size_t)n * sizeof(uint32_t));
+    if (!c->sizes) return;
+    for (uint32_t i = 0; i < n; ++i) c->sizes[i] = rd32(p + 12 + (int64_t)i * 4);
+    c->sample_count = n;
+}
+
+static void parse_chunk_offsets(mp4_ctab_t* c, const uint8_t* p, int len, int is64) {
+    if (len < 8) return;
+    uint32_t n = rd32(p + 4);
+    int stride = is64 ? 8 : 4;
+    if (!n || n > MP4_MAX_TABLE) return;
+    if ((int64_t)8 + (int64_t)n * stride > len) return;
+    c->chunk_offsets = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
+    if (!c->chunk_offsets) return;
+    for (uint32_t i = 0; i < n; ++i)
+        c->chunk_offsets[i] = is64 ? rd64(p + 8 + (int64_t)i * 8) : (uint64_t)rd32(p + 8 + (int64_t)i * 4);
+    c->chunk_count = n;
+}
+
 static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len);
 
 static void parse_trak(mp4_t* m, const uint8_t* p, int len) {
@@ -181,6 +284,11 @@ static void parse_trak(mp4_t* m, const uint8_t* p, int len) {
     t->timescale = 90000;
     parse_box_tree(m, t, p, len);
     if (t->codec != BASIS_CODEC_NONE) m->ntracks++;
+    else {
+        free(t->ctab.sizes); free(t->ctab.stts); free(t->ctab.ctts);
+        free(t->ctab.stsc); free(t->ctab.chunk_offsets); free(t->ctab.stss);
+        memset(&t->ctab, 0, sizeof(t->ctab));
+    }
 }
 
 static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) {
@@ -203,6 +311,15 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
                 if (t) { int ver = body[0]; int idoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (idoff + 4 <= blen) t->track_id = (int)rd32(body + idoff); }
                 break;
             case 0x73747364: if (t) parse_stsd(t, body, blen); break;    /* stsd */
+            /* classic sample tables (progressive MP4); zero-entry versions in
+             * fMP4 init segments parse to nothing and stay inert */
+            case 0x73747473: if (t) t->ctab.stts = parse_table(body, blen, 2, 2, &t->ctab.stts_count); break;  /* stts */
+            case 0x63747473: if (t) t->ctab.ctts = parse_table(body, blen, 2, 2, &t->ctab.ctts_count); break;  /* ctts */
+            case 0x73747363: if (t) t->ctab.stsc = parse_table(body, blen, 3, 2, &t->ctab.stsc_count); break;  /* stsc */
+            case 0x73747373: if (t) t->ctab.stss = parse_table(body, blen, 1, 1, &t->ctab.stss_count); break;  /* stss */
+            case 0x7374737a: if (t) parse_stsz(&t->ctab, body, blen); break;                                   /* stsz */
+            case 0x7374636f: if (t) parse_chunk_offsets(&t->ctab, body, blen, 0); break;                       /* stco */
+            case 0x636f3634: if (t) parse_chunk_offsets(&t->ctab, body, blen, 1); break;                       /* co64 */
             default: break;
         }
         off += sz;
@@ -227,6 +344,138 @@ static void announce_tracks(mp4_t* m) {
         }
         t->announced = 1;
     }
+}
+
+/* ---- classic (progressive) sample walk ---------------------------------- */
+
+/* A track's tables are walkable when every table the walk depends on parsed
+ * completely. stss/ctts are optional. */
+static int classic_track_ready(const mp4_ctab_t* c) {
+    return c->sample_count && c->chunk_count && c->stts_count && c->stsc_count &&
+           (c->const_size || c->sizes);
+}
+
+static int classic_ready(mp4_t* m) {
+    for (int i = 0; i < m->ntracks; ++i)
+        if (classic_track_ready(&m->tracks[i].ctab)) return 1;
+    return 0;
+}
+
+static void classic_init_cursor(mp4_ctab_t* c) {
+    if (!classic_track_ready(c)) { c->sample_count = 0; return; }
+    c->next = 0;
+    c->chunk = 0;
+    c->chunk_sample = 0;
+    c->offset = c->chunk_offsets[0];
+    c->stsc_i = 0;
+    c->stts_i = 0; c->stts_used = 0;
+    c->ctts_i = 0; c->ctts_used = 0;
+    c->stss_i = 0;
+    c->dts = 0;
+}
+
+static uint32_t classic_size(const mp4_ctab_t* c, uint32_t i) {
+    return c->const_size ? c->const_size : c->sizes[i];
+}
+
+static void classic_advance(mp4_ctab_t* c) {
+    uint32_t size = classic_size(c, c->next);
+    c->dts += (int64_t)c->stts[c->stts_i * 2 + 1];
+    if (++c->stts_used >= c->stts[c->stts_i * 2] && c->stts_i + 1 < c->stts_count) {
+        c->stts_i++; c->stts_used = 0;
+    }
+    if (c->ctts && ++c->ctts_used >= c->ctts[c->ctts_i * 2] && c->ctts_i + 1 < c->ctts_count) {
+        c->ctts_i++; c->ctts_used = 0;
+    }
+    c->next++;
+    c->chunk_sample++;
+    if (c->chunk_sample >= c->stsc[c->stsc_i * 2 + 1]) {  /* samples-per-chunk of the current run */
+        c->chunk++;
+        c->chunk_sample = 0;
+        while (c->stsc_i + 1 < c->stsc_count && c->chunk + 1 >= c->stsc[(c->stsc_i + 1) * 2])
+            c->stsc_i++;
+        if (c->chunk < c->chunk_count) c->offset = c->chunk_offsets[c->chunk];
+    } else {
+        c->offset += size;
+    }
+}
+
+/* Walks the classic tables against one mdat, merging tracks in file-offset
+ * order — the muxer's chunk interleave — since the byte source only moves
+ * forward. Samples whose offsets lie beyond this mdat wait for a later one.
+ * mdat_end is the absolute end of the payload, or INT64_MAX for a size-0 box. */
+static int consume_progressive(mp4_t* m, int64_t mdat_end) {
+    uint8_t* buf = NULL;
+    size_t cap = 0;
+    int rc = 0;
+
+    for (;;) {
+        if (!m->sink->is_running(m->sink->user)) { rc = -1; break; }
+
+        mp4_track_t* t = NULL;
+        for (int i = 0; i < m->ntracks; ++i) {
+            mp4_ctab_t* c = &m->tracks[i].ctab;
+            if (c->next >= c->sample_count) continue;
+            if ((int64_t)c->offset >= mdat_end) continue;
+            if (!t || c->offset < t->ctab.offset) t = &m->tracks[i];
+        }
+        if (!t) break;
+
+        mp4_ctab_t* c = &t->ctab;
+        uint32_t ssize = classic_size(c, c->next);
+        if (ssize == 0 || (int64_t)c->offset < m->pos ||
+            (mdat_end != INT64_MAX && (int64_t)(c->offset + ssize) > mdat_end)) {
+            /* behind the stream head or overrunning the box: the table points at
+             * bytes we can't reach — drop the sample and keep walking */
+            classic_advance(c);
+            continue;
+        }
+        if (skip_bytes(m, (int64_t)c->offset - m->pos) != 0) { rc = -1; break; }
+        if (ssize > cap) {
+            free(buf);
+            cap = (size_t)ssize + ((size_t)ssize >> 1) + 4096;
+            buf = (uint8_t*)malloc(cap);
+            if (!buf) { cap = 0; rc = -1; break; }
+        }
+        if (read_exact(m, buf, (int)ssize) != (int)ssize) { rc = -1; break; }
+
+        int tsc = t->timescale > 0 ? t->timescale : 90000;
+        int32_t cto = c->ctts ? (int32_t)c->ctts[c->ctts_i * 2 + 1] : 0;
+        int64_t pts_us = (c->dts + cto) * 1000000 / tsc;
+
+        if (t->is_video) {
+            int key = 1;
+            if (c->stss) {
+                /* stss is sorted 1-based sample numbers; catch the cursor up past
+                 * any entries skipped by dropped samples before comparing */
+                while (c->stss_i < c->stss_count && c->stss[c->stss_i] < c->next + 1) c->stss_i++;
+                key = c->stss_i < c->stss_count && c->stss[c->stss_i] == c->next + 1;
+                if (key) c->stss_i++;
+            }
+            int nls = t->nal_len_size ? t->nal_len_size : 4;
+            /* Annex B swaps each NAL's nls-byte length prefix for a 4-byte start
+             * code; a NAL is at least nls + 1 bytes, so this bounds the growth. */
+            int outcap = (int)ssize + (4 - nls) * ((int)ssize / (nls + 1)) + 64;
+            uint8_t* out = (uint8_t*)malloc((size_t)outcap);
+            if (out) {
+                int n = basis_avcc_to_annexb(buf, (int)ssize, nls, out, outcap);
+                if (n > 0) {
+                    if (c->stss == NULL)
+                        key = t->codec == BASIS_CODEC_H265 ? basis_h265_is_keyframe(out, n) : basis_h264_is_keyframe(out, n);
+                    m->sink->on_video_au(m->sink->user, out, n, pts_us, key);
+                }
+                free(out);
+            }
+        } else {
+            m->sink->on_audio_frame(m->sink->user, buf, (int)ssize, pts_us);
+        }
+        classic_advance(c);
+    }
+
+    free(buf);
+    if (rc == 0 && mdat_end != INT64_MAX && m->pos < mdat_end)
+        return skip_bytes(m, mdat_end - m->pos);
+    return rc;
 }
 
 /* ---- moof parsing ------------------------------------------------------- */
@@ -386,19 +635,49 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
     m.sink = sink; m.read = read; m.ctx = ctx;
 
     while (sink->is_running(sink->user)) {
-        uint32_t type; uint8_t* buf; int64_t blen;
-        if (read_box(&m, &type, &buf, &blen) != 0) break;
+        uint32_t type; int64_t body;
+        if (read_box_header(&m, &type, &body) != 0) break;
+
+        if (type == 0x6d646174) { /* mdat */
+            if (classic_ready(&m)) {
+                /* progressive: stream the payload sample-by-sample (no size cap) */
+                int64_t end = body < 0 ? INT64_MAX : m.pos + body;
+                if (consume_progressive(&m, end) != 0) break;
+                continue;
+            }
+            if (m.nfrags > 0 && body >= 0 && body <= MP4_MAX_BOX) {
+                /* fragment payload: small — buffer whole and slice by the moof's runs */
+                uint8_t* buf = (uint8_t*)malloc((size_t)(body ? body : 1));
+                if (!buf) break;
+                if (read_exact(&m, buf, (int)body) != (int)body) { free(buf); break; }
+                consume_mdat(&m, buf, (int)body);
+                free(buf);
+                continue;
+            }
+            /* media data with no index yet: the moov may still follow (trailing-
+             * moov progressive file). Skip it, and report if the moov proves that
+             * these bytes were the media. */
+            m.mdat_skipped = 1;
+            if (body < 0 || skip_bytes(&m, body) != 0) break;
+            continue;
+        }
+
+        if (body < 0 || body > MP4_MAX_BOX) break;
+        uint8_t* buf = (uint8_t*)malloc((size_t)(body ? body : 1));
+        if (!buf) break;
+        if (read_exact(&m, buf, (int)body) != (int)body) { free(buf); break; }
 
         switch (type) {
             case 0x6d6f6f76: /* moov */
-                parse_box_tree(&m, NULL, buf, (int)blen);
+                parse_box_tree(&m, NULL, buf, (int)body);
+                for (int i = 0; i < m.ntracks; ++i) classic_init_cursor(&m.tracks[i].ctab);
                 announce_tracks(&m);
+                if (m.mdat_skipped && classic_ready(&m))
+                    sink->on_error(sink->user,
+                        "progressive MP4 stores its index (moov) after the media data, which can't play over a one-way stream; remux with faststart (ffmpeg -movflags +faststart)");
                 break;
             case 0x6d6f6f66: /* moof */
-                parse_moof(&m, buf, (int)blen);
-                break;
-            case 0x6d646174: /* mdat */
-                consume_mdat(&m, buf, (int)blen);
+                parse_moof(&m, buf, (int)body);
                 break;
             default:
                 break; /* ftyp, styp, sidx, free, ... ignored */
@@ -408,6 +687,11 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
 
     for (int k = 0; k < MP4_MAX_FRAGS; ++k) {
         free(m.frags[k].sizes); free(m.frags[k].durs); free(m.frags[k].ctos);
+    }
+    for (int i = 0; i < 2; ++i) {
+        mp4_ctab_t* c = &m.tracks[i].ctab;
+        free(c->sizes); free(c->stts); free(c->ctts);
+        free(c->stsc); free(c->chunk_offsets); free(c->stss);
     }
     return 0;
 }
