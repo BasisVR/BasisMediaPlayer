@@ -211,6 +211,11 @@ struct basis_decoder {
     LONGLONG lastRenderQpc = 0;
     int64_t mediaStartUs = 0;
     int64_t lastPresentedPts = INT64_MIN;
+    /* Stable presentation position for get_position_us: unlike lastPresentedPts
+     * it survives the resync sentinel resets, and unlike lastPtsUs (decode-side)
+     * it freezes with presentation — a paused/stopped player reads as holding
+     * still even while the demuxer keeps feeding the ring. */
+    volatile LONG64 presentedPosUs = -1;
 
     /* audio-master sync: pace video to audio Unity has actually consumed. */
     int64_t videoBasePts = INT64_MIN;        /* PTS of the first video frame (sync origin) */
@@ -1175,6 +1180,7 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
             d->ctxUnity->CopyResource(d->outTexD11, d->ringOnUnity[best]);
             if (d->ringMutexUnity[best]) d->ringMutexUnity[best]->ReleaseSync(0);
             d->lastPresentedPts = bestPts;
+            InterlockedExchange64(&d->presentedPosUs, bestPts);
             InterlockedIncrement(&d->dbg_copy);
             if (d->ttffMs < 0) {
                 LARGE_INTEGER tnow; QueryPerformanceCounter(&tnow);
@@ -1223,6 +1229,7 @@ extern "C" int basis_decoder_render_update(basis_decoder_t* d) {
                          * never handed on (or sampled) mid-write. */
                         d->outSharedD12Mutex->ReleaseSync(0);
                         d->lastPresentedPts = bestPts;
+                        InterlockedExchange64(&d->presentedPosUs, bestPts);
                         InterlockedIncrement(&d->dbg_copy);
                         if (d->ttffMs < 0) {
                             LARGE_INTEGER tnow; QueryPerformanceCounter(&tnow);
@@ -1270,7 +1277,13 @@ extern "C" int basis_decoder_get_video_size(basis_decoder_t* d, int* w, int* h) 
     if (w) *w = d->sharedW; if (h) *h = d->sharedH; return 0;
 }
 extern "C" int basis_decoder_get_frame_origin(basis_decoder_t* d) { return d ? (int)d->frameTopLeft : 0; }
-extern "C" int64_t basis_decoder_get_position_us(basis_decoder_t* d) { return d ? d->lastPtsUs : -1; }
+extern "C" int64_t basis_decoder_get_position_us(basis_decoder_t* d) {
+    if (!d) return -1;
+    /* Presentation position once a frame has shown; decode-side before that
+     * (start-up, audio-only) so early consumers still see the clock move. */
+    int64_t presented = InterlockedCompareExchange64((volatile LONG64*)&d->presentedPosUs, 0, 0);
+    return presented >= 0 ? presented : d->lastPtsUs;
+}
 extern "C" int basis_decoder_get_audio_format(basis_decoder_t* d, int* r, int* c) {
     if (!d || !d->aconfigured) return -1;
     if (r) *r = d->asr ? d->asr : 48000;
