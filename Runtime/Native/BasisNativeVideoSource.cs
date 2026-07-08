@@ -75,6 +75,15 @@ public sealed class BasisNativeVideoSource : IBasisPcmSource, IDisposable
     // PTS (microseconds) of the most recently published frame; -1 until known.
     public long PositionUs => BasisNativeMedia.GetPositionUs(handle);
 
+    // Total media duration (microseconds) once the container index has been
+    // parsed; 0 for live/unknown — 0 also means the source can't seek.
+    public long DurationUs => BasisNativeMedia.GetDurationUs(handle);
+
+    // Requests an asynchronous absolute seek; lands at or shortly before the
+    // target (preceding keyframe / segment boundary). False when the source
+    // has no seekable timeline.
+    public bool SeekUs(long targetUs) => BasisNativeMedia.SeekUs(handle, targetUs);
+
     // One-line native counter string (blit/copy/lag/buf/nodue/acq/audio). For the
     // debug window / diagnostics.
     public string DebugInfo => handle != IntPtr.Zero ? BasisNativeMedia.GetDebug(handle) : null;
