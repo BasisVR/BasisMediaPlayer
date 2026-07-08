@@ -110,7 +110,8 @@ typedef struct {
     void* ctx;
     mp4_track_t tracks[2];
     int ntracks;
-    int movie_timescale;  /* from mvhd; units of elst segment durations */
+    int movie_timescale;    /* from mvhd; units of elst segment durations */
+    int64_t movie_duration; /* from mvhd, movie-timescale ticks; 0 when absent */
 
     int64_t pos;          /* absolute stream offset consumed so far */
     int     mdat_skipped; /* media data streamed past before any index arrived */
@@ -341,8 +342,15 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
             case 0x6d696e66: /* minf */
             case 0x65647473: /* edts */
             case 0x7374626c: parse_box_tree(m, t, body, blen); break;    /* stbl */
-            case 0x6d766864: /* mvhd: movie timescale (elst duration units) */
-                if (blen >= 4) { int ver = body[0]; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) m->movie_timescale = (int)rd32(body + tsoff); }
+            case 0x6d766864: /* mvhd: movie timescale (elst duration units) + duration */
+                if (blen >= 4) {
+                    int ver = body[0];
+                    int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4;
+                    if (tsoff + 4 <= blen) m->movie_timescale = (int)rd32(body + tsoff);
+                    if (ver == 1) { if (tsoff + 4 + 8 <= blen) m->movie_duration = (int64_t)rd64(body + tsoff + 4); }
+                    else          { uint32_t d = tsoff + 4 + 4 <= blen ? rd32(body + tsoff + 4) : 0;
+                                    if (d != 0xFFFFFFFFu) m->movie_duration = d; } /* all-ones = unknown */
+                }
                 break;
             case 0x656c7374: if (t) parse_elst(t, body, blen); break;    /* elst */
             case 0x6d646864: /* mdhd: version(1) flags(3) ... timescale */
@@ -408,6 +416,21 @@ static int classic_ready(mp4_t* m) {
     for (int i = 0; i < m->ntracks; ++i)
         if (classic_track_ready(&m->tracks[i].ctab)) return 1;
     return 0;
+}
+
+/* Longest track's stts total — the fallback when mvhd carries no duration. */
+static int64_t classic_total_duration_us(mp4_t* m) {
+    int64_t best = 0;
+    for (int i = 0; i < m->ntracks; ++i) {
+        const mp4_ctab_t* c = &m->tracks[i].ctab;
+        if (!classic_track_ready(c)) continue;
+        int64_t ticks = 0;
+        for (uint32_t k = 0; k < c->stts_count; ++k)
+            ticks += (int64_t)c->stts[k * 2] * c->stts[k * 2 + 1];
+        int64_t us = ticks_to_us(ticks, m->tracks[i].timescale);
+        if (us > best) best = us;
+    }
+    return best;
 }
 
 /* Resolve a track's edit list against the movie timescale: initial empty edits
@@ -848,6 +871,15 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
                 if (m.mdat_skipped && classic_ready(&m))
                     sink->on_error(sink->user,
                         "progressive MP4 stores its index (moov) after the media data, which can't play over a one-way stream; remux with faststart (ffmpeg -movflags +faststart)");
+                /* Progressive files have a complete timeline in hand — report it.
+                 * (fMP4 durations come from the layer that knows them, e.g. an HLS
+                 * VOD playlist; an init-segment mvhd is usually zero anyway.) */
+                if (classic_ready(&m) && sink->on_duration) {
+                    int64_t dur_us = m.movie_duration > 0
+                        ? ticks_to_us(m.movie_duration, m.movie_timescale > 0 ? m.movie_timescale : 1000)
+                        : classic_total_duration_us(&m);
+                    if (dur_us > 0) sink->on_duration(sink->user, dur_us);
+                }
                 break;
             case 0x6d6f6f66: /* moof */
                 parse_moof(&m, buf, (int)body);

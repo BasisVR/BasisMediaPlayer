@@ -169,6 +169,11 @@ struct basis_media_engine {
     /* diagnostics (demux thread writes, main thread reads; minor races OK) */
     volatile long video_au_count;
     volatile long audio_frame_count;
+
+    /* Total media duration reported by the demuxer (VOD); 0 = unknown/live.
+     * Demux thread writes once, main thread reads — a torn read on 32-bit is
+     * the worst case and Windows/Android are 64-bit. */
+    volatile int64_t duration_us;
 };
 
 /* ---- state/error helpers (exported to internal) ------------------------- */
@@ -287,6 +292,7 @@ static void sink_audio_frame(void* user, const uint8_t* data, int len, int64_t p
 static void sink_state(void* user, basis_media_state_t s) { basis_engine_set_state((basis_media_engine_t*)user, s); }
 static void sink_error(void* user, const char* m) { basis_engine_set_error((basis_media_engine_t*)user, m); }
 static void sink_eos(void* user) { basis_engine_set_state((basis_media_engine_t*)user, BASIS_MEDIA_STATE_ENDED); }
+static void sink_duration(void* user, int64_t us) { basis_media_engine_t* e = (basis_media_engine_t*)user; if (us > 0) e->duration_us = us; }
 static int  sink_is_running(void* user) { basis_media_engine_t* e = (basis_media_engine_t*)user; return e->running; }
 
 static void install_sink(basis_media_engine_t* e) {
@@ -298,6 +304,7 @@ static void install_sink(basis_media_engine_t* e) {
     e->sink.on_state = sink_state;
     e->sink.on_error = sink_error;
     e->sink.on_end_of_stream = sink_eos;
+    e->sink.on_duration = sink_duration;
     e->sink.is_running = sink_is_running;
 }
 
@@ -324,6 +331,7 @@ static void install_audio_sink(basis_media_engine_t* e) {
     e->audio_sink.on_state = audio_sink_state;
     e->audio_sink.on_error = sink_error;               /* a failed audio leg is an engine error */
     e->audio_sink.on_end_of_stream = audio_sink_eos;
+    e->audio_sink.on_duration = sink_duration;         /* either leg may know the timeline */
     e->audio_sink.is_running = sink_is_running;
 }
 
@@ -517,6 +525,11 @@ static void run_hls(demux_ctx_t* c) {
      * has no endlist. A forced hint skips this. */
     if (c->e->paced_hint == 0 && basis_hls_is_vod(hls))
         c->e->paced = 1;
+    if (basis_hls_is_vod(hls)) {
+        long total_ms = basis_hls_duration_ms(hls);
+        if (total_ms > 0 && c->sink->on_duration)
+            c->sink->on_duration(c->sink->user, (int64_t)total_ms * 1000);
+    }
     /* HLS buffers segments and delivers faster than real time, so always pace delivery —
      * even for live (paced=0), which still presents at and converges to the live edge.
      * This replaces basis_hls.c's byte-rate token bucket (disabled there) with PTS-exact
@@ -999,6 +1012,10 @@ BASIS_API int BASIS_CALL basis_media_get_frame_origin(basis_media_engine_t* e) {
 BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* e) {
     if (!e || !e->decoder) return -1;
     return basis_decoder_get_position_us(e->decoder);
+}
+
+BASIS_API int64_t BASIS_CALL basis_media_get_duration_us(basis_media_engine_t* e) {
+    return e ? e->duration_us : 0; /* 0 = unknown / live */
 }
 
 BASIS_API int BASIS_CALL basis_media_poll_caption(basis_media_engine_t* e, char* buf, int buf_size,

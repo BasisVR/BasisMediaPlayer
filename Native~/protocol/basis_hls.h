@@ -54,6 +54,11 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len);
  * playlist parsed at open, so the caller can pick live-vs-on-demand pacing. */
 int basis_hls_is_vod(void* ctx);
 
+/* Total VOD duration in milliseconds (summed segment EXTINF values), 0 for live
+ * or unknown. Playlists beyond the internal segment cap report the truncated
+ * total, matching what actually plays. */
+long basis_hls_duration_ms(void* ctx);
+
 void basis_hls_close(void* ctx);
 
 #ifdef __cplusplus

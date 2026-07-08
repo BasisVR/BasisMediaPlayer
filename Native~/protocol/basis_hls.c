@@ -93,6 +93,7 @@ typedef struct basis_hls {
     long part_target_ms;
     long target_duration_ms;
     int  endlist_seen;
+    long total_ms;               /* VOD: summed EXTINF durations (0 when live/unknown) */
 
     int  map_served;             /* fMP4: init segment already streamed once */
     char map_uri[HLS_MAX_URI];
@@ -614,6 +615,13 @@ void* basis_hls_open(const char* url, const basis_http_provider_t* http,
     h->part_target_ms = pl.part_target_ms;
     h->target_duration_ms = pl.target_duration_ms ? pl.target_duration_ms : 6000;
     h->endlist_seen = pl.has_endlist;
+    if (pl.has_endlist) {
+        /* Sum whole segments only — parts subdivide the same media time. A VOD
+         * beyond HLS_MAX_ITEMS is truncated at parse, so this under-reports in
+         * lockstep with what actually plays. */
+        for (int i = 0; i < pl.item_count; ++i)
+            if (pl.items[i].part < 0) h->total_ms += pl.items[i].dur_ms;
+    }
     if (pl.map_uri[0]) snprintf(h->map_uri, sizeof(h->map_uri), "%s", pl.map_uri);
 
     /* VOD (EXT-X-ENDLIST): start at the first segment so the whole recording
@@ -690,6 +698,11 @@ int basis_hls_read(void* ctx, uint8_t* buf, int len) {
 int basis_hls_is_vod(void* ctx) {
     basis_hls_t* h = (basis_hls_t*)ctx;
     return h ? h->endlist_seen : 0;
+}
+
+long basis_hls_duration_ms(void* ctx) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    return h ? h->total_ms : 0;
 }
 
 void basis_hls_close(void* ctx) {

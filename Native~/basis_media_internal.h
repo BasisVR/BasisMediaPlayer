@@ -70,6 +70,11 @@ typedef struct basis_media_sink {
     void (*on_error)(void* user, const char* message);
     void (*on_end_of_stream)(void* user);
 
+    /* Total media duration once the container/playlist reveals one (VOD).
+     * Live sources never call it. May be NULL (standalone harnesses); may fire
+     * again on a reconnect re-parsing the same index. */
+    void (*on_duration)(void* user, int64_t duration_us);
+
     /* Demuxers poll this in their read loops; return 0 to unwind and exit. */
     int (*is_running)(void* user);
 } basis_media_sink_t;
