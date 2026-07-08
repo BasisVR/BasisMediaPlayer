@@ -78,6 +78,11 @@ public sealed class BasisMediaMetadata
         return meta;
     }
 
+    // Field-level snapshot. The player hands these out so external code can't
+    // silently mutate its live metadata (which would bypass OnMetadataChanged
+    // and the reload-origin comparisons); ApplyMetadata is the mutation path.
+    public BasisMediaMetadata Clone() => (BasisMediaMetadata)MemberwiseClone();
+
     // Copies other's non-null/non-empty fields over this instance, leaving the
     // rest in place — layers enrichment over the URL-derived defaults.
     public void MergeFrom(BasisMediaMetadata other)
