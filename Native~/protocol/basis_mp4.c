@@ -19,7 +19,7 @@
  * progressive files, flagged for iteration):
  *   - one video track + one audio track
  *   - one trun per traf, mdat samples contiguous in trun order
- *   - 4-byte NAL length (from avcC); version 0/1 boxes; stsz (not stz2)
+ *   - version 0/1 boxes; stsz sample sizes (stz2 raises a clear error)
  */
 
 #include "basis_mp4.h"
@@ -76,7 +76,6 @@ typedef struct {
     uint8_t asc[16];
     int asc_len;
     int sr, ch, obj;
-    int64_t next_dts; /* running, in track timescale */
     int announced;
     mp4_ctab_t ctab;
 } mp4_track_t;

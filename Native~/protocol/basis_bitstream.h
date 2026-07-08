@@ -11,8 +11,8 @@ extern "C" {
 /* ---- Annex B (start-code) NAL iteration --------------------------------- */
 
 /* Finds the next NAL unit (between 00 00 01 / 00 00 00 01 start codes) at or
- * after `from`. On success sets *nal_off/*nal_len (payload excluding the start
- * code) and returns the index just past this NAL; returns -1 when none remain. */
+ * after `from`. On success sets *nal_off / *nal_len (payload excluding the
+ * start code) and returns the index just past this NAL; -1 when none remain. */
 int basis_annexb_next(const uint8_t* data, int size, int from, int* nal_off, int* nal_len);
 
 /* H.264 NAL type = byte & 0x1F ; H.265 NAL type = (byte >> 1) & 0x3F */
