@@ -31,6 +31,7 @@
 #define MP4_MAX_FRAGS 4   /* per-moof trun runs (audio + video, with headroom) */
 #define MP4_MAX_BOX   (256LL * 1024 * 1024)  /* cap for boxes buffered whole (moov/moof/fragment mdat) */
 #define MP4_MAX_TABLE (16u * 1024 * 1024)    /* per-table entry cap (~hours of samples) */
+#define MP4_MAX_FRAG_SAMPLES (1u << 20)      /* per-trun sample cap (a fragment is seconds of media) */
 
 /* Classic (progressive) sample tables + walk cursor. Valid when sample_count
  * and chunk_count are non-zero; fMP4 init segments carry these boxes with zero
@@ -41,8 +42,10 @@ typedef struct {
     uint32_t* sizes;          /* per-sample sizes when const_size == 0 */
     uint32_t  stts_count;     /* {sample_count, delta} run pairs */
     uint32_t* stts;
-    uint32_t  ctts_count;     /* {sample_count, offset} run pairs; offset read signed */
+    uint32_t  ctts_count;     /* {sample_count, offset} run pairs; sign depends on ctts_version */
     uint32_t* ctts;
+    int       ctts_version;   /* FullBox version: 0 = unsigned offsets, 1 = signed */
+    int       has_stz2;       /* compact sample sizes present (unsupported) */
     uint32_t  stsc_count;     /* {first_chunk, samples_per_chunk} pairs */
     uint32_t* stsc;
     uint32_t  chunk_count;
@@ -85,7 +88,7 @@ typedef struct {
     int       track_id;
     int       data_offset;
     int64_t   base_dts;
-    int       default_dur;
+    uint32_t  default_dur;
     uint32_t* sizes;
     uint32_t* durs;
     int32_t*  ctos;
@@ -110,6 +113,15 @@ typedef struct {
 
 static uint32_t rd32(const uint8_t* p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static uint64_t rd64(const uint8_t* p) { return ((uint64_t)rd32(p)<<32)|rd32(p+4); }
+
+/* Timescale ticks -> microseconds. Splitting into whole seconds + remainder
+ * keeps the intermediate multiply in range for any stream-supplied timescale
+ * (v * 1000000 directly overflows past ~2.5 hours at a crafted ~1 GHz scale). */
+static int64_t ticks_to_us(int64_t v, int timescale) {
+    int64_t ts = timescale > 0 ? timescale : 90000;
+    int64_t s = v / ts, r = v % ts;
+    return s * 1000000 + r * 1000000 / ts;
+}
 
 static int read_exact(mp4_t* m, uint8_t* buf, int n) {
     int got = 0;
@@ -173,7 +185,7 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
         int esize = (int)rd32(p + off);
         uint32_t etype = rd32(p + off + 4);
         const uint8_t* ent = p + off;
-        if (esize < 8 || off + esize > len) break;
+        if (esize < 8 || esize > len - off) break;
 
         if (etype == 0x61766331 /*avc1*/ || etype == 0x68766331 /*hvc1*/ || etype == 0x68657631 /*hev1*/) {
             t->is_video = 1;
@@ -183,7 +195,7 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
             while (co + 8 <= esize) {
                 int csz = (int)rd32(ent + co);
                 uint32_t ct = rd32(ent + co + 4);
-                if (csz < 8 || co + csz > esize) break;
+                if (csz < 8 || csz > esize - co) break;
                 if (ct == 0x61766343 /*avcC*/ || ct == 0x68766343 /*hvcC*/) {
                     int nls = 4;
                     int got = basis_avcc_extradata_to_annexb(ent + co + 8, csz - 8,
@@ -192,7 +204,7 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
                 }
                 co += csz;
             }
-        } else if (etype == 0x6d703461 /*mp4a*/) {
+        } else if (etype == 0x6d703461 /*mp4a*/ && esize >= 8 + 28) {
             t->is_video = 0;
             t->codec = BASIS_CODEC_AAC;
             /* audio sample entry header 28 bytes, then esds */
@@ -202,7 +214,7 @@ static void parse_stsd(mp4_track_t* t, const uint8_t* p, int len) {
             while (co + 8 <= esize) {
                 int csz = (int)rd32(ent + co);
                 uint32_t ct = rd32(ent + co + 4);
-                if (csz < 8 || co + csz > esize) break;
+                if (csz < 8 || csz > esize - co) break;
                 if (ct == 0x65736473 /*esds*/) {
                     /* find DecoderSpecificInfo (tag 0x05) inside esds */
                     const uint8_t* ep = ent + co + 12; int el = csz - 12;
@@ -296,7 +308,7 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
     while (off + 8 <= len) {
         int sz = (int)rd32(p + off);
         uint32_t ty = rd32(p + off + 4);
-        if (sz < 8 || off + sz > len) break;
+        if (sz < 8 || sz > len - off) break;
         const uint8_t* body = p + off + 8;
         int blen = sz - 8;
         switch (ty) {
@@ -305,10 +317,10 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
             case 0x6d696e66: /* minf */
             case 0x7374626c: parse_box_tree(m, t, body, blen); break;    /* stbl */
             case 0x6d646864: /* mdhd: version(1) flags(3) ... timescale */
-                if (t) { int ver = body[0]; t->track_id = t->track_id; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) t->timescale = (int)rd32(body + tsoff); }
+                if (t && blen >= 4) { int ver = body[0]; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) t->timescale = (int)rd32(body + tsoff); }
                 break;
             case 0x746b6864: /* tkhd: track id */
-                if (t) { int ver = body[0]; int idoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (idoff + 4 <= blen) t->track_id = (int)rd32(body + idoff); }
+                if (t && blen >= 4) { int ver = body[0]; int idoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (idoff + 4 <= blen) t->track_id = (int)rd32(body + idoff); }
                 break;
             case 0x73747364: if (t) parse_stsd(t, body, blen); break;    /* stsd */
             /* classic sample tables (progressive MP4); zero-entry versions in
@@ -316,10 +328,16 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
              * each kind wins — a duplicate in a malformed stbl would otherwise
              * overwrite (and leak) the earlier allocation. */
             case 0x73747473: if (t && !t->ctab.stts) t->ctab.stts = parse_table(body, blen, 2, 2, &t->ctab.stts_count); break;  /* stts */
-            case 0x63747473: if (t && !t->ctab.ctts) t->ctab.ctts = parse_table(body, blen, 2, 2, &t->ctab.ctts_count); break;  /* ctts */
+            case 0x63747473: /* ctts: version 0 offsets are unsigned, version 1 signed */
+                if (t && !t->ctab.ctts) {
+                    t->ctab.ctts = parse_table(body, blen, 2, 2, &t->ctab.ctts_count);
+                    t->ctab.ctts_version = blen >= 1 ? body[0] : 0;
+                }
+                break;
             case 0x73747363: if (t && !t->ctab.stsc) t->ctab.stsc = parse_table(body, blen, 3, 2, &t->ctab.stsc_count); break;  /* stsc */
             case 0x73747373: if (t && !t->ctab.stss) t->ctab.stss = parse_table(body, blen, 1, 1, &t->ctab.stss_count); break;  /* stss */
             case 0x7374737a: if (t && !t->ctab.sample_count) parse_stsz(&t->ctab, body, blen); break;                           /* stsz */
+            case 0x73747a32: if (t) t->ctab.has_stz2 = 1; break;         /* stz2: compact sizes, unsupported */
             case 0x7374636f: if (t && !t->ctab.chunk_offsets) parse_chunk_offsets(&t->ctab, body, blen, 0); break;              /* stco */
             case 0x636f3634: if (t && !t->ctab.chunk_offsets) parse_chunk_offsets(&t->ctab, body, blen, 1); break;              /* co64 */
             default: break;
@@ -425,8 +443,8 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
 
         mp4_ctab_t* c = &t->ctab;
         uint32_t ssize = classic_size(c, c->next);
-        if (ssize == 0 || (int64_t)c->offset < m->pos ||
-            (mdat_end != INT64_MAX && (int64_t)(c->offset + ssize) > mdat_end)) {
+        if (ssize == 0 || ssize > (uint32_t)MP4_MAX_BOX || (int64_t)c->offset < m->pos ||
+            (mdat_end != INT64_MAX && (int64_t)c->offset > mdat_end - (int64_t)ssize)) {
             /* behind the stream head or overrunning the box: the table points at
              * bytes we can't reach — drop the sample and keep walking */
             classic_advance(c);
@@ -441,9 +459,12 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
         }
         if (read_exact(m, buf, (int)ssize) != (int)ssize) { rc = -1; break; }
 
-        int tsc = t->timescale > 0 ? t->timescale : 90000;
-        int32_t cto = c->ctts ? (int32_t)c->ctts[c->ctts_i * 2 + 1] : 0;
-        int64_t pts_us = (c->dts + cto) * 1000000 / tsc;
+        int64_t cto = 0;
+        if (c->ctts) {
+            uint32_t raw = c->ctts[c->ctts_i * 2 + 1];
+            cto = c->ctts_version ? (int64_t)(int32_t)raw : (int64_t)raw;
+        }
+        int64_t pts_us = ticks_to_us(c->dts + cto, t->timescale);
 
         if (t->is_video) {
             int key = 1;
@@ -455,9 +476,7 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
                 if (key) c->stss_i++;
             }
             int nls = t->nal_len_size ? t->nal_len_size : 4;
-            /* Annex B swaps each NAL's nls-byte length prefix for a 4-byte start
-             * code; a NAL is at least nls + 1 bytes, so this bounds the growth. */
-            int outcap = (int)ssize + (4 - nls) * ((int)ssize / (nls + 1)) + 64;
+            int outcap = basis_avcc_annexb_cap((int)ssize, nls);
             uint8_t* out = (uint8_t*)malloc((size_t)outcap);
             if (out) {
                 int n = basis_avcc_to_annexb(buf, (int)ssize, nls, out, outcap);
@@ -501,35 +520,43 @@ static int frag_reserve(mp4_frag_t* f, int n) {
  * decode time; each trun gives a data-offset (relative to the moof) and samples. */
 static void parse_traf(mp4_t* m, const uint8_t* p, int len) {
     int off = 0;
-    int track_id = 0, default_dur = 0, default_size = 0;
+    int track_id = 0;
+    uint32_t default_dur = 0, default_size = 0;
     int64_t base_dts = 0;
     while (off + 8 <= len) {
         int sz = (int)rd32(p + off);
         uint32_t ty = rd32(p + off + 4);
-        if (sz < 8 || off + sz > len) break;
+        if (sz < 8 || sz > len - off) break;
         const uint8_t* b = p + off + 8;
-        if (ty == 0x74666864) { /* tfhd */
+        int blen = sz - 8;
+        if (ty == 0x74666864 && blen >= 8) { /* tfhd */
             uint32_t flags = rd32(b) & 0xFFFFFF;
-            int q = 4;
-            track_id = (int)rd32(b + q); q += 4;
+            track_id = (int)rd32(b + 4);
+            int q = 8;
             if (flags & 0x000001) q += 8;  /* base-data-offset */
             if (flags & 0x000002) q += 4;  /* sample-description-index */
-            if (flags & 0x000008) { default_dur = (int)rd32(b + q); q += 4; }
-            if (flags & 0x000010) { default_size = (int)rd32(b + q); q += 4; }
-        } else if (ty == 0x74666474) { /* tfdt */
+            if (flags & 0x000008) { if (q + 4 > blen) { off += sz; continue; } default_dur = rd32(b + q); q += 4; }
+            if (flags & 0x000010) { if (q + 4 > blen) { off += sz; continue; } default_size = rd32(b + q); q += 4; }
+        } else if (ty == 0x74666474 && blen >= 8) { /* tfdt */
             int ver = b[0];
-            base_dts = ver == 1 ? (int64_t)rd64(b + 4) : (int64_t)rd32(b + 4);
+            if (ver != 1) base_dts = (int64_t)rd32(b + 4);
+            else if (blen >= 12) base_dts = (int64_t)rd64(b + 4);
         } else if (ty == 0x7472756e && m->nfrags < MP4_MAX_FRAGS) { /* trun */
+            if (blen < 8) { off += sz; continue; }
             mp4_frag_t* f = &m->frags[m->nfrags];
             uint32_t flags = rd32(b) & 0xFFFFFF;
-            int count = (int)rd32(b + 4);
+            uint32_t count = rd32(b + 4);
             int q = 8;
             int data_offset = 0;
-            if (flags & 0x000001) { data_offset = (int)rd32(b + q); q += 4; } /* data-offset */
-            if (flags & 0x000004) q += 4; /* first-sample-flags */
-            if (!frag_reserve(f, count)) { off += sz; continue; }
-            for (int i = 0; i < count; ++i) {
-                uint32_t dur = (uint32_t)default_dur, size = (uint32_t)default_size;
+            if (flags & 0x000001) { if (q + 4 > blen) { off += sz; continue; } data_offset = (int)rd32(b + q); q += 4; } /* data-offset */
+            if (flags & 0x000004) { if (q + 4 > blen) { off += sz; continue; } q += 4; } /* first-sample-flags */
+            /* the declared per-sample table must fit inside this box */
+            int per = 4 * (!!(flags & 0x000100) + !!(flags & 0x000200) + !!(flags & 0x000400) + !!(flags & 0x000800));
+            if (count == 0 || count > MP4_MAX_FRAG_SAMPLES ||
+                (int64_t)count * per > (int64_t)blen - q) { off += sz; continue; }
+            if (!frag_reserve(f, (int)count)) { off += sz; continue; }
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t dur = default_dur, size = default_size;
                 int32_t cto = 0;
                 if (flags & 0x000100) { dur = rd32(b + q); q += 4; }
                 if (flags & 0x000200) { size = rd32(b + q); q += 4; }
@@ -541,7 +568,7 @@ static void parse_traf(mp4_t* m, const uint8_t* p, int len) {
             f->base_dts = base_dts;
             f->data_offset = data_offset;
             f->default_dur = default_dur;
-            f->count = count;
+            f->count = (int)count;
             m->nfrags++;
         }
         off += sz;
@@ -554,7 +581,7 @@ static void parse_moof(mp4_t* m, const uint8_t* p, int len) {
     while (off + 8 <= len) {
         int sz = (int)rd32(p + off);
         uint32_t ty = rd32(p + off + 4);
-        if (sz < 8 || off + sz > len) break;
+        if (sz < 8 || sz > len - off) break;
         if (ty == 0x74726166) parse_traf(m, p + off + 8, sz - 8); /* traf */
         off += sz;
     }
@@ -578,13 +605,13 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
         if (m->frags[k].data_offset < base_off) base_off = m->frags[k].data_offset;
 
     mp4_track_t* trk[MP4_MAX_FRAGS];
-    int     pos[MP4_MAX_FRAGS];
+    int64_t pos[MP4_MAX_FRAGS];
     int     idx[MP4_MAX_FRAGS];
     int64_t dts[MP4_MAX_FRAGS];
     for (int k = 0; k < m->nfrags; ++k) {
         const mp4_frag_t* f = &m->frags[k];
         trk[k] = track_by_id(m, f->track_id);
-        pos[k] = f->data_offset - base_off;
+        pos[k] = (int64_t)f->data_offset - base_off;
         idx[k] = (trk[k] && pos[k] >= 0) ? 0 : f->count; /* unknown track / bad offset: skip run */
         dts[k] = f->base_dts;
     }
@@ -594,8 +621,7 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
         int64_t best_us = 0;
         for (int j = 0; j < m->nfrags; ++j) {
             if (idx[j] >= m->frags[j].count) continue;
-            int jts = trk[j]->timescale > 0 ? trk[j]->timescale : 90000;
-            int64_t us = dts[j] * 1000000 / jts;
+            int64_t us = ticks_to_us(dts[j], trk[j]->timescale);
             if (k < 0 || us < best_us) { k = j; best_us = us; }
         }
         if (k < 0) break;
@@ -603,19 +629,18 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
         const mp4_frag_t* f = &m->frags[k];
         mp4_track_t* t = trk[k];
         int i = idx[k];
-        int ssize = (int)f->sizes[i];
-        if (ssize <= 0 || pos[k] + ssize > len) { idx[k] = f->count; continue; } /* run truncated */
-        int ts = t->timescale > 0 ? t->timescale : 90000;
-        int64_t pts_us = (dts[k] + f->ctos[i]) * 1000000 / ts;
+        uint32_t ssize = f->sizes[i];
+        if (ssize == 0 || ssize > (uint32_t)len || pos[k] > (int64_t)len - (int64_t)ssize) {
+            idx[k] = f->count; continue; /* run truncated */
+        }
+        int64_t pts_us = ticks_to_us(dts[k] + f->ctos[i], t->timescale);
 
         if (t->is_video) {
             int nls = t->nal_len_size ? t->nal_len_size : 4;
-            /* Annex B swaps each NAL's nls-byte length prefix for a 4-byte start
-             * code; a NAL is at least nls + 1 bytes, so this bounds the growth. */
-            int cap = ssize + (4 - nls) * (ssize / (nls + 1)) + 64;
+            int cap = basis_avcc_annexb_cap((int)ssize, nls);
             uint8_t* out = (uint8_t*)malloc((size_t)cap);
             if (out) {
-                int n = basis_avcc_to_annexb(data + pos[k], ssize, nls, out, cap);
+                int n = basis_avcc_to_annexb(data + pos[k], (int)ssize, nls, out, cap);
                 if (n > 0) {
                     int key = t->codec == BASIS_CODEC_H265 ? basis_h265_is_keyframe(out, n) : basis_h264_is_keyframe(out, n);
                     m->sink->on_video_au(m->sink->user, out, n, pts_us, key);
@@ -623,7 +648,7 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
                 free(out);
             }
         } else {
-            m->sink->on_audio_frame(m->sink->user, data + pos[k], ssize, pts_us);
+            m->sink->on_audio_frame(m->sink->user, data + pos[k], (int)ssize, pts_us);
         }
 
         pos[k] += ssize;
@@ -674,6 +699,14 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
                 parse_box_tree(&m, NULL, buf, (int)body);
                 for (int i = 0; i < m.ntracks; ++i) classic_init_cursor(&m.tracks[i].ctab);
                 announce_tracks(&m);
+                /* A track whose sizes live in stz2 has no walkable tables; playing
+                 * the remaining track would silently drop this one, so fail loudly. */
+                for (int i = 0; i < m.ntracks; ++i)
+                    if (m.tracks[i].ctab.has_stz2 && !classic_track_ready(&m.tracks[i].ctab)) {
+                        sink->on_error(sink->user,
+                            "MP4 uses a compact (stz2) sample-size table, which isn't supported; remux (ffmpeg -c copy) to rewrite the sample tables");
+                        break;
+                    }
                 if (m.mdat_skipped && classic_ready(&m))
                     sink->on_error(sink->user,
                         "progressive MP4 stores its index (moov) after the media data, which can't play over a one-way stream; remux with faststart (ffmpeg -movflags +faststart)");

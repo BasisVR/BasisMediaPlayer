@@ -94,6 +94,12 @@ int basis_avcc_to_annexb(const uint8_t* in, int in_len, int nls, uint8_t* out, i
     return op;
 }
 
+int basis_avcc_annexb_cap(int in_len, int nal_length_size) {
+    int nls = (nal_length_size >= 1 && nal_length_size <= 4) ? nal_length_size : 4;
+    if (in_len < 0) in_len = 0;
+    return in_len + (4 - nls) * (in_len / (nls + 1)) + 64;
+}
+
 /* avcC: [0]=1 [1]=profile [2]=compat [3]=level [4]=0xFC|lengthSizeMinus1
  *       [5]=0xE0|numSPS, then SPS (u16 len + data)..., numPPS, PPS... */
 static int avcc_to_annexb(const uint8_t* cfg, int cfg_len, uint8_t* out, int out_cap,

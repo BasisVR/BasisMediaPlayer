@@ -31,6 +31,12 @@ int basis_h265_is_keyframe(const uint8_t* annexb, int len);
 int basis_avcc_to_annexb(const uint8_t* in, int in_len, int nal_length_size,
                          uint8_t* out, int out_cap);
 
+/* Worst-case output size for basis_avcc_to_annexb: each NAL's length prefix
+ * (nal_length_size bytes) becomes a 4-byte start code, and a NAL occupies at
+ * least nal_length_size + 1 input bytes, which bounds the per-NAL growth.
+ * Includes a small constant of extra headroom. */
+int basis_avcc_annexb_cap(int in_len, int nal_length_size);
+
 /* Builds an Annex B extradata blob from an avcC/hvcC config record (as carried
  * in MP4 stsd or FLV AVCDecoderConfigurationRecord). Writes the contained
  * SPS/PPS (and VPS for HEVC) as start-code-prefixed NALUs. Returns bytes written
