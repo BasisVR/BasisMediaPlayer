@@ -53,6 +53,12 @@ typedef struct {
     uint32_t  stss_count;     /* sync-sample numbers, 1-based; NULL => all sync */
     uint32_t* stss;
 
+    /* edit-list mapping onto the movie timeline (from elst, resolved once the
+     * movie timescale is known): presentation = media time - media_start,
+     * shifted late by pts_delay_us of initial empty edits. */
+    int64_t   media_start;    /* media-timescale ticks */
+    int64_t   pts_delay_us;
+
     /* cursor: the next sample to emit */
     uint32_t next;            /* global sample index, 0-based */
     uint32_t chunk;           /* current chunk, 0-based */
@@ -77,6 +83,9 @@ typedef struct {
     int asc_len;
     int sr, ch, obj;
     int announced;
+    /* raw elst entries; durations are movie-timescale, media times media-timescale */
+    uint32_t elst_count;
+    struct { uint64_t duration; int64_t media_time; } elst[8];
     mp4_ctab_t ctab;
 } mp4_track_t;
 
@@ -101,6 +110,7 @@ typedef struct {
     void* ctx;
     mp4_track_t tracks[2];
     int ntracks;
+    int movie_timescale;  /* from mvhd; units of elst segment durations */
 
     int64_t pos;          /* absolute stream offset consumed so far */
     int     mdat_skipped; /* media data streamed past before any index arrived */
@@ -272,6 +282,21 @@ static void parse_stsz(mp4_ctab_t* c, const uint8_t* p, int len) {
     c->sample_count = n;
 }
 
+static void parse_elst(mp4_track_t* t, const uint8_t* p, int len) {
+    if (t->elst_count || len < 8) return;
+    int ver = p[0];
+    uint32_t n = rd32(p + 4);
+    int stride = ver == 1 ? 20 : 12;
+    if (!n || (int64_t)8 + (int64_t)n * stride > len) return;
+    uint32_t keep = n < 8 ? n : 8;  /* only the leading edits shape the walk */
+    for (uint32_t i = 0; i < keep; ++i) {
+        const uint8_t* e = p + 8 + (size_t)i * stride;
+        if (ver == 1) { t->elst[i].duration = rd64(e); t->elst[i].media_time = (int64_t)rd64(e + 8); }
+        else          { t->elst[i].duration = rd32(e); t->elst[i].media_time = (int32_t)rd32(e + 4); }
+    }
+    t->elst_count = keep;
+}
+
 static void parse_chunk_offsets(mp4_ctab_t* c, const uint8_t* p, int len, int is64) {
     if (len < 8) return;
     uint32_t n = rd32(p + 4);
@@ -314,7 +339,12 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
             case 0x7472616b: parse_trak(m, body, blen); break;          /* trak */
             case 0x6d646961: /* mdia */
             case 0x6d696e66: /* minf */
+            case 0x65647473: /* edts */
             case 0x7374626c: parse_box_tree(m, t, body, blen); break;    /* stbl */
+            case 0x6d766864: /* mvhd: movie timescale (elst duration units) */
+                if (blen >= 4) { int ver = body[0]; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) m->movie_timescale = (int)rd32(body + tsoff); }
+                break;
+            case 0x656c7374: if (t) parse_elst(t, body, blen); break;    /* elst */
             case 0x6d646864: /* mdhd: version(1) flags(3) ... timescale */
                 if (t && blen >= 4) { int ver = body[0]; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) t->timescale = (int)rd32(body + tsoff); }
                 break;
@@ -378,6 +408,24 @@ static int classic_ready(mp4_t* m) {
     for (int i = 0; i < m->ntracks; ++i)
         if (classic_track_ready(&m->tracks[i].ctab)) return 1;
     return 0;
+}
+
+/* Resolve a track's edit list against the movie timescale: initial empty edits
+ * (media_time -1) delay the whole track; the first normal edit's media_time is
+ * the media-time origin (encoder priming / initial trim). Later edit segments
+ * would need a segment-aware walk and are ignored. Samples ahead of the origin
+ * keep their (negative) presentation time rather than being dropped — video
+ * there can still be reference data the decoder needs. */
+static void classic_apply_elst(mp4_t* m, mp4_track_t* t) {
+    mp4_ctab_t* c = &t->ctab;
+    for (uint32_t i = 0; i < t->elst_count; ++i) {
+        if (t->elst[i].media_time < 0) {
+            c->pts_delay_us += ticks_to_us((int64_t)t->elst[i].duration, m->movie_timescale > 0 ? m->movie_timescale : 1000);
+            continue;
+        }
+        c->media_start = t->elst[i].media_time;
+        break;
+    }
 }
 
 static void classic_init_cursor(mp4_ctab_t* c) {
@@ -463,7 +511,7 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
             uint32_t raw = c->ctts[c->ctts_i * 2 + 1];
             cto = c->ctts_version ? (int64_t)(int32_t)raw : (int64_t)raw;
         }
-        int64_t pts_us = ticks_to_us(c->dts + cto, t->timescale);
+        int64_t pts_us = ticks_to_us(c->dts + cto - c->media_start, t->timescale) + c->pts_delay_us;
 
         if (t->is_video) {
             int key = 1;
@@ -696,7 +744,10 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
         switch (type) {
             case 0x6d6f6f76: /* moov */
                 parse_box_tree(&m, NULL, buf, (int)body);
-                for (int i = 0; i < m.ntracks; ++i) classic_init_cursor(&m.tracks[i].ctab);
+                for (int i = 0; i < m.ntracks; ++i) {
+                    classic_apply_elst(&m, &m.tracks[i]);
+                    classic_init_cursor(&m.tracks[i].ctab);
+                }
                 announce_tracks(&m);
                 /* A track whose sizes live in stz2 has no walkable tables; playing
                  * the remaining track would silently drop this one, so fail loudly. */
