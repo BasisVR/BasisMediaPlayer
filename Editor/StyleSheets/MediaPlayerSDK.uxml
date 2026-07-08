@@ -10,6 +10,26 @@
             <engine:TextField label="Display Name" name="DisplayNameField" tooltip="Friendly name shown in the Media Players menu and diagnostics. Defaults to the GameObject name when empty."/>
         </engine:VisualElement>
 
+        <engine:VisualElement name="NowPlayingCard" class="bvp-card">
+            <engine:Label text="Now Playing" class="bvp-section-title"/>
+            <engine:VisualElement name="NowPlayingTitleRow" class="bvp-status-row">
+                <engine:Label text="Title" selectable="false" class="bvp-status-label"/>
+                <engine:Label text="" name="NowPlayingTitle" selectable="false" class="bvp-status-value bvp-status-value-wrap"/>
+            </engine:VisualElement>
+            <engine:VisualElement name="NowPlayingUploaderRow" class="bvp-status-row">
+                <engine:Label text="Uploader" selectable="false" class="bvp-status-label"/>
+                <engine:Label text="" name="NowPlayingUploader" selectable="false" class="bvp-status-value"/>
+            </engine:VisualElement>
+            <engine:VisualElement name="NowPlayingFileRow" class="bvp-status-row">
+                <engine:Label text="File" selectable="false" class="bvp-status-label"/>
+                <engine:Label text="" name="NowPlayingFile" selectable="false" class="bvp-status-value"/>
+            </engine:VisualElement>
+            <engine:VisualElement name="NowPlayingDurationRow" class="bvp-status-row">
+                <engine:Label text="Duration" selectable="false" class="bvp-status-label"/>
+                <engine:Label text="" name="NowPlayingDuration" selectable="false" class="bvp-status-value"/>
+            </engine:VisualElement>
+        </engine:VisualElement>
+
         <engine:Foldout text="Buffering" name="BufferingFoldout" value="true" class="bvp-foldout">
             <engine:IntegerField label="Max Queue Length" name="MaxQueueLengthField" tooltip="Maximum queued frames before the overflow policy kicks in. ~1s at 30 fps by default."/>
             <engine:EnumField label="Overflow Policy" name="OverflowPolicyField" tooltip="DropOldest keeps fresh frames; DropNewest keeps the buffered history."/>

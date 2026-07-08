@@ -136,6 +136,13 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public event Action<BasisBitrateTrack> OnBitrateTrackChanged;
     public event Action<BasisAudioTrack> OnAudioTrackChanged;
 
+    // Metadata for the loading/loaded media updated — a load seeded fresh
+    // URL-derived defaults, or an enrichment layer (resolver, playlist,
+    // consumer) merged richer fields in. Fires at least once per load and may
+    // repeat with an unchanged snapshot (reloads, reconnects) — handlers just
+    // re-read the payload. See BasisMediaMetadata.
+    public event Action<BasisMediaMetadata> OnMetadataChanged;
+
     // The active in-band caption cue changed (CEA-608 CC1). Cue.Text is null when
     // the caption clears. Raised even while CaptionsEnabled is false so a display
     // can stay primed; honour CaptionsEnabled for visibility.
@@ -318,6 +325,11 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     public BasisMediaPlayerAudio AudioComponent => audioComponent;
     public BasisMediaSource ActiveMediaSource => activeMediaSource;
 
+    // Display metadata for the current media — title/filename at minimum,
+    // richer fields when an integration supplied them. Null until the first
+    // load; after that always set. See BasisMediaMetadata for the layering.
+    public BasisMediaMetadata Metadata => metadata;
+
     // Bumped on every LoadUrl. An async resolver (the yt-dlp integration) captures this
     // before resolving and skips its LoadSource if it changed meanwhile, so a slow resolve
     // of an earlier URL can't overwrite a newer load. Read-only to callers.
@@ -379,6 +391,8 @@ public sealed class BasisMediaPlayer : MonoBehaviour
     private BasisMediaPlayerAudio audioComponent;
     private long lastEnqueuedPtsUs;
     private BasisMediaSource activeMediaSource;
+    private BasisMediaMetadata metadata;
+    private bool metadataSeededByLoadUrl;
     private float sleepTimerRemainingSeconds;
     private bool sleepTimerArmed;
 
@@ -436,6 +450,12 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         url = BasisMediaUrlRouter.NormalizeUrl(url);
         LastErrorMessage = null;
         LoadGeneration++;
+        // Seed URL-derived metadata for the REQUESTED url now, so consumers see
+        // what's loading even while a resolver is still working; enrichment
+        // (resolver title etc.) merges in at LoadSource / ApplyMetadata.
+        metadata = BasisMediaMetadata.FromUrl(url);
+        metadataSeededByLoadUrl = true;
+        OnMetadataChanged?.Invoke(metadata);
         if (BasisMediaUrlRouter.TryResolveAndLoad(this, url)) return;
         if (!BasisMediaUrlRouter.IsDirectlyPlayable(url))
         {
@@ -465,6 +485,20 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         LoadSource(media);
     }
 
+    // Merges non-null fields of `partial` into the current metadata and raises
+    // OnMetadataChanged — for enrichment that arrives after a load started
+    // (async resolvers, playlist display names, consumer-stamped titles).
+    // Applies to the CURRENT load: async callers should capture LoadGeneration
+    // before awaiting and skip the call if it changed, the same guard resolvers
+    // use for LoadSource.
+    public void ApplyMetadata(BasisMediaMetadata partial)
+    {
+        if (partial == null) return;
+        if (metadata == null) metadata = new BasisMediaMetadata();
+        metadata.MergeFrom(partial);
+        OnMetadataChanged?.Invoke(metadata);
+    }
+
     public void Reload()
     {
         if (activeMediaSource == null)
@@ -489,7 +523,36 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
 
         LastErrorMessage = null;
+        BasisMediaSource previousMediaSource = activeMediaSource;
         activeMediaSource = media;
+
+        // Metadata keys on the ORIGIN url — the page URL a resolver started from
+        // (media.Metadata.SourceUrl), else the seed a LoadUrl in flight already
+        // built (a resolver's stream Uri would title as e.g. "videoplayback"),
+        // else this source's own Uri (direct LoadSource callers). Keep the
+        // existing metadata only for the load it belongs to — the seeded LoadUrl
+        // continuation or a reload of the SAME source instance (Reload(), the
+        // native auto-reconnect); a different instance rebuilds even on a
+        // matching origin so the previous load's enrichment and consumer-stamped
+        // fields don't leak into a fresh load. Source-carried enrichment then
+        // layers on top.
+        bool seeded = metadataSeededByLoadUrl;
+        metadataSeededByLoadUrl = false;
+        string metadataUrl = media.Metadata != null && !string.IsNullOrEmpty(media.Metadata.SourceUrl)
+            ? media.Metadata.SourceUrl
+            : (seeded && metadata != null ? metadata.SourceUrl : media.Uri);
+        bool sameSourceInstance = ReferenceEquals(previousMediaSource, media);
+        if (metadata == null ||
+            !string.Equals(metadata.SourceUrl, metadataUrl, StringComparison.Ordinal) ||
+            (!seeded && !sameSourceInstance))
+            metadata = BasisMediaMetadata.FromUrl(metadataUrl);
+        metadata.MergeFrom(media.Metadata);
+        // Persist the origin on the source itself so a later reload of the SAME
+        // instance (Reload(), the native auto-reconnect) keeps it after the
+        // one-shot LoadUrl seed has been spent.
+        if (media.Metadata == null) media.Metadata = new BasisMediaMetadata { SourceUrl = metadataUrl };
+        else if (string.IsNullOrEmpty(media.Metadata.SourceUrl)) media.Metadata.SourceUrl = metadataUrl;
+        OnMetadataChanged?.Invoke(metadata);
 
         /* not needed anymore!
         // Under Wine/Proton, Media Foundation may be missing and initializing the
