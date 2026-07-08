@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -14,6 +15,9 @@ typedef struct {
     HINTERNET request;
     int response_complete;
     int seekable;            /* finite Content-Length + Accept-Ranges: bytes (VOD) */
+    int range_ok;            /* server answered the bytes=0- probe with a 206 */
+    wchar_t* path;           /* request path, kept for ranged re-requests */
+    DWORD open_flags;        /* WINHTTP_FLAG_SECURE when https */
 } win_http_t;
 
 static wchar_t* to_w(const char* s) {
@@ -49,11 +53,13 @@ extern "C" void* basis_win_http_open(const char* url) {
     if (!h->connect) { WinHttpCloseHandle(h->session); free(wurl); free(h); return NULL; }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    h->open_flags = flags;
+    h->path = _wcsdup(path);
     h->request = WinHttpOpenRequest(h->connect, L"GET", path, NULL,
                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!h->request) {
         WinHttpCloseHandle(h->connect); WinHttpCloseHandle(h->session);
-        free(wurl); free(h); return NULL;
+        free(h->path); free(wurl); free(h); return NULL;
     }
 
     /* SSRF: never let a public URL redirect down to plaintext (the classic
@@ -62,11 +68,15 @@ extern "C" void* basis_win_http_open(const char* url) {
     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(h->request, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
-    if (!WinHttpSendRequest(h->request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    /* The bytes=0- probe: identical body, but a server that really implements
+     * ranges answers 206. Only that proves a later ranged re-request will be
+     * honoured — Accept-Ranges alone is advertisement (Python's SimpleHTTP
+     * handler, for one, advertises it and then serves 200 + the whole file). */
+    if (!WinHttpSendRequest(h->request, L"Range: bytes=0-", (DWORD)-1L,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(h->request, NULL)) {
         WinHttpCloseHandle(h->request); WinHttpCloseHandle(h->connect); WinHttpCloseHandle(h->session);
-        free(wurl); free(h); return NULL;
+        free(h->path); free(wurl); free(h); return NULL;
     }
 
     /* check status code */
@@ -76,8 +86,9 @@ extern "C" void* basis_win_http_open(const char* url) {
     free(wurl);
     if (code < 200 || code >= 400) {
         WinHttpCloseHandle(h->request); WinHttpCloseHandle(h->connect); WinHttpCloseHandle(h->session);
-        free(h); return NULL;
+        free(h->path); free(h); return NULL;
     }
+    h->range_ok = (code == 206);
 
     /* Seekability (for live-vs-VOD auto-detection): a known Content-Length plus
      * Accept-Ranges: bytes means a finite, range-fetchable body — on-demand content.
@@ -101,6 +112,11 @@ extern "C" int basis_win_http_is_seekable(void* ctx) {
     return h ? h->seekable : 0;
 }
 
+extern "C" int basis_win_http_can_reseek(void* ctx) {
+    win_http_t* h = (win_http_t*)ctx;
+    return h ? (h->seekable && h->range_ok) : 0;
+}
+
 extern "C" int basis_win_http_read(void* ctx, uint8_t* buf, int len) {
     win_http_t* h = (win_http_t*)ctx;
     if (!h || h->response_complete || len <= 0) return 0;
@@ -122,11 +138,55 @@ extern "C" void basis_win_http_abort(void* ctx) {
     if (req) WinHttpCloseHandle(req);
 }
 
+/* Replaces the current response with a ranged GET on the same connection so the
+ * stream continues from `offset`. Only valid on a seekable body. The caller must
+ * guarantee no concurrent basis_win_http_read is in flight (park or abort the
+ * reading thread first — a prior basis_win_http_abort is fine, this re-opens).
+ * Returns 0 on success; on failure the source is left request-less and reads
+ * report EOF. */
+extern "C" int basis_win_http_reseek(void* ctx, long long offset) {
+    win_http_t* h = (win_http_t*)ctx;
+    if (!h || !h->seekable || !h->range_ok || !h->path || offset < 0) return -1;
+
+    HINTERNET old_req = h->request;
+    h->request = NULL;
+    if (old_req) WinHttpCloseHandle(old_req);
+
+    HINTERNET req = WinHttpOpenRequest(h->connect, L"GET", h->path, NULL,
+                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, h->open_flags);
+    if (!req) return -1;
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+    wchar_t range[64];
+    swprintf(range, 64, L"Range: bytes=%lld-", offset);
+    if (!WinHttpSendRequest(req, range, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req, NULL)) {
+        WinHttpCloseHandle(req);
+        return -1;
+    }
+
+    /* 206 = ranged body starting at offset. A 200 means the server ignored the
+     * Range and restarted at byte 0 — the bytes would be silently misaligned. */
+    DWORD code = 0, sz = sizeof(code);
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
+    if (code != 206 && !(code == 200 && offset == 0)) {
+        WinHttpCloseHandle(req);
+        return -1;
+    }
+
+    h->request = req;
+    h->response_complete = 0;
+    return 0;
+}
+
 extern "C" void basis_win_http_close(void* ctx) {
     win_http_t* h = (win_http_t*)ctx;
     if (!h) return;
     if (h->request) WinHttpCloseHandle(h->request);
     if (h->connect) WinHttpCloseHandle(h->connect);
     if (h->session) WinHttpCloseHandle(h->session);
+    free(h->path);
     free(h);
 }

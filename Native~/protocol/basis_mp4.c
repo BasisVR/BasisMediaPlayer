@@ -108,9 +108,12 @@ typedef struct {
     basis_media_sink_t* sink;
     basis_read_fn read;
     void* ctx;
+    basis_reseek_fn reseek; /* NULL: the byte source can't reposition */
+    void* reseek_ctx;
     mp4_track_t tracks[2];
     int ntracks;
-    int movie_timescale;  /* from mvhd; units of elst segment durations */
+    int movie_timescale;    /* from mvhd; units of elst segment durations */
+    int64_t movie_duration; /* from mvhd, movie-timescale ticks; 0 when absent */
 
     int64_t pos;          /* absolute stream offset consumed so far */
     int     mdat_skipped; /* media data streamed past before any index arrived */
@@ -341,8 +344,15 @@ static void parse_box_tree(mp4_t* m, mp4_track_t* t, const uint8_t* p, int len) 
             case 0x6d696e66: /* minf */
             case 0x65647473: /* edts */
             case 0x7374626c: parse_box_tree(m, t, body, blen); break;    /* stbl */
-            case 0x6d766864: /* mvhd: movie timescale (elst duration units) */
-                if (blen >= 4) { int ver = body[0]; int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4; if (tsoff + 4 <= blen) m->movie_timescale = (int)rd32(body + tsoff); }
+            case 0x6d766864: /* mvhd: movie timescale (elst duration units) + duration */
+                if (blen >= 4) {
+                    int ver = body[0];
+                    int tsoff = ver == 1 ? 4 + 8 + 8 : 4 + 4 + 4;
+                    if (tsoff + 4 <= blen) m->movie_timescale = (int)rd32(body + tsoff);
+                    if (ver == 1) { if (tsoff + 4 + 8 <= blen) m->movie_duration = (int64_t)rd64(body + tsoff + 4); }
+                    else          { uint32_t d = tsoff + 4 + 4 <= blen ? rd32(body + tsoff + 4) : 0;
+                                    if (d != 0xFFFFFFFFu) m->movie_duration = d; } /* all-ones = unknown */
+                }
                 break;
             case 0x656c7374: if (t) parse_elst(t, body, blen); break;    /* elst */
             case 0x6d646864: /* mdhd: version(1) flags(3) ... timescale */
@@ -408,6 +418,21 @@ static int classic_ready(mp4_t* m) {
     for (int i = 0; i < m->ntracks; ++i)
         if (classic_track_ready(&m->tracks[i].ctab)) return 1;
     return 0;
+}
+
+/* Longest track's stts total — the fallback when mvhd carries no duration. */
+static int64_t classic_total_duration_us(mp4_t* m) {
+    int64_t best = 0;
+    for (int i = 0; i < m->ntracks; ++i) {
+        const mp4_ctab_t* c = &m->tracks[i].ctab;
+        if (!classic_track_ready(c)) continue;
+        int64_t ticks = 0;
+        for (uint32_t k = 0; k < c->stts_count; ++k)
+            ticks += (int64_t)c->stts[k * 2] * c->stts[k * 2 + 1];
+        int64_t us = ticks_to_us(ticks, m->tracks[i].timescale);
+        if (us > best) best = us;
+    }
+    return best;
 }
 
 /* Resolve a track's edit list against the movie timescale: initial empty edits
@@ -501,6 +526,33 @@ static void emit_pend(mp4_t* m, const mp4_track_t* t, const mp4_pend_t* s) {
     else m->sink->on_audio_frame(m->sink->user, s->data, s->size, s->pts_us);
 }
 
+/* Repositions a track cursor to the sample at target_us — for video, the
+ * preceding sync sample so decode restarts on a keyframe. Replays the cursor
+ * from the table start: the tables are in memory, so a full replay is cheap
+ * relative to the network refetch the seek triggers anyway. */
+static void classic_seek_cursor(mp4_track_t* t, int64_t target_us, int want_key) {
+    mp4_ctab_t* c = &t->ctab;
+    classic_init_cursor(c);
+    if (!c->sample_count) return;
+    for (;;) {
+        if (c->next + 1 >= c->sample_count) break;
+        int64_t next_dts = c->dts + (int64_t)c->stts[c->stts_i * 2 + 1];
+        int64_t next_us = ticks_to_us(next_dts - c->media_start, t->timescale) + c->pts_delay_us;
+        if (next_us > target_us) break;
+        classic_advance(c);
+    }
+    if (want_key && c->stss) {
+        uint32_t key1 = 1; /* stss is sorted 1-based; find the floor of next+1 */
+        for (uint32_t k = 0; k < c->stss_count; ++k) {
+            if (c->stss[k] <= c->next + 1) key1 = c->stss[k];
+            else break;
+        }
+        uint32_t key0 = key1 ? key1 - 1 : 0;
+        classic_init_cursor(c);
+        while (c->next < key0) classic_advance(c);
+    }
+}
+
 /* Walks the classic tables against one mdat. The byte source only moves
  * forward, so samples are read in file-offset order — the muxer's chunk
  * interleave — but delivered in decode-time order across tracks: with a
@@ -522,6 +574,32 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
 
     for (;;) {
         if (!m->sink->is_running(m->sink->user)) { rc = -1; break; }
+
+        /* absolute seek: reposition mid-walk when the engine posts a target */
+        int64_t seek_us;
+        if (m->reseek && m->sink->take_seek && m->sink->take_seek(m->sink->user, &seek_us)) {
+            uint64_t new_off = UINT64_MAX;
+            for (int i = 0; i < m->ntracks; ++i) {
+                mp4_track_t* t = &m->tracks[i];
+                if (!classic_track_ready(&t->ctab)) continue;
+                classic_seek_cursor(t, seek_us, t->is_video);
+                if (t->ctab.next < t->ctab.sample_count && t->ctab.offset < new_off)
+                    new_off = t->ctab.offset;
+            }
+            if (new_off != UINT64_MAX && (int64_t)new_off < mdat_end &&
+                m->reseek(m->reseek_ctx, (int64_t)new_off) == 0) {
+                m->pos = (int64_t)new_off;
+                for (int i = 0; i < 2; ++i) { /* parked samples predate the jump */
+                    while (head[i]) { mp4_pend_t* s = head[i]; head[i] = s->next; free(s); }
+                    tail[i] = NULL;
+                }
+                queued = 0;
+            }
+            /* On a failed refetch the cursors stay moved: samples now behind the
+             * stream head drop via the existing unreachable-bytes check and the
+             * walk degrades to forward-only rather than derailing. */
+            continue;
+        }
 
         /* the next sample in file order, while any remains in this mdat */
         mp4_track_t* rt = NULL;
@@ -792,9 +870,11 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
     }
 }
 
-int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
+int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx,
+                  basis_reseek_fn reseek, void* reseek_ctx) {
     mp4_t m; memset(&m, 0, sizeof(m));
     m.sink = sink; m.read = read; m.ctx = ctx;
+    m.reseek = reseek; m.reseek_ctx = reseek_ctx;
 
     while (sink->is_running(sink->user)) {
         uint32_t type; int64_t body;
@@ -848,6 +928,16 @@ int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx) {
                 if (m.mdat_skipped && classic_ready(&m))
                     sink->on_error(sink->user,
                         "progressive MP4 stores its index (moov) after the media data, which can't play over a one-way stream; remux with faststart (ffmpeg -movflags +faststart)");
+                /* Progressive files have a complete timeline in hand — report it,
+                 * but only when the byte source can honour seeks (a non-zero
+                 * duration is the managed layer's seekability signal). fMP4
+                 * durations come from the layer that knows them (HLS VOD). */
+                if (classic_ready(&m) && m.reseek && sink->on_duration) {
+                    int64_t dur_us = m.movie_duration > 0
+                        ? ticks_to_us(m.movie_duration, m.movie_timescale > 0 ? m.movie_timescale : 1000)
+                        : classic_total_duration_us(&m);
+                    if (dur_us > 0) sink->on_duration(sink->user, dur_us);
+                }
                 break;
             case 0x6d6f6f66: /* moof */
                 parse_moof(&m, buf, (int)body);

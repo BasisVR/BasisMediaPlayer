@@ -11,7 +11,10 @@
 extern "C" {
 #endif
 
-int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx);
+/* reseek/reseek_ctx (optional, NULL when the source can't reposition) let the
+ * progressive path honour sink->take_seek requests with a ranged refetch. */
+int basis_mp4_run(basis_media_sink_t* sink, basis_read_fn read, void* ctx,
+                  basis_reseek_fn reseek, void* reseek_ctx);
 
 #ifdef __cplusplus
 }

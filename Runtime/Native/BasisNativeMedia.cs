@@ -64,6 +64,12 @@ internal static class BasisNativeMedia
     private static extern long basis_media_get_position_us(IntPtr engine);
 
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
+    private static extern long basis_media_get_duration_us(IntPtr engine);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
+    private static extern int basis_media_seek_us(IntPtr engine, long targetUs);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
     private static extern int basis_media_get_last_error(IntPtr engine, byte[] buf, int bufSize);
 
     [DllImport(Lib, CallingConvention = CallingConvention.StdCall)]
@@ -190,6 +196,24 @@ internal static class BasisNativeMedia
     }
 
     public static long GetPositionUs(IntPtr e) => e == IntPtr.Zero ? -1 : basis_media_get_position_us(e);
+
+    // 0 = unknown/live (also the "no seekable timeline" signal). Old native
+    // libraries without the export read as 0 — same as a live source.
+    public static long GetDurationUs(IntPtr e)
+    {
+        if (e == IntPtr.Zero) return 0;
+        try { return basis_media_get_duration_us(e); }
+        catch (EntryPointNotFoundException) { return 0; }
+    }
+
+    // Asynchronous: the demuxer repositions at its next sample boundary and
+    // playback resumes from the preceding keyframe / segment boundary.
+    public static bool SeekUs(IntPtr e, long targetUs)
+    {
+        if (e == IntPtr.Zero) return false;
+        try { return basis_media_seek_us(e, targetUs) == 0; }
+        catch (EntryPointNotFoundException) { return false; }
+    }
 
     public static string GetLastError(IntPtr e)
     {

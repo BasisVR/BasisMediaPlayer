@@ -93,6 +93,15 @@ typedef struct basis_hls {
     long part_target_ms;
     long target_duration_ms;
     int  endlist_seen;
+    long total_ms;               /* VOD: summed EXTINF durations (0 when live/unknown) */
+
+    /* VOD seek index: every full segment in playlist order, retained at open so
+     * a seek can rebuild the fetch queue from any point. TS segments only. */
+    char (*vod_uri)[HLS_MAX_URI];
+    long* vod_dur_ms;
+    int   vod_count;
+    volatile int  seek_pending;  /* producer repositions at its next iteration */
+    volatile long seek_target_ms;
 
     int  map_served;             /* fMP4: init segment already streamed once */
     char map_uri[HLS_MAX_URI];
@@ -506,6 +515,29 @@ static void ring_write(basis_hls_t* h, const uint8_t* data, int n) {
 static void hls_producer(basis_hls_t* h) {
     uint8_t tmp[16384];
     while (hls_should_run(h)) {
+        if (h->seek_pending) {
+            /* Reposition: drop the current segment, rebuild the queue from the
+             * segment containing the target, flush buffered bytes. The consumer
+             * may hold a partial TS packet from before the jump — the TS
+             * demuxer resynchronises on the 0x47 sync byte. */
+            h->seek_pending = 0;
+            if (h->vod_count > 0) {
+                if (h->seg_ctx) { h->http.close(h->seg_ctx); h->seg_ctx = NULL; }
+                long acc = 0;
+                int idx = 0;
+                for (; idx < h->vod_count - 1; ++idx) {
+                    if (acc + h->vod_dur_ms[idx] > h->seek_target_ms) break;
+                    acc += h->vod_dur_ms[idx];
+                }
+                h->pending_head = 0;
+                h->pending_count = 0;
+                for (int i = idx; i < h->vod_count; ++i)
+                    queue_push(h, h->vod_uri[i], h->vod_dur_ms[i]);
+                hls_mutex_lock(&h->lock);
+                h->ring_head = h->ring_tail = h->ring_count = 0;
+                hls_mutex_unlock(&h->lock);
+            }
+        }
         if (!h->seg_ctx) {
             if (h->is_fmp4 && !h->map_served && h->map_uri[0]) {
                 h->seg_ctx = h->http.open(h->map_uri); /* fMP4 init segment first */
@@ -614,6 +646,31 @@ void* basis_hls_open(const char* url, const basis_http_provider_t* http,
     h->part_target_ms = pl.part_target_ms;
     h->target_duration_ms = pl.target_duration_ms ? pl.target_duration_ms : 6000;
     h->endlist_seen = pl.has_endlist;
+    if (pl.has_endlist) {
+        /* Sum whole segments only — parts subdivide the same media time. A VOD
+         * beyond HLS_MAX_ITEMS is truncated at parse, so this under-reports in
+         * lockstep with what actually plays. */
+        for (int i = 0; i < pl.item_count; ++i)
+            if (pl.items[i].part < 0) h->total_ms += pl.items[i].dur_ms;
+        /* Retain the segment list so a seek can rebuild the queue from any
+         * index. fMP4 VOD is excluded: a mid-stream ring flush would land the
+         * demuxer inside a box, and it can't resynchronise the way TS does. */
+        if (!pl.is_fmp4) {
+            h->vod_uri = (char (*)[HLS_MAX_URI])malloc((size_t)pl.item_count * HLS_MAX_URI);
+            h->vod_dur_ms = (long*)malloc((size_t)pl.item_count * sizeof(long));
+            if (h->vod_uri && h->vod_dur_ms) {
+                for (int i = 0; i < pl.item_count; ++i) {
+                    if (pl.items[i].part >= 0) continue;
+                    memcpy(h->vod_uri[h->vod_count], pl.items[i].uri, HLS_MAX_URI);
+                    h->vod_dur_ms[h->vod_count] = pl.items[i].dur_ms;
+                    h->vod_count++;
+                }
+            } else {
+                free(h->vod_uri); h->vod_uri = NULL;
+                free(h->vod_dur_ms); h->vod_dur_ms = NULL;
+            }
+        }
+    }
     if (pl.map_uri[0]) snprintf(h->map_uri, sizeof(h->map_uri), "%s", pl.map_uri);
 
     /* VOD (EXT-X-ENDLIST): start at the first segment so the whole recording
@@ -692,6 +749,24 @@ int basis_hls_is_vod(void* ctx) {
     return h ? h->endlist_seen : 0;
 }
 
+long basis_hls_duration_ms(void* ctx) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    return h ? h->total_ms : 0;
+}
+
+int basis_hls_can_seek(void* ctx) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    return h && h->vod_count > 0 && !h->producer_done;
+}
+
+int basis_hls_request_seek(void* ctx, long long target_ms) {
+    basis_hls_t* h = (basis_hls_t*)ctx;
+    if (!basis_hls_can_seek(ctx) || target_ms < 0) return -1;
+    h->seek_target_ms = (long)target_ms;
+    h->seek_pending = 1;
+    return 0;
+}
+
 void basis_hls_close(void* ctx) {
     basis_hls_t* h = (basis_hls_t*)ctx;
     if (!h) return;
@@ -699,6 +774,8 @@ void basis_hls_close(void* ctx) {
     hls_thread_join(h);
     if (h->seg_ctx) { h->http.close(h->seg_ctx); h->seg_ctx = NULL; }
     hls_mutex_destroy(&h->lock);
+    free(h->vod_uri);
+    free(h->vod_dur_ms);
     free(h->ring);
     free(h);
 }

@@ -24,6 +24,20 @@ void  basis_win_http_abort(void* ctx);
  * 0 otherwise. Reflects the headers captured when the source was opened. */
 int   basis_win_http_is_seekable(void* ctx);
 
+/* 1 when a ranged re-request will actually be honoured: the initial GET carries a
+ * bytes=0- probe, and only a 206 answer proves the server implements ranges —
+ * Accept-Ranges alone is advertisement some servers don't back up. Stricter than
+ * is_seekable (which only drives live-vs-VOD pacing). */
+int   basis_win_http_can_reseek(void* ctx);
+
+/* Continues the stream from an absolute byte offset by issuing a ranged GET on the
+ * same connection (requires a 206 response; a server that ignores Range fails the
+ * call rather than silently restarting at 0). Only valid on a seekable body, with
+ * no basis_win_http_read concurrently in flight — park or abort the reading thread
+ * first (a prior basis_win_http_abort is fine; this opens a fresh request).
+ * Returns 0 on success; on failure reads report EOF. */
+int   basis_win_http_reseek(void* ctx, long long offset);
+
 #ifdef __cplusplus
 }
 #endif

@@ -307,9 +307,19 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         }
     }
 
-    public TimeSpan Duration => seekableSource != null && seekableSource.IsPrepared
-        ? seekableSource.Duration
-        : TimeSpan.Zero;
+    public TimeSpan Duration
+    {
+        get
+        {
+            if (seekableSource != null && seekableSource.IsPrepared) return seekableSource.Duration;
+            if (nativeEngine != null)
+            {
+                long us = nativeEngine.DurationUs;
+                if (us > 0) return TimeSpan.FromTicks(us * 10L);
+            }
+            return TimeSpan.Zero;
+        }
+    }
 
     public TimeSpan Position
     {
@@ -867,10 +877,25 @@ public sealed class BasisMediaPlayer : MonoBehaviour
         else Pause();
     }
 
-    // Jumps to the given position. Only meaningful for seekable sources; live
-    // streaming sources throw NotSupportedException.
+    // Jumps to the given position. Only meaningful for sources with a seekable
+    // timeline (Duration > TimeSpan.Zero); live sources throw
+    // NotSupportedException. On the native path the seek is asynchronous and
+    // lands at or shortly before the target (preceding keyframe / segment
+    // boundary); OnSeekCompleted reports the requested target.
     public void Seek(TimeSpan position)
     {
+        if (position < TimeSpan.Zero) position = TimeSpan.Zero;
+        if (nativeEngine != null)
+        {
+            if (!nativeEngine.SeekUs(position.Ticks / 10L))
+            {
+                throw new NotSupportedException(
+                    "BasisMediaPlayer.Seek: the current native source has no seekable timeline (live, or an unindexed container).");
+            }
+            audioComponent?.ResetSyncAnchor();
+            OnSeekCompleted?.Invoke(position);
+            return;
+        }
         if (seekableSource == null)
         {
             throw new NotSupportedException(
@@ -1353,11 +1378,21 @@ public sealed class BasisMediaPlayer : MonoBehaviour
             runtimeIsPrepared = true;
             OnReady?.Invoke();
             // Apply any deferred BasisMediaSource start-position now that the
-            // source can actually accept a seek.
-            if (activeMediaSource != null && activeMediaSource.StartPosition > TimeSpan.Zero && seekableSource != null)
+            // source can actually accept a seek. On the native path the
+            // timeline may legitimately be absent (live) — skip silently
+            // rather than raising, since StartPosition is best-effort there
+            // (a late joiner syncing into a live stream).
+            if (activeMediaSource != null && activeMediaSource.StartPosition > TimeSpan.Zero)
             {
-                try { seekableSource.Seek(activeMediaSource.StartPosition); }
-                catch (Exception ex) { RaiseError(ex); }
+                if (seekableSource != null)
+                {
+                    try { seekableSource.Seek(activeMediaSource.StartPosition); }
+                    catch (Exception ex) { RaiseError(ex); }
+                }
+                else if (nativeEngine != null && nativeEngine.SeekUs(activeMediaSource.StartPosition.Ticks / 10L))
+                {
+                    audioComponent?.ResetSyncAnchor();
+                }
             }
         }
 
