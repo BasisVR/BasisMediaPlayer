@@ -75,6 +75,12 @@ typedef struct basis_media_sink {
      * again on a reconnect re-parsing the same index. */
     void (*on_duration)(void* user, int64_t duration_us);
 
+    /* Absolute-seek handshake for on-demand sources. A demuxer that can seek
+     * polls it between samples: returns 1 and writes the target when a request
+     * is pending, 0 otherwise. Each sink hands out a request once. May be NULL
+     * (standalone harnesses, sources that never seek). */
+    int (*take_seek)(void* user, int64_t* out_target_us);
+
     /* Demuxers poll this in their read loops; return 0 to unwind and exit. */
     int (*is_running)(void* user);
 } basis_media_sink_t;
@@ -82,6 +88,12 @@ typedef struct basis_media_sink {
 /* Generic blocking byte source for demuxers that read a continuous stream
  * (MPEG-TS / fMP4 over TCP or HTTP). Returns bytes read, 0 on EOF, <0 on error. */
 typedef int (*basis_read_fn)(void* ctx, uint8_t* buf, int len);
+
+/* Repositions a byte source to an absolute offset (a ranged HTTP refetch).
+ * Returns 0 on success — subsequent reads deliver from `abs_offset`. Called by
+ * a demuxer between its own reads, on its own thread; sources that can't
+ * reposition simply aren't given one (demuxers receive NULL). */
+typedef int (*basis_reseek_fn)(void* ctx, int64_t abs_offset);
 
 /* ---- Platform decode/present backend (windows/ + android/) --------------- */
 

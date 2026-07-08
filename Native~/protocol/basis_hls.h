@@ -59,6 +59,17 @@ int basis_hls_is_vod(void* ctx);
  * total, matching what actually plays. */
 long basis_hls_duration_ms(void* ctx);
 
+/* 1 when the source can honour a seek: a TS-segment VOD playlist whose segment
+ * producer is still alive. fMP4 VOD reports 0 — repositioning the stitched
+ * byte stream mid-box can't be resynchronised the way TS can. */
+int basis_hls_can_seek(void* ctx);
+
+/* Requests a reposition to target_ms. Asynchronous: the segment producer
+ * rebuilds its fetch queue from the segment containing the target and flushes
+ * buffered bytes; playback resumes from that segment boundary. Returns 0 when
+ * accepted, -1 when the source can't seek. */
+int basis_hls_request_seek(void* ctx, long long target_ms);
+
 void basis_hls_close(void* ctx);
 
 #ifdef __cplusplus

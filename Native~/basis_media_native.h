@@ -128,6 +128,14 @@ BASIS_API int64_t BASIS_CALL basis_media_get_position_us(basis_media_engine_t* e
  * container index has been parsed, so poll rather than reading once at open. */
 BASIS_API int64_t BASIS_CALL basis_media_get_duration_us(basis_media_engine_t* engine);
 
+/* Requests an absolute seek to target_us on a source with a seekable timeline
+ * (basis_media_get_duration_us > 0; targets past the end clamp to it). Seeking
+ * is asynchronous: the demuxer repositions at the next sample boundary and
+ * playback resumes from the preceding keyframe, so the landing position is at
+ * or shortly before the target — observe basis_media_get_position_us. Returns
+ * 0 when the request was accepted, -1 when the source cannot seek. */
+BASIS_API int BASIS_CALL basis_media_seek_us(basis_media_engine_t* engine, int64_t target_us);
+
 /* Copies the in-band caption cue (CEA-608 CC1) active at the current presentation
  * position into buf (UTF-8, NUL-terminated). Returns bytes written (0 = no active
  * cue), or -1 on bad args. out_start_us/out_end_us receive the active cue's time
