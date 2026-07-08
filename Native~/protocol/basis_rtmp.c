@@ -201,12 +201,13 @@ static void handle_video(rtmp_t* r, basis_media_sink_t* sink, chunk_state_t* c) 
     } else if (avc_pkt == 1) { /* NALUs (avcc) -> annex B */
         if (!r->video_announced) sink->on_video_format(sink->user, r->video_codec, NULL, 0, 0, 0), r->video_announced = 1;
         int nls = r->video_nls ? r->video_nls : 4;
-        uint8_t* out = (uint8_t*)malloc((size_t)dlen + 64);
+        int cap = basis_avcc_annexb_cap(dlen, nls);
+        uint8_t* out = (uint8_t*)malloc((size_t)cap);
         if (out) {
-            int n = basis_avcc_to_annexb(data, dlen, nls, out, dlen + 64);
+            int n = basis_avcc_to_annexb(data, dlen, nls, out, cap);
             if (n > 0) {
                 int key = (p[0] >> 4) == 1; /* FLV frametype 1 = keyframe */
-                sink->on_video_au(sink->user, out, n, pts_us, key);
+                sink->on_video_au(sink->user, out, n, pts_us, (int64_t)c->ts * 1000, key);
             }
             free(out);
         }

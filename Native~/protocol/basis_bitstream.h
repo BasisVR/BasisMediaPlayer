@@ -11,8 +11,8 @@ extern "C" {
 /* ---- Annex B (start-code) NAL iteration --------------------------------- */
 
 /* Finds the next NAL unit (between 00 00 01 / 00 00 00 01 start codes) at or
- * after `from`. On success sets *nal_off/*nal_len (payload excluding the start
- * code) and returns the index just past this NAL; returns -1 when none remain. */
+ * after `from`. On success sets *nal_off / *nal_len (payload excluding the
+ * start code) and returns the index just past this NAL; -1 when none remain. */
 int basis_annexb_next(const uint8_t* data, int size, int from, int* nal_off, int* nal_len);
 
 /* H.264 NAL type = byte & 0x1F ; H.265 NAL type = (byte >> 1) & 0x3F */
@@ -30,6 +30,12 @@ int basis_h265_is_keyframe(const uint8_t* annexb, int len);
  * `out`, or -1 if `out_cap` is too small. nal_length_size is 1..4 (usually 4). */
 int basis_avcc_to_annexb(const uint8_t* in, int in_len, int nal_length_size,
                          uint8_t* out, int out_cap);
+
+/* Worst-case output size for basis_avcc_to_annexb: each NAL's length prefix
+ * (nal_length_size bytes) becomes a 4-byte start code, and a NAL occupies at
+ * least nal_length_size + 1 input bytes, which bounds the per-NAL growth.
+ * Includes a small constant of extra headroom. */
+int basis_avcc_annexb_cap(int in_len, int nal_length_size);
 
 /* Builds an Annex B extradata blob from an avcC/hvcC config record (as carried
  * in MP4 stsd or FLV AVCDecoderConfigurationRecord). Writes the contained

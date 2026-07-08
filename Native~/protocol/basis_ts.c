@@ -101,7 +101,7 @@ static void flush_video(ts_t* t) {
 
     int key = (t->video_codec == BASIS_CODEC_H265) ? basis_h265_is_keyframe(au, au_len)
                                                    : basis_h264_is_keyframe(au, au_len);
-    t->sink->on_video_au(t->sink->user, au, au_len, pts_us, key);
+    t->sink->on_video_au(t->sink->user, au, au_len, pts_us, pts_us, key);
 
     e->len = 0;
     e->started = 0;

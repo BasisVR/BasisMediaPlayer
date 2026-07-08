@@ -1,6 +1,7 @@
-/* Fragmented-MP4 demuxer (ftyp/moov/moof/mdat) feeding H.264/H.265 + AAC into a
- * basis_media_sink. Pulls bytes through the supplied read callback. Targets the
- * live fMP4 profile (init segment + moof/mdat fragments). */
+/* MP4 demuxer feeding H.264/H.265 + AAC into a basis_media_sink. Handles both
+ * fragmented MP4 (fMP4/CMAF: init segment + moof/mdat fragments) and classic
+ * progressive files (moov sample tables + mdat, faststart layout). Pulls bytes
+ * through the supplied read callback. */
 #ifndef BASIS_MP4_H
 #define BASIS_MP4_H
 
