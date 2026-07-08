@@ -207,7 +207,7 @@ static void handle_video(rtmp_t* r, basis_media_sink_t* sink, chunk_state_t* c) 
             int n = basis_avcc_to_annexb(data, dlen, nls, out, cap);
             if (n > 0) {
                 int key = (p[0] >> 4) == 1; /* FLV frametype 1 = keyframe */
-                sink->on_video_au(sink->user, out, n, pts_us, key);
+                sink->on_video_au(sink->user, out, n, pts_us, (int64_t)c->ts * 1000, key);
             }
             free(out);
         }

@@ -47,10 +47,13 @@ typedef struct basis_media_sink {
                             const uint8_t* extradata, int extradata_len,
                             int width, int height);
 
-    /* One coded video access unit in Annex B form (start-code separated NALUs),
-     * with presentation timestamp in microseconds. key != 0 marks an IDR/keyframe. */
+    /* One coded video access unit in Annex B form (start-code separated NALUs).
+     * pts_us is the presentation timestamp; dts_us the decode timestamp, used
+     * for delivery pacing (composition offsets can put pts_us further ahead
+     * than the pacing lead — a demuxer without decode timestamps passes
+     * pts_us for both). key != 0 marks an IDR/keyframe. */
     void (*on_video_au)(void* user, const uint8_t* annexb, int len,
-                        int64_t pts_us, int key);
+                        int64_t pts_us, int64_t dts_us, int key);
 
     /* Called once when the audio codec/config is first known. For AAC, `asc` is
      * the AudioSpecificConfig (2+ bytes) when available. */

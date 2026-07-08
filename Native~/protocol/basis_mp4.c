@@ -467,28 +467,97 @@ static void classic_advance(mp4_ctab_t* c) {
     }
 }
 
-/* Walks the classic tables against one mdat, merging tracks in file-offset
- * order — the muxer's chunk interleave — since the byte source only moves
- * forward. Samples whose offsets lie beyond this mdat wait for a later one.
- * mdat_end is the absolute end of the payload, or INT64_MAX for a size-0 box. */
+/* A sample read from the file but not yet handed to the sink: file order can
+ * run ahead of delivery order when the muxer interleaves chunks coarsely.
+ * Video is stored already converted to Annex B with its keyframe verdict. */
+typedef struct mp4_pend {
+    struct mp4_pend* next;
+    int64_t pts_us;
+    int64_t dts_us;
+    int     key;
+    int     size;
+    uint8_t data[];
+} mp4_pend_t;
+
+#define MP4_MAX_PENDING (32LL * 1024 * 1024)  /* parked-bytes bound; past it deliver anyway */
+
+/* Decode time of the cursor's next sample, mapped like emission. */
+static int64_t classic_sample_dts_us(const mp4_track_t* t) {
+    const mp4_ctab_t* c = &t->ctab;
+    return ticks_to_us(c->dts - c->media_start, t->timescale) + c->pts_delay_us;
+}
+
+/* Next undelivered decode time for a track: the parked front, else the table
+ * cursor's sample while it still points inside this mdat. */
+static int64_t classic_next_due(const mp4_track_t* t, const mp4_pend_t* head, int64_t mdat_end) {
+    if (head) return head->dts_us;
+    const mp4_ctab_t* c = &t->ctab;
+    if (c->next >= c->sample_count || (int64_t)c->offset >= mdat_end) return INT64_MAX;
+    return classic_sample_dts_us(t);
+}
+
+static void emit_pend(mp4_t* m, const mp4_track_t* t, const mp4_pend_t* s) {
+    if (t->is_video) m->sink->on_video_au(m->sink->user, s->data, s->size, s->pts_us, s->dts_us, s->key);
+    else m->sink->on_audio_frame(m->sink->user, s->data, s->size, s->pts_us);
+}
+
+/* Walks the classic tables against one mdat. The byte source only moves
+ * forward, so samples are read in file-offset order — the muxer's chunk
+ * interleave — but delivered in decode-time order across tracks: with a
+ * coarse interleave (a chunk of video ahead of the matching audio) the
+ * delivery-paced chunk in front would otherwise hold the other track's
+ * earlier samples past their turn and starve it. Samples whose file order
+ * runs ahead of their delivery turn are parked in per-track queues, bounded
+ * by MP4_MAX_PENDING — past the bound (or once nothing more can be read from
+ * this mdat) the earliest parked sample delivers regardless. Samples whose
+ * offsets lie beyond this mdat wait for a later one. mdat_end is the absolute
+ * end of the payload, or INT64_MAX for a size-0 box. */
 static int consume_progressive(mp4_t* m, int64_t mdat_end) {
     uint8_t* buf = NULL;
     size_t cap = 0;
     int rc = 0;
+    mp4_pend_t* head[2] = { NULL, NULL };
+    mp4_pend_t* tail[2] = { NULL, NULL };
+    int64_t queued = 0;   /* payload bytes parked across both queues */
 
     for (;;) {
         if (!m->sink->is_running(m->sink->user)) { rc = -1; break; }
 
-        mp4_track_t* t = NULL;
+        /* the next sample in file order, while any remains in this mdat */
+        mp4_track_t* rt = NULL;
         for (int i = 0; i < m->ntracks; ++i) {
             mp4_ctab_t* c = &m->tracks[i].ctab;
             if (c->next >= c->sample_count) continue;
             if ((int64_t)c->offset >= mdat_end) continue;
-            if (!t || c->offset < t->ctab.offset) t = &m->tracks[i];
+            if (!rt || c->offset < rt->ctab.offset) rt = &m->tracks[i];
         }
-        if (!t) break;
 
-        mp4_ctab_t* c = &t->ctab;
+        /* deliver the earliest parked sample once no other track can still
+         * produce an earlier one — or when forced (bound hit, or nothing left
+         * to read in this mdat) */
+        int e = -1;
+        for (int i = 0; i < m->ntracks; ++i)
+            if (head[i] && (e < 0 || head[i]->dts_us < head[e]->dts_us)) e = i;
+        if (e >= 0) {
+            int64_t barrier = INT64_MAX;
+            for (int i = 0; i < m->ntracks; ++i) {
+                if (i == e) continue;
+                int64_t due = classic_next_due(&m->tracks[i], head[i], mdat_end);
+                if (due < barrier) barrier = due;
+            }
+            if (head[e]->dts_us <= barrier || queued > MP4_MAX_PENDING || !rt) {
+                mp4_pend_t* s = head[e];
+                head[e] = s->next;
+                if (!head[e]) tail[e] = NULL;
+                queued -= s->size;
+                emit_pend(m, &m->tracks[e], s);
+                free(s);
+                continue;
+            }
+        }
+        if (!rt) break;
+
+        mp4_ctab_t* c = &rt->ctab;
         uint32_t ssize = classic_size(c, c->next);
         if (ssize == 0 || ssize > (uint32_t)MP4_MAX_BOX || (int64_t)c->offset < m->pos ||
             (mdat_end != INT64_MAX && (int64_t)c->offset > mdat_end - (int64_t)ssize)) {
@@ -511,9 +580,11 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
             uint32_t raw = c->ctts[c->ctts_i * 2 + 1];
             cto = c->ctts_version ? (int64_t)(int32_t)raw : (int64_t)raw;
         }
-        int64_t pts_us = ticks_to_us(c->dts + cto - c->media_start, t->timescale) + c->pts_delay_us;
+        int64_t pts_us = ticks_to_us(c->dts + cto - c->media_start, rt->timescale) + c->pts_delay_us;
+        int64_t dts_us = classic_sample_dts_us(rt);
 
-        if (t->is_video) {
+        mp4_pend_t* s = NULL;
+        if (rt->is_video) {
             int key = 1;
             if (c->stss) {
                 /* stss is sorted 1-based sample numbers; catch the cursor up past
@@ -522,23 +593,38 @@ static int consume_progressive(mp4_t* m, int64_t mdat_end) {
                 key = c->stss_i < c->stss_count && c->stss[c->stss_i] == c->next + 1;
                 if (key) c->stss_i++;
             }
-            int nls = t->nal_len_size ? t->nal_len_size : 4;
+            int nls = rt->nal_len_size ? rt->nal_len_size : 4;
             int outcap = basis_avcc_annexb_cap((int)ssize, nls);
-            uint8_t* out = (uint8_t*)malloc((size_t)outcap);
-            if (out) {
-                int n = basis_avcc_to_annexb(buf, (int)ssize, nls, out, outcap);
+            s = (mp4_pend_t*)malloc(sizeof(*s) + (size_t)outcap);
+            if (s) {
+                int n = basis_avcc_to_annexb(buf, (int)ssize, nls, s->data, outcap);
                 if (n > 0) {
                     if (c->stss == NULL)
-                        key = t->codec == BASIS_CODEC_H265 ? basis_h265_is_keyframe(out, n) : basis_h264_is_keyframe(out, n);
-                    m->sink->on_video_au(m->sink->user, out, n, pts_us, key);
-                }
-                free(out);
+                        key = rt->codec == BASIS_CODEC_H265 ? basis_h265_is_keyframe(s->data, n) : basis_h264_is_keyframe(s->data, n);
+                    s->size = n;
+                    s->key = key;
+                } else { free(s); s = NULL; }
             }
         } else {
-            m->sink->on_audio_frame(m->sink->user, buf, (int)ssize, pts_us);
+            s = (mp4_pend_t*)malloc(sizeof(*s) + ssize);
+            if (s) { memcpy(s->data, buf, ssize); s->size = (int)ssize; s->key = 0; }
+        }
+        if (s) {
+            int ti = (int)(rt - m->tracks);
+            s->pts_us = pts_us;
+            s->dts_us = dts_us;
+            s->next = NULL;
+            if (tail[ti]) tail[ti]->next = s; else head[ti] = s;
+            tail[ti] = s;
+            queued += s->size;
         }
         classic_advance(c);
     }
+
+    /* the loop drains the queues before exiting cleanly; anything still parked
+     * here means the engine is stopping — release without delivering */
+    for (int i = 0; i < 2; ++i)
+        while (head[i]) { mp4_pend_t* s = head[i]; head[i] = s->next; free(s); }
 
     free(buf);
     if (rc == 0 && mdat_end != INT64_MAX && m->pos < mdat_end)
@@ -643,8 +729,10 @@ static void parse_moof(mp4_t* m, const uint8_t* p, int len) {
  * fragment of video before any of that fragment's audio — and with delivery
  * pacing on (VOD, HLS) the paced video burst makes the trailing audio arrive a
  * full fragment late, starving the audio-gated presentation clock. Merging by
- * decode time interleaves the tracks at frame granularity, like the TS demuxer.
- * Order within a run (decode order) is preserved. */
+ * decode time interleaves the tracks at frame granularity, like the TS demuxer,
+ * and each sample's decode time rides along to the sink so the pacing gate
+ * holds it no later than its decode turn. Order within a run (decode order)
+ * is preserved. */
 static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
     if (m->nfrags <= 0) return;
     int base_off = m->frags[0].data_offset;
@@ -690,7 +778,7 @@ static void consume_mdat(mp4_t* m, const uint8_t* data, int len) {
                 int n = basis_avcc_to_annexb(data + pos[k], (int)ssize, nls, out, cap);
                 if (n > 0) {
                     int key = t->codec == BASIS_CODEC_H265 ? basis_h265_is_keyframe(out, n) : basis_h264_is_keyframe(out, n);
-                    m->sink->on_video_au(m->sink->user, out, n, pts_us, key);
+                    m->sink->on_video_au(m->sink->user, out, n, pts_us, best_us, key);
                 }
                 free(out);
             }

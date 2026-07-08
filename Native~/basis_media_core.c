@@ -247,10 +247,13 @@ static void sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed
     basis_decoder_set_video_format(e->decoder, codec, ed, ed_len, w, h);
     mutex_unlock(&e->submit_lock);
 }
-static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
+static void sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int64_t dts, int key) {
     basis_media_engine_t* e = (basis_media_engine_t*)user;
     if (!e->running) return;
-    pace_gate(e, pts);              /* paced mode: hold until ~real time; no-op otherwise */
+    /* Pace on the decode timestamp: gating on pts would sleep out a composition
+     * offset the decoder still needs the AU inside of, and starve the other
+     * track's earlier samples queued behind this one on the demux thread. */
+    pace_gate(e, dts);              /* paced mode: hold until ~real time; no-op otherwise */
     if (!e->running) return;        /* may have been stopped while pacing */
     e->video_au_count++;
     mutex_lock(&e->submit_lock);
@@ -306,8 +309,8 @@ static void install_sink(basis_media_engine_t* e) {
 static void audio_sink_video_format(void* user, basis_codec_t codec, const uint8_t* ed, int ed_len, int w, int h) {
     (void)user; (void)codec; (void)ed; (void)ed_len; (void)w; (void)h;
 }
-static void audio_sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int key) {
-    (void)user; (void)au; (void)len; (void)pts; (void)key;
+static void audio_sink_video_au(void* user, const uint8_t* au, int len, int64_t pts, int64_t dts, int key) {
+    (void)user; (void)au; (void)len; (void)pts; (void)dts; (void)key;
 }
 static void audio_sink_state(void* user, basis_media_state_t s) { (void)user; (void)s; }
 static void audio_sink_eos(void* user) { (void)user; }
